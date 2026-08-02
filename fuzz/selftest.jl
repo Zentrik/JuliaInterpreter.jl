@@ -336,8 +336,15 @@ end
         @test FuzzJI.classify_step(plain, wrong).class === :step_divergence
         short = FuzzJI.StepOutcome(:done, Any[1, 2], "", 10, Symbol[])
         @test FuzzJI.classify_step(plain, short).class === :step_divergence
-        hang = FuzzJI.StepOutcome(:nonterminating, Any[1], "budget", 4000, Symbol[])
-        @test FuzzJI.classify_step(plain, hang).class === :step_nonterminating
+        # A command that cannot advance is the reportable shape...
+        stuck = FuzzJI.StepOutcome(:stuck, Any[1], "no-ops", 4000, Symbol[], :n)
+        @test FuzzJI.classify_step(plain, stuck).class === :step_stuck
+        # ... while merely running out of commands is not: break-on-error stops
+        # at every throw and these programs throw on purpose, so budget
+        # exhaustion is tracked, not reported.
+        budget = FuzzJI.StepOutcome(:budget, Any[1], "budget", 4000, Symbol[])
+        @test FuzzJI.classify_step(plain, budget).class === :aborted
+        @test !FuzzJI.isfinding(FuzzJI.classify_step(plain, budget))
         # An identical stepped stream agrees.
         @test FuzzJI.classify_step(plain, FuzzJI.StepOutcome(:done, Any[1, 2, 3], "", 5, Symbol[])).class === :agree
 

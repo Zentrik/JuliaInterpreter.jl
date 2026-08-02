@@ -5,6 +5,11 @@ Status: analysis, 2026-08-02. Companion to `DESIGN.md`. Sources: an audit of
 interpreter/compiler fuzzing literature (Fuzzilli, Jit-Picking, YARPGen, swarm
 testing, EMI, Nautilus/Zest, tree-splicer; links at the end).
 
+**Implementation status.** P0, P1, and P3 below are implemented; see the
+"What was done" section at the end for measurements and what each change
+actually moved. P2 (semantic coverage) and P4 (EMI, world-age stress) are
+still open, and are now the highest-value remaining work.
+
 ## TL;DR
 
 Yield to date is one real bug (`invoke` argument conformance, fixed in
@@ -261,6 +266,77 @@ skip the second lowering (hand `ExprSplitter` the already-lowered exprs),
 consider `--modes cmp`-only for high-volume runs (rec-mode Base
 interpretation is the main per-candidate cost), and shard campaigns across
 processes with distinct seeds.
+
+## What was done (2026-08-02)
+
+Measured with `fuzz/metrics.jl`, which reports the generated distribution
+without executing anything. Baseline figures are from the generator at
+`0b326ce` over the same seeds.
+
+**P0 — mechanical unblocking** (commit "P0: unblock nesting…"):
+
+- The `blockdepth < 2` gate became a configurable cap plus a per-level weight
+  decay. Function bodies now start at depth 0 and toplevel statements at
+  depth 1. Program size held constant (33.1 → 32.6 statements, 61.1 → 61.0
+  rendered lines) while `try` inside a loop went 4.8% → 8.5% of programs and
+  **try-in-a-loop-in-a-function 0% → 2%** — it was structurally ungenerable.
+- Found and fixed while doing it: a `while` at module toplevel was broken.
+  The fuel counter is a global there and the loop body is a soft scope, so
+  `fuel -= 1` declared a new local and threw `UndefVarError` reading it,
+  killing the rest of the program. Only reachable once toplevel statements
+  could nest.
+- Oracle: observation streams were compared with `isequal`, which holds
+  across types (`isequal(1, 1.0)`), so an interpreter returning a Float where
+  compiled Julia returns an Int compared *equal*. Now type-sensitive. All
+  live bindings are observed at program end rather than the last three, and
+  function-valued bindings are observed by calling them under a guard.
+- Dedup: exception-class verdicts fingerprinted as `(class, refexc, intexc)`
+  only, so every interp-only `UndefVarError` shared one bucket and the first
+  one reported masked all later ones. Salted with the last observation's
+  shape — deliberately *not* the stream length or divergence index, which
+  move under shrinking and would make the shrinker reject nearly every edit.
+- `Cfg` is reachable from the CLI at all now (`--big`, `--maxblockdepth`, …);
+  `maxblockstmts` was declared but never read.
+
+**P1 — distribution shaping** (commit "P1+P3: swarm masks…"):
+
+- Swarm masking: `try` occurrences 331 → 539 and exits crossing a try
+  boundary 45 → 85, while P(program contains try) *fell* 50.8% → 45.8%.
+  Fewer programs have the feature; those that do have much more of it.
+- Policies, forced one at a time against uniform: `exceptions` raises
+  exit-through-try 6.4× and try-in-loop 3×; `builtins` raises probe density
+  3.2×; `mutation` raises struct aliasing 2.4×.
+- Non-scalar values now cross function boundaries (previously impossible),
+  and struct-valued bindings — which gate every struct rule — are created far
+  more often under the policies that target them: field writes 5.5% → 29%,
+  aliasing 24.5% → 57%, atomic modifies 1% → 4.5%.
+
+**P3 — the stepping axis** (`--engine step`): described in `DESIGN.md`.
+Yield so far: on its first 400-program campaign it produced 3 reports, of
+which triage showed **two were false positives in my own oracle** and one
+exposed a **real generator bug**:
+
+- `vararg` was tracked per *function* but only the signature built by
+  `genfundef` renders a `va...`; a call that picked a different method still
+  appended trailing arguments and matched no method. The differential axis
+  never reported these — both sides throw `MethodError`, so they classify as
+  agreement — they just quietly wasted candidates.
+- False positive 1: `frame.world` must be refreshed on toplevel frames, which
+  the interpreter's own toplevel loop does and `debug_command` does not.
+- False positive 2: deciding "is this throw a bug" from whether the backtrace
+  mentions JuliaInterpreter is wrong — program-thrown exceptions unwind
+  through interpreter frames too. Now decided by comparing against plain
+  interpretation of the same program.
+- The `nonterminating` class was also measuring the wrong thing: with
+  break-on-error armed, `:c` stops at every throw, and these programs throw on
+  purpose, so a large command count is normal. Replaced with direct
+  non-advancement detection (the same (framecode, pc) surviving
+  `STUCK_LIMIT` consecutive commands), which is the actual historical bug
+  shape; budget exhaustion is now tracked, not reported.
+
+The general lesson, worth keeping in mind for P2/P4: **a new axis's first
+reports are usually about the axis, not the system under test.** Budget for
+calibration before believing yield numbers.
 
 ## References
 

@@ -46,7 +46,7 @@ const STEP_COMMANDS = (:n, :s, :c, :finish, :nc, :se, :si, :until, :sl, :sr)
 const DRAIN_COMMANDS = (:se, :n, :finish)
 
 struct StepOutcome
-    status::Symbol      # :done | :threw | :nonterminating
+    status::Symbol      # :done | :threw | :stuck | :budget
     obs::Vector{Any}
     detail::String
     ncommands::Int
@@ -86,13 +86,24 @@ function internalframe(bt)
     return nothing
 end
 
+# How many consecutive commands may leave execution at exactly the same
+# (framecode, pc) before the walk is considered stuck. One no-op is legal — a
+# breakpoint pause reports the position without moving — but a command that
+# cannot advance repeats forever, which is the shape of the historical bug
+# (`next_line!` not getting past a statement kind).
+const STUCK_LIMIT = 200
+
 # Drive one toplevel fragment to completion with a random command walk.
-# Returns (:ok, ncommands) or throws.
+# Returns (status, ncommands, stuckcmd) where status is :done, :budget (ran out
+# of commands, which is not by itself evidence of anything) or :stuck.
 function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds::Int)
     fr = frame
     n = 0
+    laststate = nothing
+    noops = 0
+    lastcmd = :none
     while true
-        n >= maxcmds && return (:nonterminating, n)
+        n >= maxcmds && return (:budget, n, :none)
         # Toplevel frames run in the latest world, matching what the interpreter
         # itself does in its toplevel loop (`istoplevel && (frame.world = ...)`,
         # src/interpret.jl) and what the differential executor does. Without it,
@@ -103,21 +114,28 @@ function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds
         # supposed to run in their caller's world.
         is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
         # Once past 80% of the budget, stop stepping *into* callees so the walk
-        # can actually finish: otherwise a program with deep call nesting is
-        # reported nonterminating for lack of commands, not for a real hang.
+        # can finish: under RecursiveInterpreter, `:s` descends into Base, and a
+        # program with deep call nesting would otherwise spend the whole budget
+        # there.
         cmd = n > 0.8 * maxcmds ? pick(rng, DRAIN_COMMANDS) : pick(rng, STEP_COMMANDS)
         # `:until` takes a line number; nothing means "the line after this one".
         ret = cmd === :until && rand(rng) < 0.5 ?
               debug_command(interp, fr, cmd, true; line=rand(rng, 1:40)) :
               debug_command(interp, fr, cmd, true)
         n += 1
-        ret === nothing && return (:done, n)
+        ret === nothing && return (:done, n, :none)
         # Continue from wherever the command left execution: a callee frame
         # after stepping in, the caller after finishing, or a breakpoint pause.
-        # A command that makes no progress is not itself an error (a breakpoint
-        # pause is legal), but a walk that *never* advances hits the command
-        # budget above and is reported as nonterminating.
         fr, _pc = ret
+        state = (objectid(fr.framecode), fr.pc)
+        if state == laststate
+            noops += 1
+            noops >= STUCK_LIMIT && return (:stuck, n, lastcmd)
+        else
+            noops = 0
+        end
+        laststate = state
+        lastcmd = cmd
     end
 end
 
@@ -143,12 +161,19 @@ function step_program(src::String; rng::AbstractRNG, interp::Interpreter=Recursi
         end
         for (mod, frag) in ExprSplitter(m, ex)
             frame = Frame(mod, frag)
-            status, n = walkframe!(rng, interp, frame, maxcmds - total)
+            status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total)
             total += n
-            if status === :nonterminating
-                return StepOutcome(:nonterminating, getobs(m),
-                                   "command budget exhausted after $total commands", total, cmds)
+            if status === :stuck
+                return StepOutcome(:stuck, getobs(m),
+                                   "`:$stuckcmd` left execution at the same (framecode, pc) " *
+                                   "$STUCK_LIMIT times in a row after $total commands",
+                                   total, cmds, stuckcmd)
             end
+            # Budget exhaustion is not evidence of a bug — break-on-error stops
+            # at every throw, and these programs throw on purpose — so it ends
+            # the walk without a verdict rather than reporting one.
+            status === :budget && return StepOutcome(:budget, getobs(m),
+                                                     "command budget exhausted", total, cmds)
         end
         return StepOutcome(:done, getobs(m), "", total, cmds)
     catch err
@@ -175,9 +200,13 @@ end
 # `plain` is the Outcome from run_interp, i.e. what the program does when it is
 # simply executed — stepping through it must not change the answer.
 function classify_step(plain::Outcome, st::StepOutcome)::Verdict
-    if st.status === :nonterminating
-        return Verdict(:step_nonterminating, st.detail, :none, :none, 0, :none, :none)
+    if st.status === :stuck
+        # Salted with the command that could not advance.
+        return Verdict(:step_stuck, st.detail, :none, :none, 0, st.site, :none)
     end
+    # Ran out of commands: the walk never finished, so its observation stream is
+    # a prefix and there is nothing sound to compare. Tracked, not reported.
+    st.status === :budget && return Verdict(:aborted, st.detail, :none, :none, 0, :none, :none)
     # Budget-aborted plain runs have a truncated stream, so there is nothing
     # sound to compare against.
     plain.status === :aborted && return agree()
@@ -260,19 +289,11 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                 stats.discarded += 1
                 continue
             end
-            # A command budget is a proxy for "stepping is stuck", and a large
-            # program legitimately needs many commands. Before calling it a
-            # hang, retry once with a much bigger budget: a real
-            # non-advancing command still exhausts it, while a merely long
-            # program finishes. Without this the class is mostly false
-            # positives, which is worse than missing a slow hang.
-            if st.status === :nonterminating
-                st = step_program(src; rng=Xoshiro(seed), maxcmds=20 * maxcmds, usebreakpoints)
-                st === nothing && (stats.discarded += 1; continue)
-            end
             v = classify_step(plain, st)
             if v.class === :agree
                 stats.agreed += 1
+            elseif v.class === :aborted
+                stats.aborted += 1
             elseif suppressed(v)
                 stats.suppressed += 1
             else
@@ -287,7 +308,7 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                 end
             end
             if progress > 0 && i % progress == 0
-                @info "step progress" i rate_per_s = round(stats.cases / (time() - t0); digits=2) stats.agreed stats.findings stats.duplicates stats.discarded
+                @info "step progress" i rate_per_s = round(stats.cases / (time() - t0); digits=2) stats.agreed stats.aborted stats.findings stats.duplicates stats.discarded
             end
         end
     finally
