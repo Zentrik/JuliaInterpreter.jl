@@ -122,7 +122,26 @@ end
 
 # invokelatest: the binding was created by `Core.eval` after this function's
 # caller world; Julia 1.12's strict binding world-age rules apply.
-getobs(m::Module) = copy(Base.invokelatest(getglobal, m, :__OBS__)::Vector{Any})
+#
+# Slots can be *unassigned*, not merely absent: `push!` grows the array and then
+# stores into the new slot, so an interpretation that stops in between — budget
+# exhaustion, or an exception thrown mid-`push!` — leaves a live element that
+# was never written. Reading one throws UndefRefError, which took down a whole
+# campaign batch from inside the comparator. Substitute a sentinel here, at the
+# single point where observations enter the harness, so every consumer is safe:
+# it compares equal to itself (both sides interrupted the same way agree) and
+# unequal to any real value (one side producing a value where the other did not
+# is a genuine difference).
+const UNASSIGNED_OBS = :__fj_unassigned__
+
+function getobs(m::Module)
+    raw = Base.invokelatest(getglobal, m, :__OBS__)::Vector{Any}
+    out = Vector{Any}(undef, length(raw))
+    for i in eachindex(raw)
+        out[i] = isassigned(raw, i) ? raw[i] : UNASSIGNED_OBS
+    end
+    return out
+end
 
 scrubexc(err) = nameof(typeof(err))
 

@@ -106,6 +106,8 @@ mutable struct Ctx
                                     # gates `return` statements and fixes their value summary
     enabled::Set{Symbol}            # swarm: rule families this program may use
     policy::Symbol                  # generation policy skewing the weights
+    rtscopes::Int                   # enclosing constructs that introduce a *runtime* scope
+                                    # (for/while/let/try bodies) — `if` does not count
 end
 
 function Ctx(rng::AbstractRNG, cfg::Cfg=Cfg())
@@ -119,7 +121,7 @@ function Ctx(rng::AbstractRNG, cfg::Cfg=Cfg())
     end
     policy = cfg.policy ? pick(rng, POLICIES) : :uniform
     return Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false, 0, nothing,
-               enabled, policy)
+               enabled, policy, 0)
 end
 
 # Swarm gate: is this rule family available in the program being generated?
@@ -145,7 +147,23 @@ wpickrule(ctx::Ctx, opts::Vector{Tuple{Float64,Symbol}}) =
 
 # Is generation currently inside a local (non-module) scope? Determines
 # whether writing to a module global needs the `global` keyword.
+#
+# NOTE this counts *generation* scopes, which `genblock` pushes for every block
+# including `if`. That is right for name visibility — a binding made inside an
+# `if` should not be referenced after it — but wrong for scoping questions,
+# because `if` introduces no runtime scope at all. Use `inruntimelocal` for
+# those; see its comment.
 inlocal(ctx::Ctx) = length(ctx.scopes) > 1 || ctx.infunc
+
+# Is generation inside a construct that introduces a *runtime* scope? Only
+# `for`/`while`/`let`/`try` bodies and function bodies do; `if` and `begin` are
+# transparent, so a binding created inside a toplevel `if` is a module global.
+#
+# This distinction decides whether an assignment at this point lands in a global
+# or a local, which in turn decides whether a nested loop body — a soft scope at
+# toplevel — needs `global` to write it. Getting it wrong makes the loop's write
+# silently declare a fresh local and read it before assignment.
+inruntimelocal(ctx::Ctx) = ctx.rtscopes > 0 || ctx.infunc
 
 # Run `f()` with every variable matching `hide` predicate temporarily removed
 # from scope, so the generated sub-expression cannot reference them.
@@ -186,7 +204,15 @@ freshname(ctx::Ctx, prefix::String) = Symbol(prefix, ctx.namecounter += 1)
 
 pushscope!(ctx::Ctx) = push!(ctx.scopes, VInfo[])
 popscope!(ctx::Ctx) = pop!(ctx.scopes)
-declare!(ctx::Ctx, v::VInfo) = push!(ctx.scopes[end], v)
+# A binding created where no runtime-local scope is open is a module global,
+# whatever generation scope it happens to sit in: `if` and `begin` are
+# transparent, so `x = 1` inside a toplevel `if` defines a global. Recording
+# that is what lets later writes from inside a loop body — a soft scope at
+# toplevel — render the `global` keyword they need.
+function declare!(ctx::Ctx, v::VInfo)
+    v.isglobal |= !inruntimelocal(ctx)
+    push!(ctx.scopes[end], v)
+end
 
 function visiblevars(ctx::Ctx)
     out = VInfo[]
