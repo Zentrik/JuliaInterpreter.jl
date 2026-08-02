@@ -292,16 +292,23 @@ CorpusOutcome(status, detail, site) = CorpusOutcome(status, detail, site, Expr[]
 # the fragment's own file, so whatever it was written against is what gets
 # loaded. Without any prelude, 128 of 150 cases were discarded for missing
 # names and the axis tested almost nothing.
+# Returns the module plus the prelude statements that actually took effect.
+# Which ones succeed is *not* a given — a lifted `using .Main.OffsetArrays`
+# refers to a module that does not exist here, and a package may simply not be
+# loadable — so the caller has to know, rather than assume the environment came
+# out as requested.
 function corpusmodule(prelude::Vector{Expr})
     m = freshmodule()
+    ok = Expr[]
     for st in prelude
         try
             Core.eval(m, st)
+            push!(ok, st)
         catch
             # a dependency that will not load just means fewer fragments run
         end
     end
-    return m
+    return m, ok
 end
 
 # Which already-loaded module would supply this name? A fragment lifted out of
@@ -331,7 +338,7 @@ end
 function eval_ref(ex::Expr, prelude::Vector{Expr}; maxrepairs::Int=4)
     prelude = copy(prelude)
     for _ in 0:maxrepairs
-        m = corpusmodule(prelude)
+        m, applied = corpusmodule(prelude)
         err = try
             for st in ex.args
                 st isa LineNumberNode && continue
@@ -341,7 +348,7 @@ function eval_ref(ex::Expr, prelude::Vector{Expr}; maxrepairs::Int=4)
         catch e
             e
         end
-        err === nothing && return (:done, :none, prelude)
+        err === nothing && return (:done, :none, applied)
         # Unwrap the LoadError that macro expansion wraps failures in.
         while err isa LoadError
             err = err.error
@@ -361,31 +368,57 @@ function eval_ref(ex::Expr, prelude::Vector{Expr}; maxrepairs::Int=4)
     return (:threw, :UndefVarError, prelude)
 end
 
+# Drive every fragment of `ex` to completion, interpreted, under a statement
+# budget. Called through invokelatest so that the splitter's lowering and macro
+# expansion — which happen during iteration — see the prelude's imports.
+# Returns the same (status, exc, detail, site) tuple corpus_run reports, and
+# throws AbortException/Aborted through to its caller.
+# Materialize every (mod, frag) pair in one go. The splitter lowers and
+# macro-expands during *iteration*, so calling it through invokelatest only
+# helps if the iteration happens inside the invoked call too.
+splitfragments(m::Module, ex::Expr) = collect(ExprSplitter(m, ex))
+
+function run_fragments!(m::Module, ex::Expr, nstmts::Int)
+    for (mod, frag) in ExprSplitter(m, ex)
+        frame = Frame(mod, frag)
+        budget = nstmts
+        while true
+            ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
+            ret isa Aborted && throw(AbortException())
+            ret isa Some && break
+            ret === nothing || break
+        end
+    end
+    return (:done, :none, "", :none)
+end
+
 function corpus_run(ex::Expr, prelude::Vector{Expr}; nstmts::Int)
     # eval_ref returns the prelude it needed, so the interpreted run and the
     # stepping run see exactly the environment the reference succeeded in.
     refstatus, refexc, prelude = eval_ref(ex, prelude)
-    m = corpusmodule(prelude)
+    m, applied = corpusmodule(prelude)
+    # The oracle can only compare two runs that happened in equivalent
+    # environments. `eval_ref` returns the prelude that actually took effect on
+    # the reference side; if the interpreted module did not end up with the
+    # same set, the two are not comparable and any difference says nothing
+    # about the interpreter. Observed as "compiled Julia ran this and the
+    # interpreter threw UndefVarError: @testset" — a report about the harness's
+    # own environment, not about JuliaInterpreter.
+    applied == prelude || return CorpusOutcome(:junk, "environment mismatch", :none, prelude)
     intstatus, intexc, detail, site = try
-        # `ExprSplitter`/`Frame` expand macros while building the frame, and the
-        # prelude was evaluated *at runtime* — so `using Test` is newer than the
-        # world this function was compiled in, and a `@testset` in the fragment
-        # resolves against a world that has not seen the import. Compiled Julia
-        # does not hit this because `Core.eval` expands in the latest world.
-        # Without invokelatest the axis reports "compiled Julia ran this and the
-        # interpreter threw UndefVarError: @testset" — a difference manufactured
-        # entirely by the harness.
-        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
-            frame = Base.invokelatest(Frame, mod, frag)
-            budget = nstmts
-            while true
-                ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
-                ret isa Aborted && return CorpusOutcome(:junk, "budget", :none)
-                ret isa Some && break
-                ret === nothing || break
-            end
-        end
-        (:done, :none, "", :none)
+        # The whole loop runs in the latest world, not just its first call.
+        # The prelude was evaluated *at runtime*, so `using Test` is newer than
+        # the world this function was compiled in, and a `@testset` in the
+        # fragment would resolve against a world that never saw the import —
+        # reported as "compiled Julia ran this and the interpreter threw
+        # UndefVarError: @testset", a difference manufactured entirely here.
+        # `Core.eval` does not hit it because it expands in the latest world.
+        #
+        # invokelatest on `ExprSplitter(m, ex)` alone is *not* enough, which is
+        # the trap: the splitter lowers and macro-expands in `iterate`, not in
+        # its constructor, so only the construction moved worlds and expansion
+        # stayed behind. Hence a helper that contains the entire iteration.
+        Base.invokelatest(run_fragments!, m, ex, nstmts)
     catch err
         err isa AbortException && return CorpusOutcome(:junk, "budget", :none)
         s = internalframe(stacktrace(catch_backtrace()))
@@ -412,14 +445,15 @@ end
 # JuliaInterpreter: stepping executes the same code, which may legitimately
 # throw partway if a command skips an initialization.
 function corpus_step(ex::Expr, prelude::Vector{Expr}, rng::AbstractRNG; maxcmds::Int)
-    m = corpusmodule(prelude)
+    m, applied = corpusmodule(prelude)
+    applied == prelude || return CorpusOutcome(:junk, "environment mismatch", :none, prelude)
     interp = RecursiveInterpreter()
     total = 0
     try
-        # invokelatest for the same reason as corpus_run: the prelude's imports
-        # are newer than this function's world, and frame construction expands
-        # the fragment's macros.
-        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+        # invokelatest around the whole walk, for the same reason as corpus_run:
+        # the splitter expands macros during iteration, and the prelude's
+        # imports are newer than this function's world.
+        for (mod, frag) in Base.invokelatest(splitfragments, m, ex)
             frame = Base.invokelatest(Frame, mod, frag)
             status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total)
             total += n
