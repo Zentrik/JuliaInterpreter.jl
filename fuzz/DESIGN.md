@@ -350,6 +350,13 @@ shrinker to reduce it while preserving the fingerprint.
 
 ## Sources of legitimate divergence (excluded or normalized)
 
+`determinism.md` analyzes this whole area — which exclusions are genuinely
+forced (semantic underspecification, cross-engine divergence), which are
+cheap to lift (seeded RNG, content-keyed Dicts, API doubles, per-fragment
+determinism certification for the corpus axis), and why deterministic-
+execution infrastructure (Antithesis-style hypervisors) does not help a
+two-engine oracle.
+
 Excluded from the grammar: I/O, `eval`/`include`, `ccall`/pointers/`unsafe_*`,
 tasks/threads (see roadmap), timing, `objectid`, method redefinition.
 Normalized away: module names, closure/struct type identity, function values.
