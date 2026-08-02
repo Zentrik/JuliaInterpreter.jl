@@ -199,13 +199,24 @@ function parsegate(src::String)
         return nothing
     end
     ex isa Expr && ex.head === :toplevel || return nothing
-    lwr = try
-        Meta.lower(Main, ex)
-    catch
-        return nothing
+    # Lower each toplevel statement separately, because that is how both sides
+    # actually evaluate the program: `Core.eval` per statement on the reference
+    # side, one ExprSplitter fragment at a time on the interpreted side.
+    # Lowering the whole `:toplevel` in one go does not surface a scope error
+    # inside an individual statement, so a program that cannot lower would slip
+    # through the gate and then fail on both sides — with *different* exception
+    # types (ErrorException from Core.eval, ArgumentError from ExprSplitter),
+    # which the comparator then reports as an exception divergence. Observed
+    # producing 32 such reports in one run.
+    for st in ex.args
+        st isa LineNumberNode && continue
+        lwr = try
+            Meta.lower(Main, st)
+        catch
+            return nothing
+        end
+        (isexpr(lwr, :error) || isexpr(lwr, :incomplete)) && return nothing
     end
-    isexpr(lwr, :error) && return nothing
-    isexpr(lwr, :incomplete) && return nothing
     return ex
 end
 
