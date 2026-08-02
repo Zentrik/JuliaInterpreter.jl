@@ -39,7 +39,8 @@ function parseargs(args)
                          "modes" => "both", "big" => false, "fresh" => false,
                          "patience" => 1, "nosync" => false, "noswarm" => false,
                          "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false,
-                         "maxsplice" => 3, "nostep" => false)
+                         "maxsplice" => 3, "nostep" => false,
+                         "journaldir" => joinpath(@__DIR__, "journal"))
     # Cfg overrides start unset (nothing) and fall through to the profile default.
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop", "bodystmts")
         o[k] = nothing
@@ -79,6 +80,8 @@ function parseargs(args)
             o["maxsplice"] = parse(Int, args[i += 1])
         elseif a == "--nostep"         # corpus engine: run only, don't also step
             o["nostep"] = true
+        elseif a == "--journaldir"     # per-shard journal: current.jl is one file,
+            o["journaldir"] = args[i += 1]   # so concurrent shards must not share it
         elseif a == "--patience"       # consecutive empty supposition rounds before stopping
             o["patience"] = parse(Int, args[i += 1])
         elseif a == "--maxdepth"
@@ -141,30 +144,34 @@ if o["selftest"]
 elseif o["engine"] == "supposition"
     nfound = supposition_campaign(examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
                                   modes=modes, cfg=cfg, patience=o["patience"],
-                                  seeddisk=!o["fresh"], journalsync=!o["nosync"])
+                                  seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                                  journaldir=o["journaldir"])
     @info "supposition campaign complete" nfound
     exit(nfound == 0 ? 0 : 2)   # non-zero exit on new findings, for CI
 elseif o["engine"] == "native"
     stats = campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], doshrink=!o["noshrink"],
-                     modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"])
+                     modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                     journaldir=o["journaldir"])
     @info "campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "step"
     stats = step_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
                           seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                          maxcmds=o["maxcmds"], usebreakpoints=!o["nobreakpoints"])
+                          maxcmds=o["maxcmds"], usebreakpoints=!o["nobreakpoints"],
+                          journaldir=o["journaldir"])
     @info "step campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "evalcode"
     stats = evalcode_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
-                              seeddisk=!o["fresh"], journalsync=!o["nosync"])
+                              seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                              journaldir=o["journaldir"])
     @info "evalcode campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "corpus"
     stats = corpus_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
                             maxsplice=o["maxsplice"], maxcmds=o["maxcmds"],
                             dostep=!o["nostep"], seeddisk=!o["fresh"],
-                            journalsync=!o["nosync"])
+                            journalsync=!o["nosync"], journaldir=o["journaldir"])
     @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else
