@@ -370,6 +370,52 @@ corpus-admission feedback) and **P3 items 12–13** (`eval_code` and
 `ExprSplitter` axes — `utils.jl`/`construct.jl` carry the two densest fix
 histories in the package and neither is fuzzed yet), then **P4** (EMI).
 
+## On "bigger programs" vs "splice real code"
+
+Both were raised as ways to attack the same problem. They are not equally
+valuable, and the difference is worth stating because it changes where effort
+goes.
+
+**Bigger programs are the weaker lever.** Program length does not change which
+interpreter code paths are reachable — the grammar's *vocabulary* does. A
+200-statement program built from the same rules as a 30-statement one visits
+the same `step_expr!` arms, just more times. What length buys is deeper
+feature *interaction*, which is real but already addressed more cheaply by the
+nesting fix (P0.1) and swarm concentration (P1.1): both raised interaction
+rates with program size held flat. Length also costs throughput and raises the
+abort rate, since `RecursiveInterpreter` burns budget interpreting Base. It is
+supported (`--big`, ~65 statements/program) and worth running as a background
+variant, but it is not where the next bug is.
+
+**Real code is the stronger lever, for a specific reason:** it contains
+constructs the grammar will never invent. Generators, `do` blocks,
+broadcasting, `where` clauses with constraints, iteration protocols, macros
+expanding to arbitrary lowered forms — no one is going to write grammar rules
+for all of that, and each is a distinct path through `construct.jl` and
+`interpret.jl`. This is the tree-splicer/icemaker result: derive inputs from a
+corpus instead of growing a grammar forever.
+
+**But it cannot use the differential value oracle**, and that is the part
+worth being careful about. Real code does I/O, calls `rand` and `time`,
+iterates dictionaries, depends on machine state — comparing observation
+streams against compiled Julia would produce endless false positives. That is
+precisely why the grammar excludes all of it by construction. Splicing real
+code into the *existing* axis would not "spice up" the differential fuzzer; it
+would break its oracle.
+
+The resolution is to pair real code with an oracle that needs no determinism.
+`--engine corpus` compares **failure mode only**: if `Core.eval` cannot run
+the fragment, discard it; if compiled Julia ran it and the interpreter did
+not, that is a finding. Plus the stepping invariants, which never needed
+determinism either. Note that this became possible only *because* the stepping
+axis was built first — before that there was no determinism-free oracle to
+attach a corpus to.
+
+So the honest ordering is: real code yes, and it is now built; bigger programs
+are a cheap background variant, not a priority; and the thing neither idea
+addresses — knowing *which* constructs are missing rather than guessing — is
+still P2, which is why it remains the top remaining item.
+
 ## References
 
 - Fuzzilli: https://github.com/googleprojectzero/fuzzilli (Docs/HowFuzzilliWorks.md)

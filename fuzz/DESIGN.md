@@ -303,12 +303,26 @@ this and the interpreter did not" is reported, plus the stepping invariants
 from the axis above. Comparing whether execution failed, never what it
 computed, is what makes nondeterministic real code usable as input.
 
-Two things that matter in practice: a denylist keeps fragments with side
-effects (I/O, processes, threads, `ccall`) and unbounded blocking out of the
-corpus, and definitions of another module's methods are skipped since they
-would leak between cases. The sandbox module imports `Test`, `Random`,
-`LinearAlgebra`, `Dates` and `Printf` — without that prelude, 128 of 150 cases
-were discarded for missing names; with it, roughly half of all cases execute.
+Two mechanisms make this work in practice, both deliberately derived rather
+than enumerated:
+
+- **Safety filtering is an AST check, not a text search.** `calls_unsafe`
+  walks the expression and looks at what sits in *call position*, reducing
+  `f`, `Mod.f` and `f{T}` to a bare name. Substring matching on rendered
+  source is wrong in both directions: `myopen(path)` contains `"open("` and
+  would be dropped for nothing, while `Base.rm(p)` slips past a search for
+  `"rm("`. It is still a policy list, and no static check survives an indirect
+  call — the actual guarantee is the crash-safe journal plus a restart loop,
+  which already exists for exactly this.
+- **Missing imports are recovered from the failure, not guessed.** A fragment
+  lifted from Julia's test suite usually does not carry the import it needs,
+  because the `runtests.jl` that included it had already done `using Test`. So
+  the reference run reads the `UndefVarError`, finds a loaded module that
+  exports that name (`supplying_module`), adds the import and retries. No list
+  of stdlibs to maintain, and it covers whatever a future corpus directory
+  happens to need. Measured on 200 cases: 23% of cases execute using only the
+  imports each fragment's own file declared, 49% with repair.
+
 The `ran` vs `discarded_junk` counters exist so that ratio stays visible: a
 campaign that discards everything would otherwise report a perfect
 100%-agreed line while testing nothing.

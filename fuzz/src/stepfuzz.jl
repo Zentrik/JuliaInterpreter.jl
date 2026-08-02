@@ -67,6 +67,16 @@ StepOutcome(status, obs, detail, n, cmds, site) = StepOutcome(status, obs, detai
 # nothing if the package appears nowhere in the backtrace. That location is the
 # fingerprint salt: without it every internal error — whatever broke, wherever —
 # would share one dedup bucket, and the first one reported would mask the rest.
+
+# The package's own source directory, resolved once. Everything under it is
+# "internal" — no list of file names to maintain, and a file added to the
+# package tomorrow is covered automatically.
+const JI_SRCDIR = let p = pathof(JuliaInterpreter)
+    p === nothing ? "" : dirname(abspath(p))
+end
+
+isinternalfile(path::AbstractString) = !isempty(JI_SRCDIR) && startswith(abspath(path), JI_SRCDIR)
+
 function internalframe(bt)
     for fr in bt
         s = try
@@ -74,14 +84,10 @@ function internalframe(bt)
         catch
             continue
         end
-        # Frames from this package's own source. The harness lives outside
-        # src/, so its own frames never match. `interpret.jl` is deliberately
-        # included: an internal error there during stepping is still a bug in
-        # the stepping path that reached it.
-        isinternal = occursin("JuliaInterpreter", s) ||
-                     any(f -> occursin(f, s), ("commands.jl", "breakpoints.jl",
-                                               "construct.jl", "interpret.jl", "utils.jl"))
-        isinternal && return (fr.func, string(basename(s), ":", fr.line))
+        # The harness lives outside the package's src/, so its own frames never
+        # match. Frames from `interpret.jl` count too: an internal error there
+        # during stepping is still a bug in the path that reached it.
+        isinternalfile(s) && return (fr.func, string(basename(s), ":", fr.line))
     end
     return nothing
 end

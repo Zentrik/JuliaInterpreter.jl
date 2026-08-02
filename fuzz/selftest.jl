@@ -2,6 +2,7 @@
 #   julia --project=fuzz fuzz/run.jl --selftest
 
 using Test
+using Dates   # for the corpus import-repair assertions
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                nstatements, Cfg, run_both, run_all, shrink, genprogram, render
@@ -375,6 +376,22 @@ end
         @test !FuzzJI.corpus_ok(:(while true; end))
         @test !FuzzJI.corpus_ok(Expr(:using, Expr(:., :Foo)))
         @test !FuzzJI.corpus_ok(Expr(:module, true, :M, Expr(:block)))
+
+        # The filter looks at what is *called*, not at the rendered text, so a
+        # qualified or aliased spelling cannot slip past...
+        @test FuzzJI.calls_unsafe(:(Base.rm(p)))
+        @test FuzzJI.calls_unsafe(:(let; x = 1; Base.Filesystem.mv(a, b); end))
+        @test FuzzJI.calls_unsafe(:(@async f()))
+        @test FuzzJI.calls_unsafe(:(f(g(open(path)))))     # nested in an argument
+        # ... and an innocent name that merely *contains* a dangerous one is not
+        # rejected, which substring matching got wrong.
+        @test !FuzzJI.calls_unsafe(:(myopen(path)))
+        @test !FuzzJI.calls_unsafe(:(x = runtime_value + 1))
+        @test FuzzJI.corpus_ok(:(myopen(path)))
+        # Callee reduction handles qualified, parameterized and GlobalRef forms.
+        @test FuzzJI.calleename(:(Base.Foo.bar)) === :bar
+        @test FuzzJI.calleename(:(f{Int})) === :f
+        @test FuzzJI.calleename(GlobalRef(Base, :rm)) === :rm
         # Method definitions on another module's function register globally and
         # would leak between cases.
         @test FuzzJI.defines_foreign_method(:(Base.foo(x) = 1))
@@ -393,8 +410,24 @@ end
         @test FuzzJI.corpusverdict(real).class === :corpus_internal_error
         # An actual round trip: a self-contained fragment must run on both
         # sides, and one that needs a missing name must be discarded.
-        @test FuzzJI.corpus_run(Expr(:toplevel, :(zqx = 1 + 1)); nstmts=100_000).status === :ok
-        @test FuzzJI.corpus_run(Expr(:toplevel, :(znotdefined_xyz + 1)); nstmts=100_000).status === :junk
+        @test FuzzJI.corpus_run(Expr(:toplevel, :(zqx = 1 + 1)), Expr[]; nstmts=100_000).status === :ok
+        # A name nothing can supply stays junk...
+        @test FuzzJI.corpus_run(Expr(:toplevel, :(znotdefined_xyz + 1)), Expr[]; nstmts=100_000).status === :junk
+
+        # ... but a name some loaded module *does* export is repaired rather
+        # than discarded. Fragments lifted from a test file rarely carry the
+        # import they need (their runtests.jl did the `using`), so the missing
+        # import is recovered from the UndefVarError itself instead of from a
+        # hardcoded list of stdlibs.
+        @test FuzzJI.supplying_module(:Date) === Dates
+        @test FuzzJI.supplying_module(Symbol("@testset")) === Test
+        @test FuzzJI.supplying_module(:znotdefined_xyz) === nothing
+        needsdates = Expr(:toplevel, :(zdt = Date(2020, 1, 1)))
+        o = FuzzJI.corpus_run(needsdates, Expr[]; nstmts=100_000)
+        @test o.status === :ok
+        # and the repaired prelude is handed on, so the stepping stage runs in
+        # the same environment the reference succeeded in
+        @test any(isequal(:(using Dates)), o.prelude)
     end
 
     @testset "eval_code axis: probe selection and verdicts" begin
