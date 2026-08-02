@@ -39,6 +39,28 @@
 
 using JuliaInterpreter: ExprSplitter, Frame
 
+# Corpus fragments print: a `@testset` lifted from Julia's test suite writes a
+# summary, and a failing one writes a stack trace. That is the fragment doing
+# its job, not a finding — but at campaign scale it buries the harness's own
+# reports and costs real I/O (measured: 261 KB in 11 minutes from one shard).
+# Only stdout is redirected; the harness logs through stderr, so its @info
+# output and any finding it reports still reach the log.
+function quiet_stdout(f)
+    old = stdout
+    rd, wr = redirect_stdout()
+    # Drain the pipe, or a fragment that prints more than the buffer blocks
+    # forever waiting for a reader.
+    drain = @async read(rd)
+    try
+        return f()
+    finally
+        redirect_stdout(old)
+        close(wr)
+        wait(drain)
+        close(rd)
+    end
+end
+
 # Operations a corpus fragment must not perform in the fuzzer's own process:
 # they touch the machine outside it, block without bound, or hand execution to
 # another task or the compiler in ways this harness cannot bound.
@@ -452,11 +474,12 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
             stats.cases += 1
             # Lowering is part of what we are testing, so no parse gate here:
             # a fragment that does not lower is skipped by ExprSplitter itself.
-            o = corpus_run(case, prelude; nstmts)
-            # Only step fragments compiled Julia already ran cleanly: stepping a
-            # fragment that cannot run at all says nothing about the debugger.
-            if o.status === :ok && dostep
-                o = corpus_step(case, o.prelude, rng; maxcmds)
+            o = quiet_stdout() do
+                r = corpus_run(case, prelude; nstmts)
+                # Only step fragments compiled Julia already ran cleanly:
+                # stepping one that cannot run at all says nothing about the
+                # debugger.
+                (r.status === :ok && dostep) ? corpus_step(case, r.prelude, rng; maxcmds) : r
             end
             v = corpusverdict(o)
             # Track discards separately: if nearly every case is junk, the
