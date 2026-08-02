@@ -1,5 +1,10 @@
 # FuzzJI: differential fuzzing of JuliaInterpreter against compiled Julia
 
+> **Picking this up?** Start with [`NEXT.md`](NEXT.md): current state of each
+> axis, the ranked work list, and the calibration traps that cost the most
+> time. This file explains how the harness works; `yield-analysis.md` explains
+> why it is built this way.
+
 Generate random-but-valid Julia programs, run each one twice in the same
 process — compiled (`Core.eval`, the reference) and interpreted
 (`ExprSplitter` + `Frame`, the system under test) — and compare everything
@@ -383,20 +388,26 @@ and belong in `SUPPRESSIONS` if hit).
   destructuring, do-blocks, `@generated` functions, parametric structs,
   inner constructors, defaults referencing earlier params. CI: a time-boxed
   nightly job that uploads `findings/` as artifacts and exits 2 on news.
-- **M3 — feedback + debugger axis**: a `CoverageInterp <: Interpreter`
-  recording which stmt heads/builtins/intrinsics/dispatch paths each case
-  touches (cheap semantic coverage: report grammar gaps, bias seeds);
-  fuzz `debug_command` scripts (`:n`/`:s`/`:until`/`:finish` + random
-  breakpoints) over the same programs, asserting no internal error and
-  final-value agreement. Structured concurrency subset (`@sync`/`@async`,
-  `fetch`, bounded `Channel`, `-t1`, observations only from the root task) —
-  noting task bodies escape interpretation (the scheduler, not interpreted
-  code, invokes them), so the surface is task setup, `@sync` lowering,
-  exception propagation, and `:enter`/`:leave` interaction with task
-  switches.
-- **M4 — pluggable lowerer**: the harness's lowering step as an injectable
-  function; a JuliaLowering.jl configuration to flush out flisp-idiom
-  assumptions in `construct.jl`/`commands.jl` before Base switches lowerers.
+- **M3 — debugger axis** (done): `--engine step` fuzzes `debug_command` walks,
+  and `--engine evalcode` fuzzes `eval_code` at paused frames. See the two
+  sections above. The *feedback* half of M3 — a `CoverageInterp <: Interpreter`
+  recording which statement heads, builtin arms and dispatch paths each case
+  touches — is **not** done and is the highest-value remaining item.
+- **M3.5 — corpus axis** (done): `--engine corpus` runs and splices real Julia
+  source, with an oracle that compares failure mode only so nondeterministic
+  code is usable.
+- Still open, in priority order: semantic coverage (above), version-aware
+  triage of reference-side crashes, shrinking for the three newer axes, an
+  `ExprSplitter` axis, throughput, EMI, a nightly CI job. Structured
+  concurrency (`@sync`/`@async` with observations only from the root task) and
+  a **pluggable lowerer** — the lowering step as an injectable function, so a
+  JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
+  `construct.jl`/`commands.jl` before Base switches lowerers — remain
+  unstarted.
+
+**→ See [`NEXT.md`](NEXT.md)** for the full ranked work list, the current
+state of each axis, and the calibration traps worth knowing before touching
+any of it.
 
 ## Design decisions log
 
