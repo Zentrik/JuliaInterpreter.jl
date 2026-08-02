@@ -1456,6 +1456,27 @@ end
 end
 end
 
+@testset "invoke type-conformance is enforced" begin
+    # `invoke(f, types, args...)` requires the actual args to conform to `types`;
+    # a non-conforming call is a TypeError under compilation. The interpreter's
+    # `invoke` path must not silently run the selected method on out-of-type
+    # arguments (which would return a wrong value or throw an unrelated error).
+    conf_wrap(f, x) = invoke(f, Tuple{Float64}, x)
+    # -3 is an Int, not <: Float64: must raise TypeError, matching compiled invoke.
+    @test_throws TypeError @interpret conf_wrap(abs, -3)
+    @test_throws TypeError @interpret interp=NonRecursiveInterpreter() conf_wrap(abs, -3)
+    # identity would silently return the Int unchanged if the check were skipped.
+    conf_identity(x) = invoke(identity, Tuple{Float64}, x)
+    @test_throws TypeError @interpret conf_identity(3)
+    # Conforming calls (exact and via abstract widening) still work.
+    conf_ok(f, x) = invoke(f, Tuple{Float64}, x)
+    @test (@interpret conf_ok(abs, -3.0)) == 3.0
+    conf_real(f, x) = invoke(f, Tuple{Real}, x)
+    @test (@interpret conf_real(abs, -3)) == 3
+    conf_add(x, y) = invoke(+, Tuple{Int,Int}, x, y)
+    @test (@interpret conf_add(2, 3)) == 5
+end
+
 @testset "NewvarNode undefines a reused slot" begin
     function newvar_reuse(flags)
         out = Bool[]

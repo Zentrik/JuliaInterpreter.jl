@@ -398,7 +398,15 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         else
             # Select the method in the frame's world; plain `which` would use the task's
             # (possibly newer) world.
-            f_invoked = whichtt(Base.signature_type(fargs[2], argtypes); world=frame.world)
+            invoke_sig = Base.signature_type(fargs[2], argtypes)
+            # Native `invoke` requires the actual arguments to conform to the declared
+            # `argtypes`; a non-conforming call is a TypeError. Without this check the
+            # interpreter would silently run the selected method on out-of-type
+            # arguments — returning a wrong value or throwing an unrelated error deep
+            # inside the callee — where compiled code raises a clean TypeError. Defer
+            # to native `invoke` to raise the same error.
+            sig <: invoke_sig || return invoke(fargs[2:end]...)
+            f_invoked = whichtt(invoke_sig; world=frame.world)
             f_invoked === nothing && throw(MethodError(fargs[2], argtypes, frame.world))
         end
         ret = prepare_framecode(f_invoked, sig; enter_generated, world=frame.world)
