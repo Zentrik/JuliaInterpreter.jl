@@ -9,8 +9,10 @@ mutable struct VInfo
     name::Symbol
     sum::TySum
     isglobal::Bool
+    isconst::Bool   # `const` global: never a reassignment target
 end
-VInfo(name::Symbol, sum::TySum) = VInfo(name, sum, false)
+VInfo(name::Symbol, sum::TySum) = VInfo(name, sum, false, false)
+VInfo(name::Symbol, sum::TySum, isglobal::Bool) = VInfo(name, sum, isglobal, false)
 
 mutable struct FnInfo
     name::Symbol
@@ -42,9 +44,13 @@ mutable struct Ctx
     depth::Int                      # remaining expression depth
     namecounter::Int
     infunc::Bool                    # generating inside a function/closure body
+    loopdepth::Int                  # enclosing for/while loops (break/continue legality)
+    retsum::Union{Nothing,TySum}    # current function's return summary (nothing at toplevel);
+                                    # gates `return` statements and fixes their value summary
 end
 
-Ctx(rng::AbstractRNG, cfg::Cfg=Cfg()) = Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false)
+Ctx(rng::AbstractRNG, cfg::Cfg=Cfg()) =
+    Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false, 0, nothing)
 
 # Is generation currently inside a local (non-module) scope? Determines
 # whether writing to a module global needs the `global` keyword.

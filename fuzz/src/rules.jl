@@ -111,13 +111,21 @@ const BUILTIN_PROBES = String[
     "Core.Intrinsics.add_int(3, 4)",
     "Core.Intrinsics.checked_sadd_int(typemax(Int), 1)",
     "Core.Intrinsics.mul_int(6, 7)",
+    "Core.Intrinsics.flipsign_int(3, -1)",
+    "Core.Intrinsics.ctlz_int(0)",
+    "Core.Intrinsics.not_int(true)",
+    "Core.Intrinsics.copysign_float(1.5, -0.0)",
+    "Core.Intrinsics.abs_float(-0.0)",
     "Core.bitcast(Float64, 0)",
     "Core.bitcast(Float64, Int64(4607182418800017408))",
     "reinterpret(Float64, Int64(0))",
     "Base.add_int(1, 2)",
     "Int8(300)",
     "trunc(Int8, 300.0)",
-    "unsafe_trunc(Int8, 300.0)",
+    # NOTE: in-range only — out-of-range unsafe_trunc is an *unspecified value*
+    # (LLVM poison under compilation, runtime intrinsic under interpretation),
+    # so an out-of-range probe would be a nondeterministic false positive.
+    "unsafe_trunc(Int8, 100.0)",
     # equality / identity / ordering builtins
     "===(1, 1.0)",
     "Core.ifelse(true, 1, 2)",
@@ -130,8 +138,37 @@ const BUILTIN_PROBES = String[
     "Base.arrayref(true, [1,2,3], 4)",
     "Core.svec(1, 2, 3)",
     "getindex((1, 2, 3))",
-    # modifyfield / replacefield (newer builtins JuliaInterpreter must track)
+    # Memory (1.11+; on older Julia both sides throw UndefVarError — symmetric)
+    "length(Memory{Int}(undef, 3))",
+    "let m = Memory{Int}(undef, 2); m[1] = 5; m[1] end",
+    # atomics field family: hand-written per-arity dispatch in src/builtins.jl,
+    # so probe every arity, wrong arities, and ordering violations
+    "Core.swapfield!(Ref(3), :x, 7)",
+    "Core.swapfield!(Ref(3), :x, 7, :sequentially_consistent)",
+    "Core.swapfield!(Ref(3), :x)",
+    "first(Core.modifyfield!(Ref(2), :x, +, 5))",
+    "Core.modifyfield!(Ref(2), :x, +)",
+    "Core.replacefield!(Ref(1), :x, 1, 9)",
+    "Core.replacefield!(Ref(1), :x, 2, 9)",
+    "Core.replacefield!(Ref(1), :x, 1, 9, :sequentially_consistent, :sequentially_consistent)",
+    "Core.setfieldonce!(Ref(1), :x, 5)",
+    "setfield!(Ref(1), :x, 2, :sequentially_consistent)",
+    "getfield(Ref(1), :x, :sequentially_consistent)",
+    # invoke / invokelatest: dedicated call paths in the interpreter
+    "invoke(abs, Tuple{Int}, -3)",
+    "invoke(+, Tuple{Int,Int}, 2, 3)",
+    "invoke(abs, Tuple{Float64}, -3)",
+    "Base.invokelatest(*, 6, 7)",
+    # opaque closures: lower to :new_opaque_closure, a dedicated interpreter path
+    "(Base.Experimental.@opaque x -> x + 1)(41)",
+    "(Base.Experimental.@opaque (a, b) -> a * b)(6, 7)",
+    # globals reflection
+    "Core.getglobal(Base, :pi)",
+    "Core.getglobal(Base, :definitely_not_a_name_xyz)",
+    "isdefined(Base, :pi, :sequentially_consistent)",
+    # misc barriers / asserts
     "Base.donotdelete(1)",
+    "Base.inferencebarrier(3) + 1",
     "Base.compilerbarrier(:const, 1)",
     "Base.compilerbarrier(:type, 1)",
     "typeassert(1, Int)",
@@ -157,6 +194,10 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     else # AnyT
         push!(opts, (2.0, :leaf), (1.5, :guardix), (1.0, :callvar), (0.8, :guarddiv), (0.6, :ternary),
               (1.4, :builtin))
+        # guarded call with one deliberately wrong-typed argument: MethodError
+        # construction / localmethtable miss, or an error deep inside the callee
+        # propagating through interpreted frames
+        !isempty(ctx.fns) && push!(opts, (0.8, :badcall))
     end
     # Calls into generated functions, for any want their return satisfies:
     if !isempty(fnsreturning(ctx, want))
@@ -176,7 +217,9 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         return genleaf(ctx, want)
     elseif kind === :arith
         op = want == IntT ? pick(rng, [:+, :-, :*]) : pick(rng, [:+, :-, :*, :/])
-        return Ex(:binop, want, op, [genex(ctx, want), genex(ctx, want)])
+        # Float arithmetic occasionally mixes in an Int operand (promotion path)
+        bsum = (want == FloatT && rand(rng) < 0.25) ? IntT : want
+        return Ex(:binop, want, op, [genex(ctx, want), genex(ctx, bsum)])
     elseif kind === :intdiv  # unguarded, denominator a nonzero literal
         op = pick(rng, [:÷, :%])
         d = pick(rng, [1, 2, 3, 7, -1, -3])
@@ -267,13 +310,26 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         return Ex(:kwcall, f.ret, (f.name, chosen), args)
     elseif kind === :builtin
         return Ex(:guard, AnyT(), nothing, [Ex(:src, AnyT(), pick(rng, BUILTIN_PROBES))])
+    elseif kind === :badcall
+        f = pick(rng, ctx.fns)
+        sig = pick(rng, f.sigs)
+        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
+        idxs = [i for i in eachindex(sig) if sig[i] isa ConcT]
+        if !isempty(idxs)
+            i = pick(rng, idxs)
+            wrongs = [s for s in TySum[IntT, FloatT, StrT, BoolT, SymT] if !compat_eq(s, sig[i])]
+            args[i] = genex(ctx, pick(rng, wrongs))
+        end
+        return Ex(:guard, AnyT(), nothing, [Ex(:call, AnyT(), f.name, args)])
     elseif kind === :getprop
         cands = [v for v in visiblevars(ctx) if v.sum isa StructT && any(fs -> compat(want, fs), (v.sum::StructT).fieldsums)]
         v = pick(rng, cands)
         s = v.sum::StructT
         idxs = [i for i in eachindex(s.fieldsums) if compat(want, s.fieldsums[i])]
         i = pick(rng, idxs)
-        return Ex(:prop, s.fieldsums[i], s.fieldnames[i], [Ex(:var, v.sum, v.name)])
+        # atomic fields must be read with @atomic (plain access is an error)
+        return Ex(s.atomicmask[i] ? :aprop : :prop, s.fieldsums[i], s.fieldnames[i],
+                  [Ex(:var, v.sum, v.name)])
     elseif kind === :closure
         return genclosure(ctx, want isa FnT ? want : FnT(TySum[IntT], AnyT()))
     end
@@ -287,7 +343,11 @@ end
 function genclosure(ctx::Ctx, want::FnT)::Ex
     rng = ctx.rng
     params = [freshname(ctx, "p") for _ in want.psums]
-    caps = [v for v in visiblevars(ctx) if isnumeric(v.sum)]
+    # Mutable captures must be locals: `cap = cap + p` inside a closure over a
+    # *global* makes cap a closure-local instead (shadowing), and the rhs read
+    # of the still-unassigned local throws UndefVarError — a degenerate path,
+    # not the Box path this rule exists to exercise.
+    caps = [v for v in visiblevars(ctx) if isnumeric(v.sum) && !v.isglobal]
     if !isempty(caps) && !isempty(want.psums) && rand(rng) < 0.35
         # (p, ...) -> (cap = cap <op> p′; cap)   where p′ is a param of cap's summary
         cap = pick(rng, caps)
@@ -334,15 +394,18 @@ function newvarsum(ctx::Ctx)
     return AnyT()
 end
 
-# Variables eligible as reassignment targets. Growable globals are excluded
-# inside function bodies: a function is called an unbounded number of times, so
-# letting it grow a growable global — even by a bounded amount per call — would
-# accumulate without bound (the reference side has no memory cap). Growable
-# globals are still writable from toplevel/let, where the write count is bounded
-# by program size.
+# Variables eligible as reassignment targets. `const` globals are never
+# reassigned (an error since 1.12, a warning before). Growable globals are
+# excluded inside function bodies: a function is called an unbounded number of
+# times, so letting it grow a growable global — even by a bounded amount per
+# call — would accumulate without bound (the reference side has no memory cap).
+# Growable globals are still writable from toplevel/let, where the write count
+# is bounded by program size.
 reassign_targets(ctx::Ctx) =
-    ctx.infunc ? [v for v in visiblevars(ctx) if !(v.isglobal && growablevar(v))] :
-                 visiblevars(ctx)
+    [v for v in visiblevars(ctx) if !v.isconst && !(ctx.infunc && v.isglobal && growablevar(v))]
+
+atomicnumfields(s::StructT) =
+    [i for i in eachindex(s.fieldnames) if s.atomicmask[i] && isnumeric(s.fieldsums[i])]
 
 function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     rng = ctx.rng
@@ -358,10 +421,27 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     # bound. Allow push! only to vectors that aren't global-inside-a-function.
     pushable = [v for v in visiblevars(ctx) if v.sum isa VecT && !(ctx.infunc && v.isglobal)]
     !isempty(pushable) && push!(opts, (1.0, :push))
-    anyvec && push!(opts, (0.7, :setindex), (0.5, :alias))
+    anyvec && push!(opts, (0.7, :setindex))
+    # aliasing: vectors and mutable structs (mutation through one name observed
+    # through the other — identity semantics)
+    aliasable = any(v -> v.sum isa VecT || (v.sum isa StructT && (v.sum::StructT).ismutable),
+                    visiblevars(ctx))
+    aliasable && push!(opts, (0.5, :alias))
     anymutstruct = any(v -> v.sum isa StructT && (v.sum::StructT).ismutable, visiblevars(ctx))
     anymutstruct && push!(opts, (0.8, :setprop))
+    any(v -> v.sum isa StructT && !isempty(atomicnumfields(v.sum::StructT)), visiblevars(ctx)) &&
+        push!(opts, (0.5, :amodify))
     push!(opts, (0.6, :compr))
+    # the undefined-variable dimension: conditionally-defined bindings observed
+    # via @isdefined and guarded reads (UndefVarError as expected oracle data)
+    allowobs && push!(opts, (0.55, :maybeundef))
+    allowobs && blockdepth <= 2 && push!(opts, (0.5, :loopundef))
+    # `local x::T = v` — conversion/typeassert on every later reassignment
+    inlocal(ctx) && push!(opts, (0.7, :typedlocal))
+    # control-flow exits; break/continue through try/finally is the :enter/:leave
+    # and exception-frame-unwinding surface
+    ctx.loopdepth > 0 && push!(opts, (1.0, :brk), (0.8, :cont))
+    ctx.retsum !== nothing && push!(opts, (0.9, :ret))
     kind = wpick(rng, opts)
 
     if kind === :assignnew
@@ -399,7 +479,15 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         v = pick(rng, cands)
         s = v.sum::StructT
         i = rand(rng, 1:length(s.fieldnames))
-        return St(:setprop, (v.name, s.fieldnames[i]); exs=[genex(ctx, s.fieldsums[i])])
+        return St(:setprop, (v.name, s.fieldnames[i], s.atomicmask[i]);
+                  exs=[genex(ctx, s.fieldsums[i])])
+    elseif kind === :amodify
+        cands = [v for v in visiblevars(ctx) if v.sum isa StructT && !isempty(atomicnumfields(v.sum::StructT))]
+        v = pick(rng, cands)
+        s = v.sum::StructT
+        i = pick(rng, atomicnumfields(s))
+        op = pick(rng, [:+, :-, :*])
+        return St(:amodify, (v.name, s.fieldnames[i], op); exs=[genex(ctx, s.fieldsums[i])])
     elseif kind === :compr
         # v = Type[ body for i in 1:n (if cond)? ]
         eltsum = pick(rng, TySum[IntT, FloatT])
@@ -429,13 +517,19 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     elseif kind === :for
         ivar = freshname(ctx, "i")
         n = rand(rng, 0:ctx.cfg.maxloop)
+        ctx.loopdepth += 1
         body = genblock(ctx, blockdepth; n=rand(rng, 1:3), extra=[VInfo(ivar, IntT)])
+        ctx.loopdepth -= 1
         return St(:for, (ivar, n); blocks=[body])
     elseif kind === :while
         fuelvar = freshname(ctx, "fuel")
         fuel = rand(rng, 1:ctx.cfg.maxloop)
         cond = genex(ctx, BoolT)
+        # The rendered fuel decrement is the first statement of the loop body,
+        # so a generated `continue` cannot skip it — termination is preserved.
+        ctx.loopdepth += 1
         body = genblock(ctx, blockdepth; n=rand(rng, 1:3))
+        ctx.loopdepth -= 1
         return St(:while, (fuelvar, fuel); exs=[cond], blocks=[body])
     elseif kind === :let
         nb = rand(rng, 1:2)
@@ -452,11 +546,24 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     elseif kind === :try
         excvar = freshname(ctx, "err")
         hasfinally = rand(rng) < 0.3
+        haselse = rand(rng) < 0.25   # try/catch/else — distinct (1.8+) lowering
         body = genblock(ctx, blockdepth; n=rand(rng, 1:3))
         handler = genblock(ctx, blockdepth; n=rand(rng, 1:2), extra=[VInfo(excvar, AnyT())])
+        # occasionally rethrow out of the handler (conditionally): exception
+        # propagation out of an interpreted catch block
+        rand(rng) < 0.25 && push!(handler, St(:rethrowif; exs=[genex(ctx, BoolT)]))
         blocks = [body, handler]
-        hasfinally && push!(blocks, genblock(ctx, blockdepth; n=1))
-        return St(:try, (excvar, hasfinally); blocks=blocks)
+        haselse && push!(blocks, genblock(ctx, blockdepth; n=1))
+        if hasfinally
+            # No break/continue/return from inside finally: Julia's lowering
+            # rejects some of these forms, and the rest are pathological enough
+            # to drown the signal. Mask the exit context while generating it.
+            saveld, saveret = ctx.loopdepth, ctx.retsum
+            ctx.loopdepth = 0; ctx.retsum = nothing
+            push!(blocks, genblock(ctx, blockdepth; n=1))
+            ctx.loopdepth = saveld; ctx.retsum = saveret
+        end
+        return St(:try, (excvar, hasfinally, haselse); blocks=blocks)
     elseif kind === :push
         vs = [v for v in visiblevars(ctx) if v.sum isa VecT && !(ctx.infunc && v.isglobal)]
         v = pick(rng, vs)
@@ -468,11 +575,42 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         elt = (v.sum::VecT).elt
         return St(:setindex, v.name; exs=[genex(ctx, IntT), genex(ctx, elt isa AnyT ? pick(rng, CONCRETE_MENU) : elt)])
     elseif kind === :alias
-        vs = [v for v in visiblevars(ctx) if v.sum isa VecT]
+        vs = [v for v in visiblevars(ctx)
+              if v.sum isa VecT || (v.sum isa StructT && (v.sum::StructT).ismutable)]
         v = pick(rng, vs)
         name = freshname(ctx, "al")
         st = St(:alias, (name, v.name, v.sum))
         declare!(ctx, VInfo(name, v.sum))
+        return st
+    elseif kind === :brk
+        return St(:brk; exs=[genex(ctx, BoolT)])
+    elseif kind === :cont
+        return St(:cont; exs=[genex(ctx, BoolT)])
+    elseif kind === :ret
+        return St(:ret; exs=[genex(ctx, BoolT), genex(ctx, ctx.retsum::TySum)])
+    elseif kind === :maybeundef
+        name = freshname(ctx, "u")
+        cond = genex(ctx, BoolT)
+        rhs = genex(ctx, pick(rng, CONCRETE_MENU))
+        # deliberately NOT declared in ctx: later statements must not reference
+        # a maybe-undefined binding unguarded
+        return St(:maybeundef, name; exs=[cond, rhs])
+    elseif kind === :loopundef
+        ivar = freshname(ctx, "li")
+        xname = freshname(ctx, "lx")
+        n = rand(rng, 2:3)
+        when = rand(rng, 2:n)
+        pushscope!(ctx)
+        declare!(ctx, VInfo(ivar, IntT))
+        rhs = genex(ctx, pick(rng, TySum[IntT, FloatT]))
+        popscope!(ctx)
+        return St(:loopundef, (ivar, xname, n, when); exs=[rhs])
+    elseif kind === :typedlocal
+        s = pick(rng, TySum[IntT, FloatT])
+        rhs = genex(ctx, s)
+        name = freshname(ctx, "t")
+        st = St(:typedlocal, (name, s); exs=[rhs])
+        declare!(ctx, VInfo(name, s))
         return st
     end
     error("unreachable stmt kind $kind")
@@ -536,14 +674,16 @@ function genfundef(ctx::Ctx)::St
     for (kn, _) in kwparams
         declare!(ctx, VInfo(kn, IntT))
     end
-    wasinfunc = ctx.infunc
+    wasinfunc, wasret, wasloop = ctx.infunc, ctx.retsum, ctx.loopdepth
     ctx.infunc = true
+    ctx.retsum = retsum   # enables early `return` statements of the right summary
+    ctx.loopdepth = 0     # function boundary: enclosing loops aren't break targets
     body = St[]
     for _ in 1:rand(rng, 0:3)
         push!(body, genstmt(ctx; allowobs=true, blockdepth=1))
     end
     retex = genex(ctx, retsum)
-    ctx.infunc = wasinfunc
+    ctx.infunc, ctx.retsum, ctx.loopdepth = wasinfunc, wasret, wasloop
     popscope!(ctx)
     fi = FnInfo(name, [TySum[p[2] for p in params]], retex.sum,
                 Symbol[kn for (kn, _) in kwparams], vararg)
@@ -553,7 +693,9 @@ function genfundef(ctx::Ctx)::St
 end
 
 # A struct or mutable struct definition. Fields are concrete-summarized so
-# construction and field access have well-defined summaries.
+# construction and field access have well-defined summaries. Mutable structs
+# occasionally declare `@atomic` fields: atomic get/set/modify lower to the
+# ordering-carrying getfield/setfield!/modifyfield! builtin arities.
 function genstructdef(ctx::Ctx)::St
     rng = ctx.rng
     name = freshname(ctx, "S")
@@ -561,23 +703,28 @@ function genstructdef(ctx::Ctx)::St
     fnames = [freshname(ctx, "fld") for _ in 1:nf]
     fsums = TySum[pick(rng, SCALAR_NONGROW) for _ in 1:nf]
     ismutable = rand(rng, Bool)
-    s = StructT(name, fnames, fsums, ismutable)
+    mask = ismutable ? [rand(ctx.rng) < 0.3 for _ in 1:nf] : fill(false, nf)
+    s = StructT(name, fnames, fsums, ismutable, mask)
     push!(ctx.structs, s)
     # register the constructor as a function so call sites can build values
     push!(ctx.fns, FnInfo(name, [copy(fsums)], s))
     return St(:structdef, s)
 end
 
-# A module-level global variable (declared with `const` occasionally). Written
-# in the `pre` section and visible to functions and body alike.
+# A module-level global variable: occasionally `const` (never reassigned; the
+# 1.12 binding-partition surface) or type-annotated (`global g::T = v` — every
+# later write goes through convert + typeassert against the binding type).
 function genglobal(ctx::Ctx)::St
     rng = ctx.rng
     s = pick(rng, CONCRETE_MENU)
     rhs = genex(ctx, s)
     name = freshname(ctx, "g")
-    v = VInfo(name, rhs.sum, true)
+    isconst = rand(rng) < 0.2
+    typed = !isconst && isnumeric(rhs.sum) && rand(rng) < 0.35
+    decl = isconst ? :const : typed ? Symbol(typename(rhs.sum::ConcT)) : :none
+    v = VInfo(name, rhs.sum, true, isconst)
     push!(ctx.scopes[1], v)   # module-global scope
-    return St(:assign, (name, rhs.sum, true, false); exs=[rhs])
+    return St(:assign, (name, rhs.sum, true, false, decl); exs=[rhs])
 end
 
 # A second method for an existing function: same arity, different first-param

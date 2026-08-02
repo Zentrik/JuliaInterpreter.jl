@@ -44,6 +44,13 @@ function allbound!(out::Set{Symbol}, st::St)
         push!(out, st.meta[1])
     elseif st.kind === :structdef
         push!(out, (st.meta::StructT).name)
+    elseif st.kind === :typedlocal
+        push!(out, st.meta[1])
+    elseif st.kind === :maybeundef
+        push!(out, st.meta::Symbol)
+    elseif st.kind === :loopundef
+        push!(out, st.meta[1])
+        push!(out, st.meta[2])
     end
     for e in st.exs
         closureparams!(out, e)
@@ -102,7 +109,7 @@ function repairblock!(sts::Vector{St}, bound::Set{Symbol})
             (st.meta::Symbol) in bound || return false
         elseif st.kind === :alias
             (st.meta[2]::Symbol) in bound || return false
-        elseif st.kind === :setprop
+        elseif st.kind === :setprop || st.kind === :amodify
             (st.meta[1]::Symbol) in bound || return false
         end
         return true
@@ -165,14 +172,16 @@ end
 
 # -- the shrink loop ---------------------------------------------------------
 """
-    shrink(prog, fp; nstmts, maxattempts) -> Program
+    shrink(prog, fp; nstmts, maxattempts, interp) -> Program
 
 Greedily minimize `prog` while `run_both ∘ classify` keeps producing a finding
-with fingerprint `fp`.
+with fingerprint `fp`. `interp` selects which interpreter configuration the
+finding was made under (mode-tagged findings must re-check in their own mode).
 """
-function shrink(prog::Program, fp::String; nstmts::Int, maxattempts::Int=400)
+function shrink(prog::Program, fp::String; nstmts::Int, maxattempts::Int=400,
+                interp::Interpreter=RecursiveInterpreter())
     check = function (cand::Program)
-        r = run_both(render(cand); nstmts)
+        r = run_both(render(cand); nstmts, interp)
         r === nothing && return false
         v = classify(r...)
         return isfinding(v) && fingerprint(v) == fp

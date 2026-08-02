@@ -141,14 +141,14 @@ function run_ref(ex::Expr)::Outcome
     end
 end
 
-function run_interp(ex::Expr; nstmts::Int)::Outcome
+function run_interp(ex::Expr; nstmts::Int, interp::Interpreter=RecursiveInterpreter())::Outcome
     m = freshmodule()
     budget = nstmts
     try
         for (mod, frag) in ExprSplitter(m, ex)
             frame = Frame(mod, frag)
             while true
-                ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
+                ret, budget = evaluate_limited!(interp, frame, budget, true)
                 ret isa Aborted && return Outcome(:aborted, :none, getobs(m), "", "")
                 ret isa Some && break
                 @assert ret === nothing  # paused after a method definition; resume same frame
@@ -162,8 +162,18 @@ function run_interp(ex::Expr; nstmts::Int)::Outcome
     end
 end
 
-# nothing (not an Outcome pair) means the program was discarded pre-execution.
-function run_both(src::String; nstmts::Int)
+# The two interpreter configurations under test. :rec interprets everything
+# reachable (RecursiveInterpreter); :cmp is Compiled mode
+# (NonRecursiveInterpreter) — toplevel statements are stepped by the
+# interpreter but calls execute natively, a materially different path through
+# evaluate_call!/builtin dispatch.
+modeinterp(mode::Symbol) =
+    mode === :rec ? RecursiveInterpreter() :
+    mode === :cmp ? NonRecursiveInterpreter() :
+    error("unknown interp mode $mode (expected :rec | :cmp)")
+
+# Parse + lowering validity gate; returns the toplevel Expr or nothing.
+function parsegate(src::String)
     ex = try
         Meta.parseall(src)
     catch
@@ -177,7 +187,23 @@ function run_both(src::String; nstmts::Int)
     end
     isexpr(lwr, :error) && return nothing
     isexpr(lwr, :incomplete) && return nothing
+    return ex
+end
+
+# nothing (not an Outcome pair) means the program was discarded pre-execution.
+function run_both(src::String; nstmts::Int, interp::Interpreter=RecursiveInterpreter())
+    ex = parsegate(src)
+    ex === nothing && return nothing
     ref = run_ref(ex)
-    int = run_interp(ex; nstmts)
+    int = run_interp(ex; nstmts, interp)
     return (ref, int)
+end
+
+# Run the reference once and the interpreted side once per mode.
+# Returns nothing (discarded) or (ref, [(mode, Outcome), ...]).
+function run_all(src::String; nstmts::Int, modes::Tuple=(:rec, :cmp))
+    ex = parsegate(src)
+    ex === nothing && return nothing
+    ref = run_ref(ex)
+    return (ref, [(m, run_interp(ex; nstmts, interp=modeinterp(m))) for m in modes])
 end

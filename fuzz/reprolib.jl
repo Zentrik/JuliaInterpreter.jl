@@ -34,7 +34,10 @@ function repro_freshmodule(tag)
     return m
 end
 
-function reprorun(src::AbstractString)
+# `compiled=true` replays the interpreted side in Compiled mode
+# (NonRecursiveInterpreter: toplevel stepped, calls execute natively) — used by
+# findings tagged `cmp-`.
+function reprorun(src::AbstractString; compiled::Bool=false)
     ex = Meta.parseall(String(src))
 
     mref = repro_freshmodule(:Ref)
@@ -49,10 +52,12 @@ function reprorun(src::AbstractString)
     end
     refobs = copy(Base.invokelatest(getglobal, mref, :__OBS__))
 
+    interp = compiled ? JuliaInterpreter.NonRecursiveInterpreter() :
+                        JuliaInterpreter.RecursiveInterpreter()
     mint = repro_freshmodule(:Interp)
     intout = try
         for (mod, frag) in ExprSplitter(mint, ex)
-            JuliaInterpreter.finish_and_return!(Frame(mod, frag), true)
+            JuliaInterpreter.finish_and_return!(interp, Frame(mod, frag), true)
         end
         (:done, nothing)
     catch err

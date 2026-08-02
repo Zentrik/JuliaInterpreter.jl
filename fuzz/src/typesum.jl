@@ -27,7 +27,10 @@ struct StructT <: TySum
     fieldnames::Vector{Symbol}
     fieldsums::Vector{TySum}
     ismutable::Bool
+    atomicmask::Vector{Bool}   # per-field `@atomic` (mutable structs only)
 end
+StructT(name::Symbol, fieldnames, fieldsums, ismutable::Bool) =
+    StructT(name, fieldnames, fieldsums, ismutable, fill(false, length(fieldnames)))
 struct AnyT <: TySum end
 
 const IntT = ConcT(:Int)

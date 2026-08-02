@@ -18,19 +18,20 @@ const SUPPRESSIONS = Function[]
 suppressed(v::Verdict) = any(p -> p(v)::Bool, SUPPRESSIONS)
 
 function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
-                      origsrc::String, shrunksrc::String)
+                      origsrc::String, shrunksrc::String; mode::Symbol=:rec)
     dir = joinpath(outdir, fp)
     mkpath(dir)
+    reprocall = mode === :cmp ? "reprorun(SRC; compiled=true)" : "reprorun(SRC)"
     open(joinpath(dir, "repro.jl"), "w") do io
         print(io, """
-        # FuzzJI reproducer — $(v.class)
+        # FuzzJI reproducer — $(v.class) (interp mode: $mode)
         # seed: $seed
         # julia: $VERSION
         # detail: $(replace(v.detail, '\n' => ' '))
         # Run with: julia --project=<repo>/fuzz <this file>
         include(joinpath(@__DIR__, "..", "..", "reprolib.jl"))
         const SRC = $(repr(shrunksrc))
-        reprorun(SRC)
+        $reprocall
         """)
     end
     open(joinpath(dir, "meta.md"), "w") do io
@@ -38,6 +39,7 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
         # $(v.class) ($fp)
 
         - seed: `$seed`
+        - interp mode: `$mode`
         - julia: `$VERSION`
         - divergent observation index: $(v.dividx)
         - ref exception: `$(v.refexc)`  interp exception: `$(v.intexc)`
@@ -64,10 +66,14 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
     return dir
 end
 
+# Mode tag prefix for dedup/report dirs (:rec is the historical untagged form).
+tagfp(mode::Symbol, fp::String) = mode === :rec ? fp : string(mode, "-", fp)
+
 function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                   outdir::String=joinpath(@__DIR__, "..", "findings"),
                   journaldir::String=joinpath(@__DIR__, "..", "journal"),
-                  cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true)
+                  cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true,
+                  modes::Tuple=(:rec, :cmp))
     j = Journal(journaldir)
     stats = Stats()
     seen = Set{String}()
@@ -83,34 +89,43 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
             src = render(prog)
             journal_case!(j, seed, src)
             stats.cases += 1
-            r = run_both(src; nstmts)
+            r = run_all(src; nstmts, modes)
             if r === nothing
                 stats.discarded += 1
                 continue
             end
-            v = classify(r...)
-            if v.class === :agree
-                stats.agreed += 1
-            elseif v.class === :aborted
-                stats.aborted += 1
-            elseif suppressed(v)
-                stats.suppressed += 1
-            else
-                fp = fingerprint(v)
-                if fp in seen
-                    stats.duplicates += 1
+            ref, intruns = r
+            anyaborted = anyfinding = false
+            for (mode, int) in intruns
+                v = classify(ref, int)
+                if v.class === :agree
+                    continue
+                elseif v.class === :aborted
+                    anyaborted = true
+                elseif suppressed(v)
+                    anyfinding = true
+                    stats.suppressed += 1
                 else
-                    push!(seen, fp)
-                    stats.findings += 1
-                    @info "FINDING $(v.class)" seed fp detail = first(v.detail, 300)
-                    shrunk = doshrink ? shrink(prog, fp; nstmts) : prog
-                    dir = writefinding(outdir, fp, v, seed, src, render(shrunk))
-                    @info "  reported" dir nstatements_orig = nstatements(prog) nstatements_shrunk = nstatements(shrunk)
+                    anyfinding = true
+                    fp = tagfp(mode, fingerprint(v))
+                    if fp in seen
+                        stats.duplicates += 1
+                    else
+                        push!(seen, fp)
+                        stats.findings += 1
+                        @info "FINDING $(v.class)" mode seed fp detail = first(v.detail, 300)
+                        shrunk = doshrink ? shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode)) : prog
+                        dir = writefinding(outdir, fp, v, seed, src, render(shrunk); mode)
+                        @info "  reported" dir nstatements_orig = nstatements(prog) nstatements_shrunk = nstatements(shrunk)
+                    end
                 end
             end
+            # per-case rollup: a case counts once, worst class wins
+            anyfinding ? nothing : anyaborted ? (stats.aborted += 1) : (stats.agreed += 1)
             if progress > 0 && i % progress == 0
                 rate = round(stats.cases / (time() - t0); digits=1)
-                @info "progress" i rate_per_s = rate stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates
+                abortpct = round(100 * stats.aborted / max(1, stats.cases); digits=1)
+                @info "progress" i rate_per_s = rate abort_pct = abortpct stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates
             end
         end
     finally

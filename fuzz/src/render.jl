@@ -57,6 +57,8 @@ function render(e::Ex)::String
         return "(" * render(e.kids[1]) * ")..."
     elseif k === :prop
         return "(" * render(e.kids[1]) * ")." * String(e.meta::Symbol)
+    elseif k === :aprop
+        return "(@atomic (" * render(e.kids[1]) * ")." * String(e.meta::Symbol) * ")"
     elseif k === :kwcall
         fname, kwnames = e.meta
         npos = length(e.kids) - length(kwnames)
@@ -85,17 +87,30 @@ function render(st::St, io::IO, ind::Int)
     if k === :assign
         name = st.meta[1]
         needsglobal = length(st.meta) >= 4 && st.meta[4]::Bool
-        println(io, pad, needsglobal ? "global " : "", String(name), " = ", render(st.exs[1]))
+        decl = length(st.meta) >= 5 ? st.meta[5]::Symbol : :none
+        if decl === :const
+            println(io, pad, "const ", String(name), " = ", render(st.exs[1]))
+        elseif decl !== :none   # typed global declaration, e.g. `global g::Int64 = 0`
+            println(io, pad, "global ", String(name), "::", String(decl), " = ", render(st.exs[1]))
+        else
+            println(io, pad, needsglobal ? "global " : "", String(name), " = ", render(st.exs[1]))
+        end
     elseif k === :structdef
         s = st.meta::StructT
         println(io, pad, s.ismutable ? "mutable struct " : "struct ", String(s.name))
-        for (fn, fs) in zip(s.fieldnames, s.fieldsums)
-            println(io, pad, "    ", String(fn), "::", typename(fs))
+        for (i, (fn, fs)) in enumerate(zip(s.fieldnames, s.fieldsums))
+            println(io, pad, "    ", s.atomicmask[i] ? "@atomic " : "", String(fn), "::", typename(fs))
         end
         println(io, pad, "end")
     elseif k === :setprop
-        vname, fname = st.meta
-        println(io, pad, "(", String(vname), ").", String(fname), " = ", render(st.exs[1]))
+        vname, fname = st.meta[1], st.meta[2]
+        atomic = length(st.meta) >= 3 && st.meta[3]::Bool
+        println(io, pad, atomic ? "@atomic " : "", String(vname), ".", String(fname),
+                " = ", render(st.exs[1]))
+    elseif k === :amodify
+        vname, fname, op = st.meta
+        println(io, pad, "@atomic ", String(vname), ".", String(fname), " ", String(op),
+                "= ", render(st.exs[1]))
     elseif k === :observe
         println(io, pad, "__obs__(", render(st.exs[1]), ")")
     elseif k === :if
@@ -135,16 +150,55 @@ function render(st::St, io::IO, ind::Int)
         name, old, _ = st.meta
         println(io, pad, String(name), " = ", String(old))
     elseif k === :try
-        excvar, hasfinally = st.meta
+        excvar, hasfinally = st.meta[1], st.meta[2]::Bool
+        haselse = length(st.meta) >= 3 && st.meta[3]::Bool
         println(io, pad, "try")
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "catch ", String(excvar))
         renderblock(st.blocks[2], io, ind + 4)
+        bi = 3
+        if haselse
+            println(io, pad, "else")
+            renderblock(st.blocks[bi], io, ind + 4)
+            bi += 1
+        end
         if hasfinally
             println(io, pad, "finally")
-            renderblock(st.blocks[3], io, ind + 4)
+            renderblock(st.blocks[bi], io, ind + 4)
         end
         println(io, pad, "end")
+    elseif k === :brk
+        println(io, pad, "(", render(st.exs[1]), ") && break")
+    elseif k === :cont
+        println(io, pad, "(", render(st.exs[1]), ") && continue")
+    elseif k === :ret
+        println(io, pad, "(", render(st.exs[1]), ") && return ", render(st.exs[2]))
+    elseif k === :rethrowif
+        println(io, pad, "(", render(st.exs[1]), ") && rethrow()")
+    elseif k === :maybeundef
+        name = String(st.meta::Symbol)
+        println(io, pad, "if ", render(st.exs[1]))
+        println(io, pad, "    ", name, " = ", render(st.exs[2]))
+        println(io, pad, "end")
+        println(io, pad, "__obs__(@isdefined(", name, "))")
+        println(io, pad, "__obs__(try; ", name, "; catch __e; (:__undef, nameof(typeof(__e))) end)")
+    elseif k === :loopundef
+        # Per-iteration slot reset: xname is a fresh local every iteration, so
+        # at iteration `when` it must be undefined again even though iteration
+        # `when - 1` assigned it. Interpreter surface: NewvarNode handling and
+        # Expr(:isdefined, slot).
+        ivar, xname, n, when = st.meta
+        iv, xv = String(ivar), String(xname)
+        println(io, pad, "for ", iv, " in 1:", n)
+        println(io, pad, "    if ", iv, " == ", when)
+        println(io, pad, "        __obs__(@isdefined(", xv, "))")
+        println(io, pad, "        __obs__(try; (:__v, ", xv, "); catch __e; (:__undef, nameof(typeof(__e))) end)")
+        println(io, pad, "    end")
+        println(io, pad, "    ", xv, " = ", render(st.exs[1]))
+        println(io, pad, "end")
+    elseif k === :typedlocal
+        name, s = st.meta
+        println(io, pad, "local ", String(name), "::", typename(s), " = ", render(st.exs[1]))
     elseif k === :fundef
         name, params = st.meta[1], st.meta[2]
         kwparams = length(st.meta) >= 4 ? st.meta[4] : Tuple{Symbol,Any}[]

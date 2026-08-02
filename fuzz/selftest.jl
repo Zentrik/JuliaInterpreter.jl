@@ -4,7 +4,7 @@
 using Test
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
-               nstatements, Cfg, run_both, shrink, genprogram, render
+               nstatements, Cfg, run_both, run_all, shrink, genprogram, render
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
 
 # The Supposition probes run at file scope, *outside* the testset below: a
@@ -86,6 +86,178 @@ end
         aborted(obs...) = Outcome(:aborted, :none, Any[obs...], "", "")
         @test classify(done(1, 2, 3), aborted(1)).class === :aborted
         @test classify(done(1, 2, 3), aborted(7)).class === :value_divergence
+    end
+
+    @testset "fingerprints distinguish unrelated value divergences" begin
+        done(obs...) = Outcome(:done, :none, Any[obs...], "", "")
+        # Different guarded-exception divergences and different value-shape
+        # divergences must not collapse into one dedup bucket: the first
+        # value_divergence ever reported would otherwise mask all future ones.
+        va = classify(done((:__thrown, :BoundsError)), done((:__thrown, :MethodError)))
+        vb = classify(done((:__thrown, :BoundsError)), done((:__thrown, :DomainError)))
+        vc = classify(done(1), done(2))
+        vd = classify(done(1), done(2.0))
+        @test fingerprint(va) != fingerprint(vb)
+        @test fingerprint(va) != fingerprint(vc)
+        @test fingerprint(vc) != fingerprint(vd)
+        # ... while identical shapes still dedup
+        @test fingerprint(vc) == fingerprint(classify(done(5), done(7)))
+    end
+
+    @testset "targeted differential: wave-3 constructs agree" begin
+        # Hand-written deterministic programs covering the constructs added in
+        # wave 3. These must run (validity) and agree (any divergence here is
+        # either a harness bug or a real finding — triage before shipping).
+        targeted = [
+        "control-flow exits through try/finally in loops" => """
+        let
+            acc = 0
+            for i in 1:4
+                try
+                    (i == 2) && continue
+                    acc = acc + 10
+                    (i == 3) && break
+                catch err
+                    __obs__(:caught)
+                finally
+                    acc = acc + 1
+                end
+            end
+            __obs__(acc)
+            f = function (n)
+                t = 0
+                for k in 1:n
+                    (k > 2) && return t + 100
+                    try
+                        t = t + k
+                        (k == 2) && throw(DomainError(k))
+                    catch e
+                        (t > 100) && rethrow()
+                        t = t + 1000
+                    end
+                end
+                return t
+            end
+            __obs__(f(1)); __obs__(f(2)); __obs__(f(5))
+        end
+        """,
+        "per-iteration slot reset (NewvarNode)" => """
+        let
+            for li in 1:3
+                if li >= 2
+                    __obs__(@isdefined(lx))
+                    __obs__(try; (:__v, lx); catch __e; (:__undef, nameof(typeof(__e))) end)
+                end
+                lx = li * 2
+            end
+        end
+        """,
+        "conditionally-defined locals and globals" => """
+        u1 = 3
+        if u1 > 10
+            u2 = 1
+        end
+        __obs__(@isdefined(u2))
+        __obs__(try; u2; catch __e; (:__undef, nameof(typeof(__e))) end)
+        let
+            if u1 > 1
+                u3 = 2
+            end
+            __obs__(@isdefined(u3))
+            __obs__(try; u3; catch __e; (:__undef, nameof(typeof(__e))) end)
+        end
+        """,
+        "atomic struct fields (get/set/modify, aliasing)" => """
+        mutable struct AtS
+            @atomic fld1::Int64
+            fld2::Float64
+        end
+        let
+            s = AtS(1, 2.0)
+            @atomic s.fld1 = 5
+            @atomic s.fld1 += 3
+            __obs__((@atomic s.fld1))
+            s.fld2 = 4.5
+            __obs__(s.fld2)
+            al = s
+            @atomic al.fld1 += 1
+            __obs__((@atomic s.fld1))
+        end
+        """,
+        "const and typed globals" => """
+        const gc1 = 41
+        global gt1::Int64 = 0
+        function bump()
+            global gt1 = gt1 + gc1
+            return gt1
+        end
+        let
+            __obs__(bump())
+            __obs__(bump())
+            __obs__(gt1)
+            __obs__(gc1)
+        end
+        """,
+        "try/catch/else and typed locals" => """
+        let
+            local tl1::Int64 = 2
+            r = try
+                tl1 + 1
+            catch err
+                __obs__(:caught)
+                -1
+            else
+                __obs__(:else)
+                tl1 + 10
+            end
+            __obs__(r)
+            r2 = try
+                throw(ArgumentError("x"))
+            catch err
+                __obs__(nameof(typeof(err)))
+                -2
+            else
+                __obs__(:noexc)
+                -3
+            end
+            __obs__(r2)
+        end
+        """,
+        "opaque closure / invoke / atomics-builtin probes" => """
+        let
+            __obs__(try (Base.Experimental.@opaque x -> x + 1)(41) catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(try invoke(abs, Tuple{Int}, -3) catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(try first(Core.modifyfield!(Ref(2), :x, +, 5)) catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(try getfield(Ref(1), :x, :sequentially_consistent) catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(try let m = Memory{Int}(undef, 2); m[1] = 5; m[1] end catch __e; (:__thrown, nameof(typeof(__e))) end)
+        end
+        """,
+        ]
+        for (label, src) in targeted
+            r = run_both(src; nstmts=2_000_000)
+            @test r !== nothing
+            r === nothing && continue
+            v = classify(r...)
+            v.class === :agree ||
+                @warn "targeted divergence — triage me" label v.class v.detail
+            @test v.class === :agree
+        end
+    end
+
+    @testset "compiled-mode (NonRecursiveInterpreter) smoke" begin
+        ndiverge = 0
+        for seed in 1:40
+            src = render(genprogram(Xoshiro(seed)))
+            r = run_all(src; nstmts=500_000, modes=(:cmp,))
+            r === nothing && continue
+            ref, intruns = r
+            v = classify(ref, intruns[1][2])
+            if isfinding(v)
+                ndiverge += 1
+                @warn "compiled-mode smoke divergence (a real finding — triage it!)" seed v.class v.detail
+            end
+        end
+        @test ndiverge <= 5
     end
 
     @testset "differential smoke test (agreement on real programs)" begin

@@ -20,6 +20,7 @@ julia --project=fuzz -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'  #
 julia --project=fuzz fuzz/run.jl --selftest                    # harness acceptance tests
 julia --project=fuzz fuzz/run.jl --n 5000                      # Supposition-driven campaign
 julia --project=fuzz fuzz/run.jl --engine native --n 10000 --seed 1  # seeded-RNG campaign
+julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recursive-interp only
 ```
 
 Findings land in `fuzz/findings/<class>-<fingerprint>/` as a standalone
@@ -121,6 +122,41 @@ body):
 - **bare toplevel statements** between the definitions and the `let`,
   exercising the toplevel-frame path without the `let` wrapper.
 
+Wave-3 grammar (aimed at the historically bug-rich interpreter surfaces the
+earlier waves designed out):
+
+- **control-flow exits**: conditional `break`/`continue` in loops and early
+  `return` in function bodies — including through `try`/`catch`/`finally`,
+  which is the `:enter`/`:leave`/`EnterNode` and exception-frame-unwinding
+  machinery (`src/interpret.jl`), classically the most bug-dense part of an
+  interpreter. Conditional `rethrow()` inside catch handlers. Exits are never
+  generated inside `finally` blocks (lowering restrictions + signal drowning).
+  Termination is preserved: the `while` fuel decrement renders *before* the
+  body, so `continue` cannot skip it;
+- **the undefined-variable dimension**: validity-by-construction previously
+  made reads of possibly-undefined variables ungenerable — precisely the
+  `NewvarNode`/`Expr(:isdefined,...)` surface. Now generated as *guarded,
+  expected* observations: `maybeundef` (conditionally-assigned binding, then
+  `@isdefined` + a guarded read observing `UndefVarError`) and `loopundef`
+  (a fixed template asserting per-iteration slot reset: a body-local must be
+  undefined again on iteration 2 even though iteration 1 assigned it);
+- **`const` globals** (never reassigned; the 1.12 binding-strictness surface),
+  **typed globals** (`global g::Int64 = 0` — every later write goes through
+  convert + typeassert against the binding type), **typed locals**
+  (`local x::T = v`);
+- **`@atomic` struct fields**: atomic get/set/`+=` lower to the
+  ordering-carrying `getfield`/`setfield!`/`modifyfield!` builtin arities that
+  `src/builtins.jl` hand-dispatches. Probe dictionary extended with the whole
+  atomics field family (`swapfield!`/`modifyfield!`/`replacefield!`/
+  `setfieldonce!`, right and wrong arities, ordering violations on non-atomic
+  fields), `invoke`/`invokelatest`, opaque closures (`:new_opaque_closure` is
+  a dedicated interpreter path), and `Memory` basics;
+- **`try`/`catch`/`else`** (distinct 1.8+ lowering); struct aliasing (mutation
+  through one name observed through another); mixed Int/Float arithmetic
+  (promotion); **wrong-typed guarded calls** into generated functions
+  (MethodError construction / localmethtable misses, and errors thrown deep
+  inside interpreted callees propagating through interpreted frames).
+
 Generation is a pure function of its randomness source, consumed through the
 `AbstractRNG` interface. Two engines drive it (`--engine`):
 
@@ -143,8 +179,15 @@ Either way, shrunk source is the reproducer of a *finding*.
 
 Fresh anonymous modules are the reset mechanism (the cheap REPRL analogue).
 The interpreted side runs the production toplevel path — `ExprSplitter`,
-`Frame(mod, ex)`, `RecursiveInterpreter` — under a statement budget: a
-trimmed port of `evaluate_limited!` from `test/utils.jl`. Verdict classes:
+`Frame(mod, ex)` — under a statement budget: a trimmed port of
+`evaluate_limited!` from `test/utils.jl`. Each candidate runs under **two
+interpreter configurations** (`--modes`, default `both`): `rec`
+(`RecursiveInterpreter`, everything interpreted) and `cmp` (Compiled mode /
+`NonRecursiveInterpreter`: toplevel statements stepped, calls execute
+natively — a materially different path through `evaluate_call!` and builtin
+dispatch, and nearly free since callees run compiled). The reference runs
+once per candidate; findings from the second mode are tagged `cmp-` in their
+fingerprint. Verdict classes:
 
 | class | meaning |
 |---|---|
@@ -154,8 +197,12 @@ trimmed port of `evaluate_limited!` from `test/utils.jl`. Verdict classes:
 | `aborted` | interp budget exhausted, observation prefix consistent → discard (tracked) |
 
 A mismatched observation *prefix* on an aborted run is still a
-`value_divergence`. Dedup fingerprints are `(class, ref exc, interp exc)` —
-no messages (drift across Julia versions), no divergence index (moves under
+`value_divergence`. Dedup fingerprints are `(class, ref exc, interp exc,
+ref obs-shape, interp obs-shape)` — the shape signatures (guarded-exception
+name for `(:__thrown, ...)` observations, type name otherwise) keep unrelated
+value divergences from collapsing into one bucket, where the first finding
+ever reported would mask all future value bugs as duplicates. Still excluded:
+messages (drift across Julia versions) and the divergence index (moves under
 shrinking). `SUPPRESSIONS` in `driver.jl` holds predicates for known-reported
 findings so reruns only surface news.
 
@@ -187,6 +234,12 @@ shrinker to reduce it while preserving the fingerprint.
 - **`Core.Intrinsics.sdiv_int(_, 0)`.** Uncatchable SIGFPE that killed the
   worker; both sides trap identically. Removed from the probe dictionary
   (see the builtins section).
+- **Out-of-range `unsafe_trunc`.** The result is an *unspecified value*
+  (LLVM poison under compilation vs. the runtime intrinsic under
+  interpretation), so `unsafe_trunc(Int8, 300.0)` may legally differ across
+  the two engines. The probe now uses an in-range argument; the same rule
+  bars any future probe whose contract says "unspecified" (fptosi of NaN,
+  etc.).
 
 ## Sources of legitimate divergence (excluded or normalized)
 
@@ -200,7 +253,12 @@ and belong in `SUPPRESSIONS` if hit).
 
 ## Roadmap
 
-- **M2 — widen the grammar** (done, see wave-2 above, except:)
+- **M2 — widen the grammar** (done, see wave-2 above).
+- **M2.5 — wave 3** (done, see wave-3 above): control-flow exits through
+  try/finally, the undefined-variable dimension, const/typed globals, typed
+  locals, `@atomic` fields + atomics/opaque-closure/invoke probes,
+  try/catch/else, wrong-typed guarded calls, the `cmp` (Compiled-mode)
+  differential axis, and shape-salted fingerprints. Still open from M2:
   destructuring, do-blocks, `@generated` functions, parametric structs,
   inner constructors, defaults referencing earlier params. CI: a time-boxed
   nightly job that uploads `findings/` as artifacts and exits 2 on news.

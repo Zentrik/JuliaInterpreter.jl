@@ -54,7 +54,8 @@ polished by the greedy IR shrinker, and reported through the same
 function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=300_000,
                               outdir::String=joinpath(@__DIR__, "..", "findings"),
                               journaldir::String=joinpath(@__DIR__, "..", "journal"),
-                              cfg::Cfg=Cfg(), doshrink::Bool=true)
+                              cfg::Cfg=Cfg(), doshrink::Bool=true,
+                              modes::Tuple=(:rec, :cmp))
     seen = Set{String}()
     isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
@@ -68,19 +69,23 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
     for round in 1:rounds
         # Track the smallest failing program ourselves: robust against
         # Supposition report internals, and lets us reuse writefinding.
-        best = Ref{Union{Nothing,Tuple{Program,Verdict}}}(nothing)
+        best = Ref{Union{Nothing,Tuple{Program,Verdict,Symbol}}}(nothing)
         prop = function (prog::Program)
             src = render(prog)
             journal_case!(j, round, src)
-            r = run_both(src; nstmts)
+            r = run_all(src; nstmts, modes)
             r === nothing && return true
-            v = classify(r...)
-            (isfinding(v) && !suppressed(v) && !(fingerprint(v) in seen)) || return true
-            cur = best[]
-            if cur === nothing || length(render(prog)) < length(render(cur[1]))
-                best[] = (prog, v)
+            ref, intruns = r
+            for (mode, int) in intruns
+                v = classify(ref, int)
+                (isfinding(v) && !suppressed(v) && !(tagfp(mode, fingerprint(v)) in seen)) || continue
+                cur = best[]
+                if cur === nothing || length(render(prog)) < length(render(cur[1]))
+                    best[] = (prog, v, mode)
+                end
+                return false
             end
-            return false
+            return true
         end
         sr = @check max_examples = examples prop(gen)
         b = best[]
@@ -88,15 +93,22 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
             @info "supposition round found nothing new; stopping" round examples
             break
         end
-        prog, _ = b
-        r = run_both(render(prog); nstmts)
-        v = classify(r...)   # verdict of the *minimal* program
-        fp = fingerprint(v)
+        prog, v0, mode = b
+        r = run_both(render(prog); nstmts, interp=modeinterp(mode))
+        # verdict of the *minimal* program (fall back to the recorded one if
+        # the rerun no longer reproduces, e.g. a budget-sensitive case)
+        v = if r !== nothing
+            v1 = classify(r...)
+            isfinding(v1) ? v1 : v0
+        else
+            v0
+        end
+        fp = tagfp(mode, fingerprint(v))
         push!(seen, fp)
         nfound += 1
-        @info "FINDING (supposition)" round fp v.class detail = first(v.detail, 300)
-        shrunk = doshrink ? shrink(prog, fp; nstmts) : prog
-        dir = writefinding(outdir, fp, v, -1, render(prog), render(shrunk))
+        @info "FINDING (supposition)" round fp v.class mode detail = first(v.detail, 300)
+        shrunk = doshrink ? shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode)) : prog
+        dir = writefinding(outdir, fp, v, -1, render(prog), render(shrunk); mode)
         @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk)
     end
     close(j)

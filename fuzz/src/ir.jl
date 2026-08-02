@@ -25,11 +25,13 @@
 #   :src      meta = verbatim source::String                kids = []   # builtin-table literal args
 #   :splat    meta = nothing                                kids = [inner]  # renders (inner)... inside calls
 #   :prop     meta = fieldname::Symbol                      kids = [obj]    # (obj).field
+#   :aprop    meta = fieldname::Symbol                      kids = [obj]    # (@atomic (obj).field)
 #   :compr    meta = (ivar, n::Int, hasfilter::Bool)        kids = [bodyex] or [bodyex, cond]
 #   :kwcall   meta = (fname::Symbol, kwnames::Vector{Symbol}) kids = positional args, then kwarg values
 #
 # St node kinds:
-#   :assign   meta = (name, sum, isnew, needsglobal::Bool)  exs = [rhs]
+#   :assign   meta = (name, sum, isnew, needsglobal::Bool[, decl::Symbol])  exs = [rhs]
+#             decl (globals only): :const | :Int64/:Float64 (typed global) | :none
 #   :observe  meta = nothing                                exs = [ex]
 #   :if       meta = haselse::Bool                          exs = [cond]  blocks = [then] or [then, else]
 #   :for      meta = (ivar, n::Int)                         blocks = [body]
@@ -38,13 +40,25 @@
 #             params::Vector{Tuple{Symbol,TySum,Bool}} (name, sum, typed);
 #             kwparams::Vector{Tuple{Symbol,Any}} (name, literal default value)
 #   :structdef meta = StructT                               (fields with `typed` = fieldsums[i] isa ConcT)
-#   :setprop  meta = (varname, fieldname)                   exs = [val]   # mutable struct field write
+#   :setprop  meta = (varname, fieldname[, atomic::Bool])   exs = [val]   # mutable struct field write
+#   :amodify  meta = (varname, fieldname, op::Symbol)       exs = [rhs]   # @atomic v.f op= rhs (modifyfield! path)
 #   :recdef   meta = (name, accsum)                         exs = [stepex]      # fueled self-recursion template
 #   :let      meta = bindings::Vector{Tuple{Symbol,TySum}}  exs = rhs per binding  blocks = [body]
 #   :push     meta = vecname::Symbol                        exs = [val]
 #   :setindex meta = vecname::Symbol                        exs = [idx, val]    # rendered guarded
-#   :alias    meta = (newname, oldname, sum)
-#   :try      meta = (excvar, hasfinally::Bool)             blocks = [body, handler] (+ [finally])
+#   :alias    meta = (newname, oldname, sum)                # sum: VecT or mutable StructT
+#   :try      meta = (excvar, hasfinally::Bool[, haselse::Bool])
+#             blocks = [body, handler] (+ [else] if haselse) (+ [finally] if hasfinally)
+#   :brk      meta = nothing                                exs = [cond]  # (cond) && break
+#   :cont     meta = nothing                                exs = [cond]  # (cond) && continue
+#   :ret      meta = nothing                                exs = [cond, val]  # (cond) && return val
+#   :rethrowif meta = nothing                               exs = [cond]  # (cond) && rethrow(); catch handlers only
+#   :maybeundef meta = name::Symbol                         exs = [cond, rhs]
+#             if cond; name = rhs; end + observes @isdefined(name) and a guarded read
+#   :loopundef meta = (ivar, xname, n::Int, when::Int)      exs = [rhs]
+#             for ivar in 1:n — observes xname's (un)definedness at iteration `when`,
+#             then assigns it; probes per-iteration slot reset (NewvarNode)
+#   :typedlocal meta = (name, sum::TySum)                   exs = [rhs]   # local name::T = rhs
 
 struct Ex
     kind::Symbol
@@ -111,7 +125,7 @@ function refs!(out::Set{Symbol}, st::St)
         push!(out, st.meta::Symbol)
     elseif st.kind === :alias
         push!(out, st.meta[2]::Symbol)
-    elseif st.kind === :setprop
+    elseif st.kind === :setprop || st.kind === :amodify
         push!(out, st.meta[1]::Symbol)
     end
     for e in st.exs
@@ -129,5 +143,8 @@ function binds(st::St)
     st.kind === :alias && return Symbol[st.meta[1]]
     (st.kind === :fundef || st.kind === :recdef) && return Symbol[st.meta[1]]
     st.kind === :structdef && return Symbol[(st.meta::StructT).name]
+    st.kind === :typedlocal && return Symbol[st.meta[1]]
+    st.kind === :maybeundef && return Symbol[st.meta::Symbol]
+    st.kind === :loopundef && return Symbol[st.meta[1], st.meta[2]]
     return Symbol[]
 end
