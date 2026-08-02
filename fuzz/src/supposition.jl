@@ -53,11 +53,16 @@ polished by the greedy IR shrinker, and reported through the same
 """
 function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=300_000,
                               outdir::String=joinpath(@__DIR__, "..", "findings"),
+                              journaldir::String=joinpath(@__DIR__, "..", "journal"),
                               cfg::Cfg=Cfg(), doshrink::Bool=true)
     seen = Set{String}()
     isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
     end
+    # Journal every candidate before it runs: an uncatchable crash (e.g. a
+    # generated program that traps compiled Julia's codegen) kills the worker,
+    # and journal/current.jl is then the only record of what did it.
+    j = Journal(journaldir)
     gen = ProgramGen(cfg)
     nfound = 0
     for round in 1:rounds
@@ -65,7 +70,9 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
         # Supposition report internals, and lets us reuse writefinding.
         best = Ref{Union{Nothing,Tuple{Program,Verdict}}}(nothing)
         prop = function (prog::Program)
-            r = run_both(render(prog); nstmts)
+            src = render(prog)
+            journal_case!(j, round, src)
+            r = run_both(src; nstmts)
             r === nothing && return true
             v = classify(r...)
             (isfinding(v) && !suppressed(v) && !(fingerprint(v) in seen)) || return true
@@ -92,5 +99,6 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
         dir = writefinding(outdir, fp, v, -1, render(prog), render(shrunk))
         @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk)
     end
+    close(j)
     return nfound
 end

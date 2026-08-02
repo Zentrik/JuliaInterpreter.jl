@@ -101,10 +101,16 @@ const BUILTIN_PROBES = String[
     "tuple()",
     "Core.tuple(1, 2, 3)",
     "Core._apply_iterate(Base.iterate, +, (1, 2), (3, 4))",
-    # arithmetic / conversion intrinsics
+    # arithmetic / conversion intrinsics.
+    # NOTE: raw Core.Intrinsics division (sdiv_int/udiv_int/srem_int) is
+    # deliberately absent — those map to a bare machine divide with no
+    # DivideError check, so a zero divisor is an uncatchable CPU trap (SIGFPE)
+    # that would kill the in-process worker rather than surface as a finding.
+    # Both sides would trap identically anyway. Use the guarded `÷`/`%` rules
+    # (:intdiv, :guarddiv) to probe division-by-zero semantics instead.
     "Core.Intrinsics.add_int(3, 4)",
-    "Core.Intrinsics.sdiv_int(7, 0)",
     "Core.Intrinsics.checked_sadd_int(typemax(Int), 1)",
+    "Core.Intrinsics.mul_int(6, 7)",
     "Core.bitcast(Float64, 0)",
     "Core.bitcast(Float64, Int64(4607182418800017408))",
     "reinterpret(Float64, Int64(0))",
