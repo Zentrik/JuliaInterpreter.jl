@@ -334,9 +334,41 @@ exposed a **real generator bug**:
   `STUCK_LIMIT` consecutive commands), which is the actual historical bug
   shape; budget exhaustion is now tracked, not reported.
 
+A third calibration followed: `step_stuck` initially counted *any* repeated
+`(framecode, pc)`, but with break-on-error armed a statement that always
+throws re-triggers the same error breakpoint every time it is retried, so
+execution legitimately does not advance until the user unwinds. Every report
+from that round was a walk parked on an error breakpoint. Only no-ops that
+return a *normal* pc count now.
+
 The general lesson, worth keeping in mind for P2/P4: **a new axis's first
 reports are usually about the axis, not the system under test.** Budget for
-calibration before believing yield numbers.
+calibration before believing yield numbers. Concretely, of the first six
+reports the stepping axis produced, five were oracle miscalibrations and one
+was a generator bug — and finding that out took a diagnostic
+(`fuzz/diag_stuck.jl`) that answers "what is it actually stuck on", because
+the campaign-level signal ("this took 80,000 commands") could not distinguish
+a hang from a large program.
+
+## Where things stand
+
+Campaign results after the above (Julia 1.11.9, this branch):
+
+- differential axis, 700 programs: 696 agreed, 4 aborted, **0 discarded**
+  (every generated program still valid by construction), 0 findings.
+- stepping axis, 500 programs: agreement once the oracle was calibrated.
+
+So: no new interpreter bugs from these runs, on a widened grammar that now
+reaches compositions it previously could not. That is a real (negative)
+result for the differential axis and consistent with the analysis above — the
+run-to-completion surface is genuinely hardened, which is why the plan puts
+new surfaces ahead of more inputs.
+
+The highest-value remaining work is unchanged: **P2** (semantic coverage of
+the interpreter, first as an offline grammar-gap report, then as
+corpus-admission feedback) and **P3 items 12–13** (`eval_code` and
+`ExprSplitter` axes — `utils.jl`/`construct.jl` carry the two densest fix
+histories in the package and neither is fuzzed yet), then **P4** (EMI).
 
 ## References
 

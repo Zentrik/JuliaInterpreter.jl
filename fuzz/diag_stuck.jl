@@ -1,82 +1,105 @@
-# Diagnose a step_nonterminating report: is a command failing to advance, or is
-# the program merely large?
+# Diagnose a step_stuck / long-walk report for one seed.
 #
-#   julia --project=fuzz fuzz/diag_stuck.jl SEED
+#   julia --project=fuzz fuzz/diag_stuck.jl SEED [MAXCMDS]
 #
-# A command budget is only a proxy for "stuck". This looks at the real thing:
-# whether (frame, pc) ever repeats across commands, and which command was
-# issued when it did.
+# Answers the two questions triage actually needs: *which command* fails to
+# advance, and *what statement* it is sitting on when it does. A command budget
+# only ever said "this took a while", which is not the same thing — with
+# break-on-error armed, `:c` legitimately stops at every throw.
+#
+# The RNG stream must match the campaign exactly or the command sequence
+# differs and the report will not reproduce: step_campaign seeds one RNG, uses
+# it for generation, then continues the same stream into the walk (including
+# the break-on-error coin flip).
 
 include(joinpath(@__DIR__, "src", "FuzzJI.jl"))
 using .FuzzJI
 using .FuzzJI: Xoshiro, genprogram, render, parsegate, freshmodule, run_interp,
-               STEP_COMMANDS, pick
+               STEP_COMMANDS, DRAIN_COMMANDS, pick, STUCK_LIMIT
 using JuliaInterpreter
-using JuliaInterpreter: debug_command, Frame, BreakpointRef, is_toplevel_frame, ExprSplitter
+using JuliaInterpreter: debug_command, Frame, BreakpointRef, is_toplevel_frame, ExprSplitter,
+                        break_on, break_off, remove, pc_expr, scopeof
 
 seed = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 20168
 maxcmds = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 20000
 
-# Mirror step_campaign exactly: one RNG seeded once, used first for generation
-# and then continuing into the command walk. A fresh RNG for the walk would
-# issue a different command sequence and not reproduce the report.
 rng = Xoshiro(seed)
 prog = genprogram(rng)
 src = render(prog)
 ex = parsegate(src)
 ex === nothing && error("seed $seed did not survive the parse gate")
 
-println("=== program (seed $seed), ", count(==('\n'), src), " lines ===")
+println("=== seed $seed: ", count(==('\n'), src), "-line program ===")
 
 m = freshmodule()
 interp = JuliaInterpreter.RecursiveInterpreter()
 
-# Count how often each (framecode, pc) is revisited, and which command was
-# issued each time. A command that leaves the state identical is the bug shape.
-repeats = Dict{Tuple{UInt,Int},Int}()
-stuckcmds = Dict{Symbol,Int}()
-cmdcounts = Dict{Symbol,Int}()
-total = 0
-laststate = nothing
+# Mirror step_program's break-on-error draw so the stream stays aligned.
+brk = rand(rng) < 0.5
+brk ? break_on(:error) : break_off(:error)
+println("break_on(:error) armed: ", brk)
 
-for (mod, frag) in ExprSplitter(m, ex)
-    global total, laststate
-    fr = Frame(mod, frag)
-    while total < maxcmds
-        is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
-        cmd = pick(rng, STEP_COMMANDS)
-        cmdcounts[cmd] = get(cmdcounts, cmd, 0) + 1
-        ret = try
-            cmd === :until && rand(rng) < 0.5 ?
-                debug_command(interp, fr, cmd, true; line=rand(rng, 1:40)) :
-                debug_command(interp, fr, cmd, true)
-        catch err
-            println("threw after $total commands on :$cmd — ", nameof(typeof(err)))
-            break
-        end
-        total += 1
-        ret === nothing && break
-        fr, _pc = ret
-        state = (objectid(fr.framecode), fr.pc)
-        if state == laststate
-            stuckcmds[cmd] = get(stuckcmds, cmd, 0) + 1
-        end
-        laststate = state
-        repeats[state] = get(repeats, state, 0) + 1
-    end
-    total >= maxcmds && break
-end
-
-println("commands issued: $total (budget $maxcmds)")
-println("distinct (framecode, pc) states visited: ", length(repeats))
-top = sort(collect(repeats); by=last, rev=true)[1:min(5, end)]
-println("most-revisited states: ", [(s[2], n) for (s, n) in top])
-println()
-println("commands that left (framecode, pc) UNCHANGED (the stuck shape):")
-if isempty(stuckcmds)
-    println("  none — every command advanced; the budget was simply too small")
-else
-    for (c, n) in sort(collect(stuckcmds); by=last, rev=true)
-        println("  :", rpad(c, 8), n, " no-ops of ", get(cmdcounts, c, 0), " issued")
+function report_stuck(fr, cmd, noops, total, pc)
+    println()
+    println("STUCK: `:$cmd` made no progress $noops times in a row (after $total commands)")
+    println("  frame scope : ", scopeof(fr))
+    println("  pc          : ", fr.pc, " of ", length(fr.framecode.src.code), " statements")
+    println("  statement   : ", repr(pc_expr(fr)))
+    println("  returned pc : ", repr(pc))
+    println("  toplevel?   : ", is_toplevel_frame(fr))
+    println("  caller?     : ", fr.caller === nothing ? "none" : "yes")
+    println("  callee?     : ", fr.callee === nothing ? "none" : "yes")
+    println()
+    println("  surrounding statements:")
+    code = fr.framecode.src.code
+    for i in max(1, fr.pc - 3):min(length(code), fr.pc + 3)
+        println("    ", i == fr.pc ? ">>" : "  ", lpad(i, 4), "  ", repr(code[i]))
     end
 end
+
+function diagnose(m, ex, rng, interp, maxcmds)
+    total = 0
+    laststate = nothing
+    noops = 0
+    lastcmd = :none
+    for (mod, frag) in ExprSplitter(m, ex)
+        fr = Frame(mod, frag)
+        while total < maxcmds
+            is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
+            cmd = total > 0.8 * maxcmds ? pick(rng, DRAIN_COMMANDS) : pick(rng, STEP_COMMANDS)
+            ret = try
+                cmd === :until && rand(rng) < 0.5 ?
+                    debug_command(interp, fr, cmd, true; line=rand(rng, 1:40)) :
+                    debug_command(interp, fr, cmd, true)
+            catch err
+                println("threw after $total commands on :$cmd — ", nameof(typeof(err)))
+                return (:threw, total)
+            end
+            total += 1
+            ret === nothing && break
+            fr, pc = ret
+            state = (objectid(fr.framecode), fr.pc)
+            if state == laststate
+                noops += 1
+                if noops >= STUCK_LIMIT
+                    report_stuck(fr, lastcmd, noops, total, pc)
+                    return (:stuck, total)
+                end
+            else
+                noops = 0
+            end
+            laststate = state
+            lastcmd = cmd
+        end
+        total >= maxcmds && return (:budget, total)
+    end
+    return (:done, total)
+end
+
+status, total = try
+    diagnose(m, ex, rng, interp, maxcmds)
+finally
+    break_off(:error)
+    remove()
+end
+status === :stuck || println("status=$status after $total commands (budget $maxcmds)")

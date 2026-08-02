@@ -239,10 +239,10 @@ whatever the user types:
 
 | class | meaning |
 |---|---|
-| `step_internal_error` | an exception raised *by JuliaInterpreter's own code* (detected by looking for package frames in the backtrace; program-thrown exceptions are expected and ignored) |
-| `step_nonterminating` | the command budget ran out — the historical shape is a command that returns the frame unchanged forever |
 | `step_divergence` | stepping to completion produced different observations than plain interpretation: the debugger executed or skipped the wrong statements |
-| `step_only_throw` | stepping threw where plain interpretation completed |
+| `step_only_throw` | stepping threw where plain interpretation of the same program completed |
+| `step_exception_divergence` | stepping threw a different exception than plain interpretation |
+| `step_stuck` | a command left execution at the same `(framecode, pc)` `STUCK_LIMIT` times running, having returned a normal pc each time |
 
 The third is the subtle one and the reason this axis exists: several past
 fixes (`next_line!` stopping on assignment-only lines, the

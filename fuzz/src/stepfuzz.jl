@@ -87,10 +87,17 @@ function internalframe(bt)
 end
 
 # How many consecutive commands may leave execution at exactly the same
-# (framecode, pc) before the walk is considered stuck. One no-op is legal — a
-# breakpoint pause reports the position without moving — but a command that
-# cannot advance repeats forever, which is the shape of the historical bug
+# (framecode, pc) before the walk is considered stuck. A command that cannot
+# advance repeats forever, which is the shape of the historical bug
 # (`next_line!` not getting past a statement kind).
+#
+# Only commands that return a *normal* pc count. Parking at a breakpoint and
+# reporting the same position is legal and expected: with break_on(:error)
+# armed, a statement that always throws re-triggers the same error breakpoint
+# every time it is retried, so execution genuinely does not advance until the
+# user unwinds. Counting those made the whole class false positives — every
+# report from the first campaign was a walk parked on an error breakpoint, not
+# a command that could not step.
 const STUCK_LIMIT = 200
 
 # Drive one toplevel fragment to completion with a random command walk.
@@ -126,9 +133,9 @@ function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds
         ret === nothing && return (:done, n, :none)
         # Continue from wherever the command left execution: a callee frame
         # after stepping in, the caller after finishing, or a breakpoint pause.
-        fr, _pc = ret
+        fr, pc = ret
         state = (objectid(fr.framecode), fr.pc)
-        if state == laststate
+        if state == laststate && !isa(pc, BreakpointRef)
             noops += 1
             noops >= STUCK_LIMIT && return (:stuck, n, lastcmd)
         else
