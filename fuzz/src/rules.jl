@@ -403,11 +403,14 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     for _ in 1:rand(rng, cfg.nbodystmts)
         push!(body, genstmt(ctx))
     end
-    # Always end by observing a few live variables so every program compares state.
-    vars = visiblevars(ctx)
-    for v in (length(vars) <= 3 ? vars : vars[randperm(rng, length(vars))[1:3]])
+    # Always end by observing a few live variables so every program compares
+    # state. Deterministically the last few: no RNG draw needed here, which
+    # keeps the choice sequence short for Supposition-driven generation.
+    count = 0
+    for v in reverse(visiblevars(ctx))
         v.sum isa FnT && continue  # functions normalize to :__fn__; nothing to learn
         push!(body, St(:observe; exs=[Ex(:var, v.sum, v.name)]))
+        (count += 1) == 3 && break
     end
     popscope!(ctx)
     return Program(fundefs, body)

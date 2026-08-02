@@ -17,8 +17,9 @@ crash/coverage focus: `Expr`/source text is the IL, and the threat model is
 
 ```sh
 julia --project=fuzz -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'  # from repo root
-julia --project=fuzz fuzz/run.jl --selftest          # harness acceptance tests
-julia --project=fuzz fuzz/run.jl --n 10000 --seed 1  # a campaign
+julia --project=fuzz fuzz/run.jl --selftest                    # harness acceptance tests
+julia --project=fuzz fuzz/run.jl --n 5000                      # Supposition-driven campaign
+julia --project=fuzz fuzz/run.jl --engine native --n 10000 --seed 1  # seeded-RNG campaign
 ```
 
 Findings land in `fuzz/findings/<class>-<fingerprint>/` as a standalone
@@ -99,9 +100,23 @@ named functions with typed/untyped params and **multi-method dispatch**
 **closures** — including the mutating variant `p -> (cap = cap + p; cap)`
 that forces captured variables into `Box`es.
 
-Generation is a pure function of a seed (`Xoshiro(seed)`), so a seed is a
-complete reproducer of the *candidate*; shrunk source is the reproducer of
-the *finding*.
+Generation is a pure function of its randomness source, consumed through the
+`AbstractRNG` interface. Two engines drive it (`--engine`):
+
+- **supposition** (default, `supposition.jl`): a `TCRNG` adapter forwards
+  every draw to Supposition.jl's `TestCase` choice recording, and
+  `ProgramGen <: Data.Possibility{Program}` replays choice sequences through
+  the generator. Counterexamples are therefore shrunk by choice-sequence
+  replay — valid by construction, structural, and it reaches the config's
+  size floor in practice — then polished by the greedy IR shrinker. Rounds
+  continue while new (non-duplicate, non-suppressed) findings appear;
+  found fingerprints are filtered inside the property so each round hunts
+  news.
+- **native** (`driver.jl`): `Xoshiro(seed)` per candidate, so one integer
+  reproduces any candidate. The only engine with the crash-safe journal —
+  use it when hunting worker crashes.
+
+Either way, shrunk source is the reproducer of a *finding*.
 
 ### Execution & oracle (`execute.jl`, `classify.jl`)
 
@@ -152,10 +167,8 @@ and belong in `SUPPRESSIONS` if hit).
   comprehensions/generators, destructuring, `global` declarations and
   soft-vs-hard scope shapes, do-blocks, a curated builtin/intrinsic
   edge-case dictionary (wrong arities, weird-but-lowerable argument types,
-  always guarded) aimed directly at `src/builtins.jl`. Supposition.jl
-  integration (generator as a `Data` possibility; choice-sequence shrinking
-  replaces/augments the greedy reducer). CI: a time-boxed nightly job that
-  uploads `findings/` as artifacts and exits 2 on news.
+  always guarded) aimed directly at `src/builtins.jl`. CI: a time-boxed
+  nightly job that uploads `findings/` as artifacts and exits 2 on news.
 - **M3 — feedback + debugger axis**: a `CoverageInterp <: Interpreter`
   recording which stmt heads/builtins/intrinsics/dispatch paths each case
   touches (cheap semantic coverage: report grammar gaps, bias seeds);
@@ -182,12 +195,14 @@ and belong in `SUPPRESSIONS` if hit).
 - **Why source text as interchange?** Repro/journal files contain literally
   what ran; both sides parse identically; renderer bugs surface as parse
   failures in the selftest, not as silent semantic skew.
-- **Why hand-rolled generation instead of Supposition.jl in v1?** The
-  repairing IR shrinker is needed regardless (for journal-recovered crash
-  cases), seeded-RNG generation makes candidates reproducible by a single
-  integer, and it keeps v1 dependency-free (the sandbox for this work also
-  had no package-registry access). Supposition remains the plan for M2 —
-  its choice-sequence shrinking composes with the same generator shape.
+- **Why keep the native engine alongside Supposition?** The repairing IR
+  shrinker and seeded-RNG loop are needed for journal-recovered crash cases
+  (Supposition shrinks in-process, so a candidate that kills the worker
+  can't be shrunk by replay), and a single-integer seed is the most robust
+  reproducer for "the process died". Supposition is the default engine:
+  same generator, routed through a choice-recording `AbstractRNG` adapter,
+  which gets Hypothesis-style replay shrinking without a second generator
+  implementation.
 - **Budget exhaustion is a discard, not a finding, in v1.** With
   `RecursiveInterpreter` even small programs execute large amounts of
   interpreted Base code; distinguishing "expensive" from "interpreter hang"

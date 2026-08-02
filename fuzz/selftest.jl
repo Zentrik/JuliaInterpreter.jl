@@ -5,8 +5,40 @@ using Test
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                nstatements, Cfg, run_both, shrink, genprogram, render
+using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
+
+# The Supposition probes run at file scope, *outside* the testset below: a
+# deliberately failing `@check` inside a parent testset would record failures
+# into the suite. Standalone, it just returns its report.
+supposition_valid = let nbad = 0
+    for _ in 1:30
+        src = render(example(ProgramGen()))
+        lwr = Meta.lower(Main, Meta.parseall(src))
+        (Meta.isexpr(lwr, :error) || Meta.isexpr(lwr, :incomplete)) && (nbad += 1)
+    end
+    nbad == 0
+end
+
+supposition_minimal = let smallest = Ref{Any}(nothing)
+    # Impossible-to-satisfy property: every program has >= 5 body statements
+    # + 3 observations, so this must fail — and shrink toward that floor.
+    prop = function (prog)
+        if smallest[] === nothing || nstatements(prog) < nstatements(smallest[])
+            smallest[] = prog
+        end
+        return false
+    end
+    @check max_examples = 100 prop(ProgramGen())
+    smallest[] === nothing ? typemax(Int) : nstatements(smallest[])
+end
 
 @testset "FuzzJI selftest" begin
+
+    @testset "supposition engine" begin
+        @test supposition_valid
+        # the config floor is 5 body statements + 3 tail observations
+        @test supposition_minimal == 8
+    end
 
     @testset "generator determinism" begin
         for seed in (1, 42, 99)
