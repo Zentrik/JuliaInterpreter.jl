@@ -171,6 +171,23 @@ divergence (interpreter frames are visible in `stacktrace()` — a real,
 permanent difference) inside 50+ statements of noise and requires the
 shrinker to reduce it while preserving the fingerprint.
 
+## Known false-positive classes found and closed during shakedown
+
+- **`===` on Float operands (NaN payloads).** The fuzzer surfaced a
+  `value_divergence` where `min(NaN, NaN) === (NaN + NaN)` evaluated to
+  different results under compilation vs. interpretation. Root cause: the
+  particular NaN an operation yields (its sign/payload bits) is not part of
+  Julia's contract — `min` may return either NaN argument, and compiled
+  codegen and the interpreter can pick differently, so a *bitwise* `===`
+  between two float expressions is nondeterministic across the two engines.
+  Not an interpreter bug. Closed by restricting the `===` rule to
+  Int/Sym/Str/Bool operands. Bare-float value observations remain fair, as
+  `isequal` treats all NaNs as equal (only `===`/`reinterpret` expose
+  payloads, and the sole `reinterpret` probe is on a fixed constant).
+- **`Core.Intrinsics.sdiv_int(_, 0)`.** Uncatchable SIGFPE that killed the
+  worker; both sides trap identically. Removed from the probe dictionary
+  (see the builtins section).
+
 ## Sources of legitimate divergence (excluded or normalized)
 
 Excluded from the grammar: I/O, `eval`/`include`, `ccall`/pointers/`unsafe_*`,

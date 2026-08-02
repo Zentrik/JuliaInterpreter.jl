@@ -201,7 +201,13 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         op = s == StrT ? pick(rng, [:(==), :(!=), :<]) : pick(rng, [:(==), :(!=), :<, :<=, :>, :>=])
         return Ex(:binop, BoolT, op, [genex(ctx, s), genex(ctx, s)])
     elseif kind === :egal
-        s = pick(rng, TySum[IntT, FloatT, SymT, StrT])
+        # No Float operands: `===` is bitwise, and the NaN an operation yields
+        # (its payload/sign bits) is not part of Julia's contract — compiled
+        # and interpreted execution may pick different NaN bit patterns, so
+        # `floatexpr === floatexpr` is nondeterministic across the two engines
+        # and not a meaningful differential property. Value observations of
+        # bare floats stay fair (`isequal` treats all NaNs equal).
+        s = pick(rng, TySum[IntT, SymT, StrT, BoolT])
         return Ex(:binop, BoolT, :(===), [genex(ctx, s), genex(ctx, s)])
     elseif kind === :andor
         return Ex(:andor, BoolT, pick(rng, [:&&, :||]), [genex(ctx, BoolT), genex(ctx, BoolT)])
@@ -310,6 +316,11 @@ end
 # Statements
 
 const CONCRETE_MENU = TySum[IntT, IntT, IntT, FloatT, FloatT, BoolT, StrT, SymT]
+# Non-growable scalars only. Used for struct fields: a String field could be
+# grown in place (x.f = string(x.f, x.f)) inside a looping/oft-called context,
+# and structs have no per-field bound. Int/Float/Bool/Sym exercise field
+# access, mutation, and dispatch fully without the memory risk.
+const SCALAR_NONGROW = TySum[IntT, IntT, FloatT, FloatT, BoolT, SymT]
 
 function newvarsum(ctx::Ctx)
     r = rand(ctx.rng)
@@ -323,16 +334,31 @@ function newvarsum(ctx::Ctx)
     return AnyT()
 end
 
+# Variables eligible as reassignment targets. Growable globals are excluded
+# inside function bodies: a function is called an unbounded number of times, so
+# letting it grow a growable global — even by a bounded amount per call — would
+# accumulate without bound (the reference side has no memory cap). Growable
+# globals are still writable from toplevel/let, where the write count is bounded
+# by program size.
+reassign_targets(ctx::Ctx) =
+    ctx.infunc ? [v for v in visiblevars(ctx) if !(v.isglobal && growablevar(v))] :
+                 visiblevars(ctx)
+
 function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     rng = ctx.rng
     opts = Tuple{Float64,Symbol}[(4.0, :assignnew)]
-    !isempty(visiblevars(ctx)) && push!(opts, (1.5, :reassign))
+    !isempty(reassign_targets(ctx)) && push!(opts, (1.5, :reassign))
     allowobs && push!(opts, (2.5, :observe))
     if blockdepth < 2
         push!(opts, (1.2, :if), (1.0, :for), (0.7, :while), (0.6, :let), (0.7, :try))
     end
     anyvec = any(v -> v.sum isa VecT, visiblevars(ctx))
-    anyvec && push!(opts, (1.0, :push), (0.7, :setindex), (0.5, :alias))
+    # push! grows a vector by one element per call; a global vector pushed from
+    # a function body (called an unbounded number of times) grows without
+    # bound. Allow push! only to vectors that aren't global-inside-a-function.
+    pushable = [v for v in visiblevars(ctx) if v.sum isa VecT && !(ctx.infunc && v.isglobal)]
+    !isempty(pushable) && push!(opts, (1.0, :push))
+    anyvec && push!(opts, (0.7, :setindex), (0.5, :alias))
     anymutstruct = any(v -> v.sum isa StructT && (v.sum::StructT).ismutable, visiblevars(ctx))
     anymutstruct && push!(opts, (0.8, :setprop))
     push!(opts, (0.6, :compr))
@@ -346,16 +372,22 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         declare!(ctx, VInfo(name, rhs.sum))
         return st
     elseif kind === :reassign
-        v = pick(rng, visiblevars(ctx))
-        # An FnT rhs must not be able to capture any reassignable function
-        # variable (would let two closures form a call cycle → unbounded
-        # recursion). Hiding FnT vars during rhs generation closes that loophole.
+        v = pick(rng, reassign_targets(ctx))
+        # Two safety hides on the rhs of a reassignment:
+        #  - FnT target: hide function vars so two closures can't form a call
+        #    cycle (unbounded recursion).
+        #  - growable target (String/Vector/Any): hide all growable vars so the
+        #    new value can't be built from growable ones — prevents exponential
+        #    memory growth (g = string(g, g) and cross-referential chains),
+        #    which the reference side has no bound against.
         rhs = if v.sum isa FnT
             withoutfns(ctx) do
                 genex(ctx, v.sum)
             end
-        elseif v.sum isa AnyT
-            genex(ctx, pick(rng, CONCRETE_MENU))
+        elseif growablevar(v)
+            withoutgrowables(ctx) do
+                genex(ctx, v.sum isa AnyT ? pick(rng, TySum[IntT, FloatT, BoolT, SymT]) : v.sum)
+            end
         else
             genex(ctx, v.sum)
         end
@@ -426,7 +458,7 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         hasfinally && push!(blocks, genblock(ctx, blockdepth; n=1))
         return St(:try, (excvar, hasfinally); blocks=blocks)
     elseif kind === :push
-        vs = [v for v in visiblevars(ctx) if v.sum isa VecT]
+        vs = [v for v in visiblevars(ctx) if v.sum isa VecT && !(ctx.infunc && v.isglobal)]
         v = pick(rng, vs)
         elt = (v.sum::VecT).elt
         return St(:push, v.name; exs=[genex(ctx, elt isa AnyT ? pick(rng, CONCRETE_MENU) : elt)])
@@ -527,7 +559,7 @@ function genstructdef(ctx::Ctx)::St
     name = freshname(ctx, "S")
     nf = rand(rng, 1:3)
     fnames = [freshname(ctx, "fld") for _ in 1:nf]
-    fsums = TySum[pick(rng, CONCRETE_MENU) for _ in 1:nf]
+    fsums = TySum[pick(rng, SCALAR_NONGROW) for _ in 1:nf]
     ismutable = rand(rng, Bool)
     s = StructT(name, fnames, fsums, ismutable)
     push!(ctx.structs, s)

@@ -50,15 +50,12 @@ Ctx(rng::AbstractRNG, cfg::Cfg=Cfg()) = Ctx(rng, cfg, [VInfo[]], FnInfo[], Struc
 # whether writing to a module global needs the `global` keyword.
 inlocal(ctx::Ctx) = length(ctx.scopes) > 1 || ctx.infunc
 
-# Run `f()` with every FnT-summarized variable hidden. Used when generating
-# the rhs of a reassignment to an FnT variable: a closure built there must not
-# be able to reach any reassignable function variable, or reassignment could
-# tie a call cycle (f = () -> g(); g = () -> f()) — unbounded recursion that
-# breaks termination-by-construction.
-function withoutfns(f, ctx::Ctx)
+# Run `f()` with every variable matching `hide` predicate temporarily removed
+# from scope, so the generated sub-expression cannot reference them.
+function without(f, ctx::Ctx, hide)
     saved = [copy(sc) for sc in ctx.scopes]
     for sc in ctx.scopes
-        filter!(v -> !(v.sum isa FnT), sc)
+        filter!(v -> !hide(v), sc)
     end
     try
         return f()
@@ -69,6 +66,24 @@ function withoutfns(f, ctx::Ctx)
         end
     end
 end
+
+# Hide function-typed vars: a closure built in an FnT reassignment rhs must not
+# reach any reassignable function variable, or two closures could tie a call
+# cycle (f = () -> g(); g = () -> f()) — unbounded recursion.
+withoutfns(f, ctx::Ctx) = without(f, ctx, v -> v.sum isa FnT)
+
+# A binding whose value can grow under concatenation/append: String, Vector,
+# or Any (which may hold either).
+growablevar(v::VInfo) = (v.sum isa ConcT && (v.sum::ConcT).t === :Str) ||
+                        v.sum isa VecT || v.sum isa AnyT
+
+# Hide growable-typed vars: the rhs of a reassignment to a growable variable
+# must not reference ANY growable variable. That breaks multiplicative feedback
+# — direct (g = string(g, g)) and cross-referential (g = f(h); h = f(g)) alike —
+# so growable bindings stay bounded by fixed computations regardless of how many
+# times the reassignment runs. Prevents exponential-memory OOM of the (bounded-
+# step but unbounded-memory) reference side.
+withoutgrowables(f, ctx::Ctx) = without(f, ctx, growablevar)
 
 freshname(ctx::Ctx, prefix::String) = Symbol(prefix, ctx.namecounter += 1)
 
