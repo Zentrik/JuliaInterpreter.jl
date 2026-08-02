@@ -22,6 +22,8 @@ julia --project=fuzz fuzz/run.jl --n 5000                      # Supposition-dri
 julia --project=fuzz fuzz/run.jl --engine native --n 10000 --seed 1  # seeded-RNG campaign
 julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recursive-interp only
 julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis
+julia --project=fuzz fuzz/run.jl --engine evalcode --n 2000      # eval_code at paused frames
+julia --project=fuzz fuzz/run.jl --engine corpus --n 5000        # real Julia source, spliced
 julia --project=fuzz fuzz/run.jl --engine native --n 5000 --big --fresh  # larger programs, re-report known buckets
 julia --project=fuzz fuzz/metrics.jl --n 500                    # what the generator actually produces
 ```
@@ -260,6 +262,56 @@ toplevel loop does (`src/interpret.jl`) and what the differential executor
 does. `debug_command` has no toplevel loop of its own, so without this every
 method the program defines at runtime — including the harness's `__obs__` in
 the fresh module — is "too new" for the frame's world.
+
+### The eval_code axis (`evalcodefuzz.jl`)
+
+`--engine evalcode`. `eval_code(frame, "x")` is what a debugger's prompt calls
+when you type a variable name at a pause, and `eval_code(frame, "x = 3")` is
+what it calls when you assign one. Making that work means building a `let`
+around the frame's locals, evaluating in it, and writing results *back* into
+the right slots — including static parameters and captured closure variables.
+`utils.jl` carries the second-densest fix history in the package (7 commits),
+one of them literally "Fix eval_code writing static parameters back to the
+wrong slots", and nothing tests it beyond ~33 hand-written cases.
+
+Programs are stepped to a series of pause points; at each one:
+
+| class | meaning |
+|---|---|
+| `evalcode_read_mismatch` | `eval_code(frame, name)` disagrees with the value `locals(frame)` reports — the debugger is lying about program state |
+| `evalcode_write_lost` | after `eval_code(frame, "x = v")`, reading `x` back does not give `v` |
+| `evalcode_collateral_write` | that assignment changed a *different* local — the shape of the static-parameter bug |
+| `evalcode_internal_error` | `eval_code`/`locals` threw from inside JuliaInterpreter |
+
+No determinism is required, so this works at any pause in any frame.
+
+### The corpus axis (`corpus.jl`)
+
+`--engine corpus`. A grammar only emits constructs someone wrote a rule for;
+real Julia uses generators, `do` blocks, broadcasting, parametric constraints,
+iteration protocols, and macros expanding to anything at all. This axis draws
+fragments from real source — Julia's own `test/` directory, the stdlib, and
+this repo's tests — and splices `1:maxsplice` of them into one module,
+producing combinations that exist in no file.
+
+Real code is neither deterministic nor terminating, so the differential
+*value* oracle cannot be used on it. The oracle is differential on **failure
+mode only**: run the fragment with `Core.eval`; if that throws, the fragment
+does not stand alone (a snippet lifted out of a test file references names its
+file imported) and the case is discarded as junk. Only "compiled Julia ran
+this and the interpreter did not" is reported, plus the stepping invariants
+from the axis above. Comparing whether execution failed, never what it
+computed, is what makes nondeterministic real code usable as input.
+
+Two things that matter in practice: a denylist keeps fragments with side
+effects (I/O, processes, threads, `ccall`) and unbounded blocking out of the
+corpus, and definitions of another module's methods are skipped since they
+would leak between cases. The sandbox module imports `Test`, `Random`,
+`LinearAlgebra`, `Dates` and `Printf` — without that prelude, 128 of 150 cases
+were discarded for missing names; with it, roughly half of all cases execute.
+The `ran` vs `discarded_junk` counters exist so that ratio stays visible: a
+campaign that discards everything would otherwise report a perfect
+100%-agreed line while testing nothing.
 
 ### Shrinking (`shrink.jl`)
 

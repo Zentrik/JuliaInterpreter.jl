@@ -368,6 +368,97 @@ end
               fingerprint(FuzzJI.classify_step(plain, other))
     end
 
+    @testset "corpus axis: filters and oracle" begin
+        # Unsafe or non-standalone fragments must never reach execution.
+        @test !FuzzJI.corpus_ok(:(ccall(:puts, Cint, (Cstring,), "x")))
+        @test !FuzzJI.corpus_ok(:(run(`ls`)))
+        @test !FuzzJI.corpus_ok(:(while true; end))
+        @test !FuzzJI.corpus_ok(Expr(:using, Expr(:., :Foo)))
+        @test !FuzzJI.corpus_ok(Expr(:module, true, :M, Expr(:block)))
+        # Method definitions on another module's function register globally and
+        # would leak between cases.
+        @test FuzzJI.defines_foreign_method(:(Base.foo(x) = 1))
+        @test FuzzJI.defines_foreign_method(:(function Base.bar(x::Int) 1 end))
+        @test !FuzzJI.defines_foreign_method(:(localfn(x) = 1))
+        @test !FuzzJI.corpus_ok(:(Base.foo(x) = 1))
+        # ... while ordinary code is kept.
+        @test FuzzJI.corpus_ok(:(function f(x); x + 1; end))
+        @test FuzzJI.corpus_ok(:(const zzz = [i^2 for i in 1:3]))
+
+        # A fragment compiled Julia cannot run either is junk, not a finding:
+        # this is what stops "@testset not defined" being reported as a bug.
+        junk = FuzzJI.CorpusOutcome(:junk, "reference threw UndefVarError", :none)
+        @test FuzzJI.corpusverdict(junk).class === :agree
+        real = FuzzJI.CorpusOutcome(:internal_error, "interp threw", :step_expr!)
+        @test FuzzJI.corpusverdict(real).class === :corpus_internal_error
+        # An actual round trip: a self-contained fragment must run on both
+        # sides, and one that needs a missing name must be discarded.
+        @test FuzzJI.corpus_run(Expr(:toplevel, :(zqx = 1 + 1)); nstmts=100_000).status === :ok
+        @test FuzzJI.corpus_run(Expr(:toplevel, :(znotdefined_xyz + 1)); nstmts=100_000).status === :junk
+    end
+
+    @testset "eval_code axis: probe selection and verdicts" begin
+        Variable = FuzzJI.Variable
+        # Plumbing names and non-scalar values are not round-trip candidates.
+        @test !FuzzJI.probeable(Variable(1, Symbol("#self#")))
+        @test !FuzzJI.probeable(Variable([1, 2], :v))
+        @test FuzzJI.probeable(Variable(1, :x))
+        @test FuzzJI.probeable(Variable("s", :y))
+        # Write probes stay in the original type, so the round trip tests the
+        # write-back plumbing rather than conversion.
+        rng = Xoshiro(1)
+        @test FuzzJI.writeprobe(rng, 3) isa Int
+        @test FuzzJI.writeprobe(rng, 1.5) isa Float64
+        @test FuzzJI.writeprobe(rng, true) isa Bool
+        @test FuzzJI.writeprobe(rng, [1]) === nothing   # unsupported: skipped
+        # Verdict mapping, including the collateral-write class that catches a
+        # write landing in the wrong slot.
+        @test FuzzJI.evalverdict(FuzzJI.EvalOutcome(:ok, "", :none, 3)).class === :agree
+        @test FuzzJI.evalverdict(FuzzJI.EvalOutcome(:write_lost, "d", :none, 3)).class ===
+              :evalcode_write_lost
+        @test FuzzJI.evalverdict(FuzzJI.EvalOutcome(:collateral_write, "d", :none, 3)).class ===
+              :evalcode_collateral_write
+        @test FuzzJI.evalverdict(FuzzJI.EvalOutcome(:internal_error, "d", :eval_code, 3)).class ===
+              :evalcode_internal_error
+    end
+
+    @testset "eval_code agrees with the frame's own locals" begin
+        # The real oracle, on real frames: every local eval_code reports must
+        # match what the interpreter holds, and a write must round-trip without
+        # disturbing any other local.
+        nbad = 0
+        for seed in 1:12
+            src = render(genprogram(Xoshiro(seed)))
+            ex = FuzzJI.parsegate(src)
+            ex === nothing && continue
+            m = FuzzJI.freshmodule()
+            try
+                for (mod, frag) in FuzzJI.ExprSplitter(m, ex)
+                    fr = FuzzJI.Frame(mod, frag)
+                    for _ in 1:15
+                        FuzzJI.is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
+                        o = FuzzJI.check_evalcode(Xoshiro(seed), fr)
+                        if o.status !== :ok
+                            nbad += 1
+                            @warn "eval_code divergence (a real finding — triage it!)" seed o.status o.detail
+                            break
+                        end
+                        ret = try
+                            FuzzJI.debug_command(FuzzJI.RecursiveInterpreter(), fr, :se, true)
+                        catch
+                            nothing
+                        end
+                        ret === nothing && break
+                        fr, _pc = ret
+                    end
+                end
+            catch
+                # the program's own errors end the walk; not this test's concern
+            end
+        end
+        @test nbad == 0
+    end
+
     @testset "canary: pipeline detects a genuine known divergence" begin
         # Interpreted frames are visible in stacktrace(); compiled ones are not.
         # This is a real, permanent difference — perfect for proving the whole

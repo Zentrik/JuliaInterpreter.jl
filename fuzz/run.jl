@@ -38,7 +38,8 @@ function parseargs(args)
                          "budget" => 300_000, "selftest" => false, "noshrink" => false,
                          "modes" => "both", "big" => false, "fresh" => false,
                          "patience" => 1, "nosync" => false, "noswarm" => false,
-                         "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false)
+                         "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false,
+                         "maxsplice" => 3, "nostep" => false)
     # Cfg overrides start unset (nothing) and fall through to the profile default.
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop", "bodystmts")
         o[k] = nothing
@@ -74,6 +75,10 @@ function parseargs(args)
             o["maxcmds"] = parse(Int, args[i += 1])
         elseif a == "--nobreakpoints"  # step engine: don't arm break-on-error
             o["nobreakpoints"] = true
+        elseif a == "--maxsplice"      # corpus engine: max real fragments per case
+            o["maxsplice"] = parse(Int, args[i += 1])
+        elseif a == "--nostep"         # corpus engine: run only, don't also step
+            o["nostep"] = true
         elseif a == "--patience"       # consecutive empty supposition rounds before stopping
             o["patience"] = parse(Int, args[i += 1])
         elseif a == "--maxdepth"
@@ -148,8 +153,20 @@ elseif o["engine"] == "step"
     stats = step_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
                           seeddisk=!o["fresh"], journalsync=!o["nosync"],
                           maxcmds=o["maxcmds"], usebreakpoints=!o["nobreakpoints"])
-    @info "step campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
+    @info "step campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
+    exit(stats.findings == 0 ? 0 : 2)
+elseif o["engine"] == "evalcode"
+    stats = evalcode_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
+                              seeddisk=!o["fresh"], journalsync=!o["nosync"])
+    @info "evalcode campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
+    exit(stats.findings == 0 ? 0 : 2)
+elseif o["engine"] == "corpus"
+    stats = corpus_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
+                            maxsplice=o["maxsplice"], maxcmds=o["maxcmds"],
+                            dostep=!o["nostep"], seeddisk=!o["fresh"],
+                            journalsync=!o["nosync"])
+    @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else
-    error("unknown engine $(o["engine"]) (expected: supposition | native | step)")
+    error("unknown engine $(o["engine"]) (expected: supposition | native | step | evalcode | corpus)")
 end
