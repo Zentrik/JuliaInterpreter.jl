@@ -170,6 +170,21 @@ any yield number. The specific traps, all of which cost real time:
   command.** Both were reportable classes at first and both were pure false
   positives. Measure the actual property — for "stuck", that a command leaves
   `(framecode, pc)` unchanged repeatedly *while returning a normal pc*.
+- **A differential oracle must check that both sides ran in the same
+  environment.** The corpus axis compared a reference module that had the
+  fragment's imports applied against an interpreted module that did not, and
+  reported the difference as an interpreter bug. It now records which prelude
+  statements actually took effect and discards the case when the two disagree.
+  Whether an import succeeds is genuinely not a given: a lifted
+  `using .Main.OffsetArrays` names a module that does not exist in the harness.
+- **Do not swallow setup failures silently.** That same bug was invisible for
+  as long as it was, because `corpusmodule` caught and ignored failed prelude
+  statements. A `try`/`catch` around environment setup should record what
+  failed, not just carry on.
+- **Re-verify a fix under the parameters that produced the report.** A first
+  attempt at the above looked fixed because the check ran with the default
+  `--maxsplice 3` while the campaign uses `4`, and the splice count changes
+  which fragments a seed selects. Same seed, different program.
 
 **Check whether a finding is already fixed upstream before minimizing it.**
 See item 1.
