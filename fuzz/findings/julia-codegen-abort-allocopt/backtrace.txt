@@ -1,0 +1,7 @@
+[12236] signal 6 (-6): Aborted
+in expression starting at none:1
+pthread_kill at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+gsignal at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+abort at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+operator() at /cache/build/builder-amdci4-7/julialang/julia-release-1-dot-11/src/llvm-alloc-opt.cpp:797 [inlined]
+moveToStack at /cache/build/builder-amdci4-7/julialang/julia-release-1-dot-11/src/llvm-alloc-opt.cpp:802
