@@ -32,8 +32,14 @@ function journal_case!(j::Journal, seed::Int, src::String)
             j.sync && ccall(:fsync, Cint, (Cint,), fd(io))
         end
     end
+    # The seed history is always flushed, even when the per-candidate fsync is
+    # off: `sync` trades away durability against a *machine* crash, but a
+    # process that gets killed should still leave a readable history behind,
+    # and a buffered line would be lost exactly when it is wanted. `current.jl`
+    # survives either way — it is closed after every write, so the data is in
+    # the page cache before the next candidate runs.
     println(j.logio, seed)
-    j.sync && flush(j.logio)
+    flush(j.logio)
 end
 
 # Called when a case completes without killing the process.
