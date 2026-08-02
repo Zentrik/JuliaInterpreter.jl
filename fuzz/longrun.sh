@@ -57,6 +57,16 @@ run_shard() {
     : > "$log"
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         batch=$((batch + 1))
+        # The journal holds the candidate that was executing, but only until the
+        # next one overwrites it — so a batch that died leaves its reproducer in
+        # current.jl and the *next* batch immediately destroys it. Set it aside
+        # first. This is the whole point of journalling a crash: observed on the
+        # first real abort of a long run, where a Julia codegen assertion killed
+        # a shard and the restart clobbered the program that caused it.
+        if [ -f "$jdir/current.jl" ]; then
+            mkdir -p "$jdir/crashed"
+            mv "$jdir/current.jl" "$jdir/crashed/batch$((batch - 1))-$(date -u +%H%M%S).jl"
+        fi
         echo "=== $name batch $batch seed=$seed $(date -u +%H:%M:%S) ===" >> "$log"
         # --nosync: the fsync per candidate is a disk round trip, and the
         # journal write itself (which is what recovers a crash) still happens.

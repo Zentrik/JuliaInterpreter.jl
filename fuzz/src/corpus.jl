@@ -367,8 +367,16 @@ function corpus_run(ex::Expr, prelude::Vector{Expr}; nstmts::Int)
     refstatus, refexc, prelude = eval_ref(ex, prelude)
     m = corpusmodule(prelude)
     intstatus, intexc, detail, site = try
-        for (mod, frag) in ExprSplitter(m, ex)
-            frame = Frame(mod, frag)
+        # `ExprSplitter`/`Frame` expand macros while building the frame, and the
+        # prelude was evaluated *at runtime* — so `using Test` is newer than the
+        # world this function was compiled in, and a `@testset` in the fragment
+        # resolves against a world that has not seen the import. Compiled Julia
+        # does not hit this because `Core.eval` expands in the latest world.
+        # Without invokelatest the axis reports "compiled Julia ran this and the
+        # interpreter threw UndefVarError: @testset" — a difference manufactured
+        # entirely by the harness.
+        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+            frame = Base.invokelatest(Frame, mod, frag)
             budget = nstmts
             while true
                 ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
@@ -408,8 +416,11 @@ function corpus_step(ex::Expr, prelude::Vector{Expr}, rng::AbstractRNG; maxcmds:
     interp = RecursiveInterpreter()
     total = 0
     try
-        for (mod, frag) in ExprSplitter(m, ex)
-            frame = Frame(mod, frag)
+        # invokelatest for the same reason as corpus_run: the prelude's imports
+        # are newer than this function's world, and frame construction expands
+        # the fragment's macros.
+        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+            frame = Base.invokelatest(Frame, mod, frag)
             status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total)
             total += n
             status === :stuck && return CorpusOutcome(:step_stuck,
