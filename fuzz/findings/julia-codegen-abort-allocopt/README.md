@@ -1,14 +1,46 @@
-# Julia codegen abort in the alloc-opt pass (not a JuliaInterpreter bug)
+# RESOLVED: a known, already-fixed Julia 1.11 regression — not a new bug
 
-`julia` aborts with SIGABRT while compiling a generated program. The failure is
-in Julia's own LLVM allocation-optimization pass, and it happens on the
-**reference** side of the differential harness — plain `Core.eval` of the
-program — so JuliaInterpreter is not involved in the crash at all.
+`julia` aborts with SIGABRT while compiling a generated program, in Julia's own
+LLVM allocation-optimization pass. It happens on the **reference** side of the
+differential harness — plain `Core.eval` — so JuliaInterpreter is not involved.
 
-- Julia: 1.11.9, x86_64-linux-gnu
+**This is [JuliaLang/julia#57190](https://github.com/JuliaLang/julia/issues/57190),
+closed by PR #57208.** A regression introduced in 1.11 by PR #51720 and fixed
+for 1.12. Verified here:
+
+| Julia | `minimized.jl` | `minimized-struct.jl` | issue #57190's own repro |
+|---|---|---|---|
+| 1.11.9 | aborts | aborts | aborts |
+| 1.12.6 | clean | clean | clean |
+
+So the fix never reached a 1.11 patch release. The only thing arguably worth
+raising upstream is whether #57208 should be backported to 1.11; nothing here
+is a new defect.
+
 - Found by: FuzzJI native engine, seed 5000644 with the `--big` config profile
 - Reproduced independently by two shards (`native` and `native-big`) with an
-  identical backtrace, so it is not a one-off.
+  identical backtrace.
+
+## The process lesson, which is the durable part
+
+The version check should have been the *first* triage step and was instead the
+last. Confirming the crash reproduces on current Julia costs one command; it
+was done only after journal replay, line-level minimization, a C-Reduce run,
+and a delegated reduction agent — all of which turned out to be work on a bug
+fixed a release ago.
+
+Two things follow for the harness, tracked as work items rather than fixed
+here:
+
+1. A crash on the *reference* side is a Julia bug, not an interpreter bug, and
+   should be classified and routed separately instead of landing in the same
+   findings bucket as a divergence.
+2. Any such finding should be re-run against the newest installed Julia before
+   it is reported, so "already fixed upstream" is answered automatically.
+
+What the episode does show is that the reduction pipeline works end to end: a
+69-line generated program became a 36-byte one-liner that matches the
+canonical reproducer for a real, independently-confirmed compiler bug.
 
 ## Backtrace (abridged)
 
