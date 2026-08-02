@@ -370,6 +370,51 @@ corpus-admission feedback) and **P3 items 12–13** (`eval_code` and
 `ExprSplitter` axes — `utils.jl`/`construct.jl` carry the two densest fix
 histories in the package and neither is fuzzed yet), then **P4** (EMI).
 
+## The first long run
+
+Five sharded axes (`fuzz/longrun.sh`), restart-looping. What it produced:
+
+**One real bug, in Julia rather than in JuliaInterpreter.** `julia` aborts
+inside its own LLVM allocation-optimization pass (`llvm-alloc-opt.cpp`,
+`moveToStack`) while compiling a generated program. It surfaced on the
+*reference* side — plain `Core.eval` — so the interpreter is not involved.
+Two shards hit it independently with identical backtraces. Recovered by
+deterministic replay to seed 5000644 and reduced from 69 to 29 lines; see
+`findings/julia-codegen-abort-allocopt/`.
+
+That the harness finds compiler bugs is a side effect worth naming: it
+compiles every generated program as its reference, so it is a codegen fuzzer
+for free, on exactly the type-unstable deeply-nested input that stresses
+escape analysis. The AFL work on the Julia binary found a comparable class.
+
+**Four harness bugs, which is the more useful output of a first long run.**
+Each was killing batches or manufacturing findings, and none was reachable by
+short campaigns:
+
+- Observation slots can be *unassigned*, not merely absent: `push!` grows the
+  array then stores, so an interpretation stopping in between leaves a live
+  element that was never written. Reading it killed whole batches — sometimes
+  `UndefRefError`, sometimes a segfault, both inside the comparator.
+- `inlocal` counts *generation* scopes, which are pushed for `if` blocks too,
+  but `if` introduces no runtime scope. Runtime scopes are now tracked
+  separately; without that, a `while` fuel counter written inside a toplevel
+  `if` silently never decremented.
+- The parse gate lowered the whole program in one call, so a per-statement
+  scope error slipped through and then failed on *both* sides with different
+  exception types — reported as an exception divergence. One generator mistake
+  of this shape produced 32 spurious findings in a single run.
+- The journal's seed history was flushed only when the per-candidate fsync was
+  on, so a killed shard lost its history exactly when it was wanted.
+
+The crashed-candidate recovery path also had a hole: the journal holds the
+program that was executing, but the *next* batch overwrote it immediately, so
+a crash destroyed its own reproducer. Fixed by setting it aside on restart.
+
+**Still no JuliaInterpreter bug.** The interpreter-facing axes ran clean. Given
+the fix-history argument above, the most likely reading is that they need
+hours rather than that they are pointed wrong — but that is a hypothesis, not
+a result, and it stays untested until a run goes the distance on fixed code.
+
 ## On "bigger programs" vs "splice real code"
 
 Both were raised as ways to attack the same problem. They are not equally
