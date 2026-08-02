@@ -123,10 +123,17 @@ end
     end
 
     @testset "shrinker reduces while preserving the finding" begin
-        # Embed the canary divergence in generated noise, then shrink.
-        noisy = genprogram(Xoshiro(7))
-        canaryst = FuzzJI.St(:observe; exs=[FuzzJI.Ex(:stackprobe, FuzzJI.BoolT, nothing, FuzzJI.Ex[])])
-        prog = FuzzJI.Program(noisy.fundefs, vcat(noisy.body[1:end-1], [canaryst], noisy.body[end:end]))
+        # Embed the canary divergence in deterministic, guaranteed-clean noise,
+        # then shrink. Hand-built (not generated) so the fixture can't randomly
+        # throw before reaching the canary; the shrinker must strip the inert
+        # assignments and leave the one divergent observation.
+        Ex, St = FuzzJI.Ex, FuzzJI.St
+        IntT = FuzzJI.IntT
+        inert(i) = St(:assign, (Symbol("z", i), IntT, true, false); exs=[FuzzJI.lit(i, IntT)])
+        canaryst = St(:observe; exs=[Ex(:stackprobe, FuzzJI.BoolT, nothing, FuzzJI.Ex[])])
+        noise = St[inert(i) for i in 1:12]
+        newbody = vcat(noise[1:6], [canaryst], noise[7:12])
+        prog = FuzzJI.Program(St[], St[], St[], newbody)
         r = run_both(render(prog); nstmts=2_000_000)
         @test r !== nothing
         v = classify(r...)

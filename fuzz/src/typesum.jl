@@ -22,6 +22,12 @@ struct FnT <: TySum
     ret::TySum
 end
 arity(f::FnT) = length(f.psums)
+struct StructT <: TySum
+    name::Symbol
+    fieldnames::Vector{Symbol}
+    fieldsums::Vector{TySum}
+    ismutable::Bool
+end
 struct AnyT <: TySum end
 
 const IntT = ConcT(:Int)
@@ -42,6 +48,7 @@ compat(want::TupT, have::TupT) =
     length(want.elts) == length(have.elts) &&
     all(compat_eq(w, h) for (w, h) in zip(want.elts, have.elts))
 compat(want::FnT, have::FnT) = arity(want) == arity(have)
+compat(want::StructT, have::StructT) = want.name === have.name
 compat(::TySum, ::TySum) = false
 
 compat_eq(a::TySum, b::TySum) = compat(a, b) && compat(b, a)
@@ -67,4 +74,5 @@ end
 typename(s::VecT) = "Vector"
 typename(s::TupT) = "Tuple"
 typename(::FnT) = "Function"
+typename(s::StructT) = String(s.name)
 typename(::AnyT) = "Any"

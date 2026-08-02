@@ -90,15 +90,36 @@ valid by construction (the selftest asserts 0 parse/lowering failures across
 300 seeds). Blocks are generated in child generation-scopes conservatively
 (runtime `if` doesn't scope, but forgetting its bindings is safe).
 
-Wave-1 grammar plus the wave-2 acceptance rule: literals (including
-`typemax`, `NaN`, `-0.0`, unicode strings), arithmetic/comparison/boolean
-ops, `===`, `isa` against abstract types, ternaries, tuples, vectors
-(`push!`/guarded `setindex!`/aliasing — identity semantics is a classic
-interpreter bug class), `if`/`for`/fueled `while`/`let`/`try-catch-finally`,
-named functions with typed/untyped params and **multi-method dispatch**
-(second method differing in first-param type), fueled recursion, and
-**closures** — including the mutating variant `p -> (cap = cap + p; cap)`
-that forces captured variables into `Box`es.
+Wave-1 grammar: literals (including `typemax`, `NaN`, `-0.0`, unicode
+strings), arithmetic/comparison/boolean ops, `===`, `isa` against abstract
+types, ternaries, tuples, vectors (`push!`/guarded `setindex!`/aliasing —
+identity semantics is a classic interpreter bug class), `if`/`for`/fueled
+`while`/`let`/`try-catch-finally`, named functions with typed/untyped params
+and **multi-method dispatch** (second method differing in first-param type),
+fueled recursion, and **closures** — including the mutating variant
+`p -> (cap = cap + p; cap)` that forces captured variables into `Box`es.
+
+Wave-2 grammar (programs are now four sections: module globals + struct
+definitions, function definitions, bare toplevel statements, and the `let`
+body):
+
+- a curated **builtins/intrinsics edge-case dictionary** (`BUILTIN_PROBES`):
+  ~45 verbatim probes of `getfield`/`apply_type`/`Core.Intrinsics.*`/
+  `_apply_iterate`/`compilerbarrier`/... with wrong arities and
+  odd-but-lowerable arguments, always guarded so the exception *type* is
+  oracle data — aimed directly at `src/builtins.jl`;
+- **module globals**: created at toplevel and via bare-toplevel statements,
+  read everywhere, written from local scopes via `global x = ...`;
+- **`struct`/`mutable struct` definitions**: construction, field reads,
+  `setfield!` via `x.f = v`, mutable-struct aliasing; observations record
+  field values, never instances (type identity differs across the two
+  modules by construction);
+- **kwargs/defaults/varargs/splat**: keyword params with defaults (random
+  subsets passed at call sites — the kwsorter path), trailing positional
+  defaults, vararg methods with extra/splatted call-site args;
+- **comprehensions** with optional filters (lower to closures + `collect`);
+- **bare toplevel statements** between the definitions and the `let`,
+  exercising the toplevel-frame path without the `let` wrapper.
 
 Generation is a pure function of its randomness source, consumed through the
 `AbstractRNG` interface. Two engines drive it (`--engine`):
@@ -162,12 +183,9 @@ and belong in `SUPPRESSIONS` if hit).
 
 ## Roadmap
 
-- **M2 — widen the grammar**: struct/mutable struct definitions (observe
-  field values, never instances), kwargs/defaults/varargs/splat,
-  comprehensions/generators, destructuring, `global` declarations and
-  soft-vs-hard scope shapes, do-blocks, a curated builtin/intrinsic
-  edge-case dictionary (wrong arities, weird-but-lowerable argument types,
-  always guarded) aimed directly at `src/builtins.jl`. CI: a time-boxed
+- **M2 — widen the grammar** (done, see wave-2 above, except:)
+  destructuring, do-blocks, `@generated` functions, parametric structs,
+  inner constructors, defaults referencing earlier params. CI: a time-boxed
   nightly job that uploads `findings/` as artifacts and exits 2 on news.
 - **M3 — feedback + debugger axis**: a `CoverageInterp <: Interpreter`
   recording which stmt heads/builtins/intrinsics/dispatch paths each case

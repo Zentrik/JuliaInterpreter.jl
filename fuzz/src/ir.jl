@@ -22,14 +22,23 @@
 #   :closure  meta = params::Vector{Symbol}                 kids = [bodyex]
 #   :closuremut meta = (params::Vector{Symbol}, cap::Symbol) kids = [updateex, retex]
 #   :guard    meta = nothing                                kids = [inner]  # try/catch wrapper
+#   :src      meta = verbatim source::String                kids = []   # builtin-table literal args
+#   :splat    meta = nothing                                kids = [inner]  # renders (inner)... inside calls
+#   :prop     meta = fieldname::Symbol                      kids = [obj]    # (obj).field
+#   :compr    meta = (ivar, n::Int, hasfilter::Bool)        kids = [bodyex] or [bodyex, cond]
+#   :kwcall   meta = (fname::Symbol, kwnames::Vector{Symbol}) kids = positional args, then kwarg values
 #
 # St node kinds:
-#   :assign   meta = (name, sum, isnew)                     exs = [rhs]
+#   :assign   meta = (name, sum, isnew, needsglobal::Bool)  exs = [rhs]
 #   :observe  meta = nothing                                exs = [ex]
 #   :if       meta = haselse::Bool                          exs = [cond]  blocks = [then] or [then, else]
 #   :for      meta = (ivar, n::Int)                         blocks = [body]
 #   :while    meta = (fuelvar, fuel::Int)                   exs = [cond]  blocks = [body]
-#   :fundef   meta = (name, params::Vector{Tuple{Symbol,TySum,Bool}}, retsum)  exs = [retex]  blocks = [body]
+#   :fundef   meta = (name, params, retsum[, kwparams, vararg::Bool])  exs = [retex]  blocks = [body]
+#             params::Vector{Tuple{Symbol,TySum,Bool}} (name, sum, typed);
+#             kwparams::Vector{Tuple{Symbol,Any}} (name, literal default value)
+#   :structdef meta = StructT                               (fields with `typed` = fieldsums[i] isa ConcT)
+#   :setprop  meta = (varname, fieldname)                   exs = [val]   # mutable struct field write
 #   :recdef   meta = (name, accsum)                         exs = [stepex]      # fueled self-recursion template
 #   :let      meta = bindings::Vector{Tuple{Symbol,TySum}}  exs = rhs per binding  blocks = [body]
 #   :push     meta = vecname::Symbol                        exs = [val]
@@ -54,9 +63,13 @@ end
 St(kind::Symbol, meta=nothing; exs=Ex[], blocks=Vector{St}[]) = St(kind, meta, exs, blocks)
 
 struct Program
+    pre::Vector{St}       # module globals + struct definitions
     fundefs::Vector{St}   # toplevel :fundef/:recdef statements
+    mid::Vector{St}       # extra toplevel statements (toplevel-frame surface)
     body::Vector{St}      # rendered inside a toplevel `let`
 end
+Program(fundefs::Vector{St}, body::Vector{St}) = Program(St[], fundefs, St[], body)
+sections(p::Program) = (p.pre, p.fundefs, p.mid, p.body)
 
 lit(v, sum::TySum) = Ex(:lit, sum, v)
 
@@ -71,6 +84,8 @@ defaultex(s::ConcT) =
 defaultex(s::VecT) = Ex(:vect, s, nothing, [defaultex(s.elt)])
 defaultex(s::TupT) = Ex(:tuple, s, nothing, [defaultex(e) for e in s.elts])
 defaultex(s::FnT) = Ex(:closure, s, [Symbol("__p", i) for i in 1:arity(s)], [defaultex(s.ret isa AnyT ? NothingT : s.ret)])
+# `nothing`, not a construction: shrinking may have removed the struct definition.
+defaultex(::StructT) = lit(nothing, NothingT)
 defaultex(::AnyT) = lit(nothing, NothingT)
 
 # All variable/function names a statement references (for cascade removal and
@@ -80,6 +95,8 @@ function refs!(out::Set{Symbol}, e::Ex)
         push!(out, e.meta::Symbol)
     elseif e.kind === :call || e.kind === :callvar
         push!(out, e.meta::Symbol)
+    elseif e.kind === :kwcall
+        push!(out, (e.meta[1])::Symbol)
     elseif e.kind === :closuremut
         push!(out, (e.meta[2])::Symbol)
     end
@@ -94,6 +111,8 @@ function refs!(out::Set{Symbol}, st::St)
         push!(out, st.meta::Symbol)
     elseif st.kind === :alias
         push!(out, st.meta[2]::Symbol)
+    elseif st.kind === :setprop
+        push!(out, st.meta[1]::Symbol)
     end
     for e in st.exs
         refs!(out, e)
@@ -109,5 +128,6 @@ function binds(st::St)
     st.kind === :assign && (st.meta[3]::Bool) && return Symbol[st.meta[1]]
     st.kind === :alias && return Symbol[st.meta[1]]
     (st.kind === :fundef || st.kind === :recdef) && return Symbol[st.meta[1]]
+    st.kind === :structdef && return Symbol[(st.meta::StructT).name]
     return Symbol[]
 end

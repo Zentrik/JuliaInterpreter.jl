@@ -8,7 +8,8 @@
 # -- deep copy (IR nodes are immutable structs over mutable vectors) ---------
 cloneex(e::Ex) = Ex(e.kind, e.sum, e.meta, Ex[cloneex(k) for k in e.kids])
 clonest(s::St) = St(s.kind, s.meta, Ex[cloneex(e) for e in s.exs], [St[clonest(x) for x in b] for b in s.blocks])
-cloneprog(p::Program) = Program(St[clonest(s) for s in p.fundefs], St[clonest(s) for s in p.body])
+cloneprog(p::Program) = Program(St[clonest(s) for s in p.pre], St[clonest(s) for s in p.fundefs],
+                                St[clonest(s) for s in p.mid], St[clonest(s) for s in p.body])
 
 # -- name accounting ---------------------------------------------------------
 function allbound!(out::Set{Symbol}, st::St)
@@ -18,6 +19,14 @@ function allbound!(out::Set{Symbol}, st::St)
     if st.kind === :fundef
         for (pn, _, _) in st.meta[2]
             push!(out, pn)
+        end
+        if length(st.meta) >= 5 && st.meta[5]::Bool     # vararg name
+            push!(out, st.meta[6]::Symbol)
+        end
+        if length(st.meta) >= 4                          # kwparam names
+            for (kn, _) in st.meta[4]
+                push!(out, kn)
+            end
         end
     elseif st.kind === :recdef
         push!(out, :n); push!(out, :acc)
@@ -33,6 +42,8 @@ function allbound!(out::Set{Symbol}, st::St)
         push!(out, st.meta[1])
     elseif st.kind === :assign   # any assignment can (re)create a local
         push!(out, st.meta[1])
+    elseif st.kind === :structdef
+        push!(out, (st.meta::StructT).name)
     end
     for e in st.exs
         closureparams!(out, e)
@@ -60,10 +71,7 @@ end
 
 function allbound(p::Program)
     out = Set{Symbol}()
-    for s in p.fundefs
-        allbound!(out, s)
-    end
-    for s in p.body
+    for sec in sections(p), s in sec
         allbound!(out, s)
     end
     return out
@@ -75,6 +83,9 @@ function repairex(e::Ex, bound::Set{Symbol})::Ex
         return defaultex(e.sum)
     end
     if (e.kind === :callvar || e.kind === :call) && !(e.meta::Symbol in bound)
+        return defaultex(e.sum)
+    end
+    if e.kind === :kwcall && !(e.meta[1]::Symbol in bound)
         return defaultex(e.sum)
     end
     if e.kind === :closuremut && !(e.meta[2]::Symbol in bound)
@@ -91,6 +102,8 @@ function repairblock!(sts::Vector{St}, bound::Set{Symbol})
             (st.meta::Symbol) in bound || return false
         elseif st.kind === :alias
             (st.meta[2]::Symbol) in bound || return false
+        elseif st.kind === :setprop
+            (st.meta[1]::Symbol) in bound || return false
         end
         return true
     end
@@ -107,10 +120,11 @@ end
 function repair!(p::Program)
     for _ in 1:4  # removals can unbind further names; a few rounds reach a fixpoint
         bound = allbound(p)
-        before = sum(length, (p.fundefs, p.body))
-        repairblock!(p.fundefs, bound)
-        repairblock!(p.body, bound)
-        sum(length, (p.fundefs, p.body)) == before && break
+        before = sum(length, sections(p))
+        for sec in sections(p)
+            repairblock!(sec, bound)
+        end
+        sum(length, sections(p)) == before && break
     end
     return p
 end
@@ -127,8 +141,9 @@ function allsites(p::Program)
             end
         end
     end
-    walk(p.fundefs)
-    walk(p.body)
+    for sec in sections(p)
+        walk(sec)
+    end
     return sites
 end
 
@@ -142,8 +157,9 @@ function nstatements(p::Program)
             end
         end
     end
-    walk(p.fundefs)
-    walk(p.body)
+    for sec in sections(p)
+        walk(sec)
+    end
     return n
 end
 

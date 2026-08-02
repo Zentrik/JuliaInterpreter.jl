@@ -55,6 +55,10 @@ function genlit(ctx::Ctx, want::TySum)::Ex
         return Ex(:vect, want, nothing, [genleaf(ctx, want.elt) for _ in 1:rand(ctx.rng, 1:3)])
     elseif want isa FnT
         return genclosure(ctx, want)
+    elseif want isa StructT
+        # construct: Name(field values...)
+        args = Ex[genleaf(ctx, fs) for fs in want.fieldsums]
+        return Ex(:call, want, want.name, args)
     end
     # AnyT leaf: any concrete literal
     return genlit(ctx, pick(ctx.rng, TySum[IntT, FloatT, BoolT, StrT, SymT, NothingT]))
@@ -65,6 +69,68 @@ function randstring_src(ctx::Ctx)
     alphabet = ['a', 'b', 'x', 'y', '0', '1', ' ', '!', 'α', 'β', '∀', '🐛']
     return String([pick(ctx.rng, alphabet) for _ in 1:n])
 end
+
+# Builtins / intrinsics edge-case dictionary. Each entry renders verbatim
+# source (an `:src` Ex) whose result is Any and always wrapped in a `:guard`,
+# so both the value case and the exception-type case are first-class oracle
+# data. These deliberately probe wrong arities, odd-but-lowerable argument
+# types, and Core/reflection builtins that JuliaInterpreter special-cases —
+# the historically bug-rich surface (src/builtins.jl).
+const BUILTIN_PROBES = String[
+    # getfield / setfield! / fieldative
+    "getfield((1, 2, 3), 2)",
+    "getfield((1, 2), 4)",
+    "getfield(1, :x)",
+    "nfields(1)",
+    "nfields((1, 2, 3))",
+    "fieldtype(Tuple{Int,String}, 1)",
+    "fieldtype(Int, 1)",
+    "isdefined(Main, :nonexistent_sym_zzz)",
+    "getfield((a=1, b=2), :b)",
+    "getfield((a=1, b=2), :c)",
+    # type / apply_type
+    "Core.apply_type(Array, Int, 1)",
+    "Core.apply_type(Val)",
+    "typeof(typeof(1))",
+    "Core.apply_type(Tuple, Int, Vararg{Int})",
+    "isa(1, Union{Int,String})",
+    "1 isa DataType",
+    # tuple / ntuple / splat builtins
+    "ntuple(identity, 3)",
+    "ntuple(identity, 0)",
+    "tuple()",
+    "Core.tuple(1, 2, 3)",
+    "Core._apply_iterate(Base.iterate, +, (1, 2), (3, 4))",
+    # arithmetic / conversion intrinsics
+    "Core.Intrinsics.add_int(3, 4)",
+    "Core.Intrinsics.sdiv_int(7, 0)",
+    "Core.Intrinsics.checked_sadd_int(typemax(Int), 1)",
+    "Core.bitcast(Float64, 0)",
+    "Core.bitcast(Float64, Int64(4607182418800017408))",
+    "reinterpret(Float64, Int64(0))",
+    "Base.add_int(1, 2)",
+    "Int8(300)",
+    "trunc(Int8, 300.0)",
+    "unsafe_trunc(Int8, 300.0)",
+    # equality / identity / ordering builtins
+    "===(1, 1.0)",
+    "Core.ifelse(true, 1, 2)",
+    "Core.ifelse(1, 2, 3)",
+    "objectid(nothing) isa UInt",
+    "Core.sizeof(Int)",
+    "Core.sizeof(1)",
+    # arrays low-level
+    "Core.arraysize([1,2,3], 1)",
+    "Base.arrayref(true, [1,2,3], 4)",
+    "Core.svec(1, 2, 3)",
+    "getindex((1, 2, 3))",
+    # modifyfield / replacefield (newer builtins JuliaInterpreter must track)
+    "Base.donotdelete(1)",
+    "Base.compilerbarrier(:const, 1)",
+    "Base.compilerbarrier(:type, 1)",
+    "typeassert(1, Int)",
+    "typeassert(1, String)",
+]
 
 function genex_inner(ctx::Ctx, want::TySum)::Ex
     rng = ctx.rng
@@ -83,11 +149,20 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     elseif want isa FnT
         push!(opts, (1.0, :closure))
     else # AnyT
-        push!(opts, (2.0, :leaf), (1.5, :guardix), (1.0, :callvar), (0.8, :guarddiv), (0.6, :ternary))
+        push!(opts, (2.0, :leaf), (1.5, :guardix), (1.0, :callvar), (0.8, :guarddiv), (0.6, :ternary),
+              (1.4, :builtin))
     end
     # Calls into generated functions, for any want their return satisfies:
     if !isempty(fnsreturning(ctx, want))
         push!(opts, (2.0, :callfn))
+    end
+    # keyword calls into functions that declare kwargs
+    if any(f -> !isempty(f.kwnames) && compat(want, f.ret), ctx.fns)
+        push!(opts, (1.2, :kwcall))
+    end
+    # field reads off in-scope struct values
+    if !isempty([v for v in visiblevars(ctx) if v.sum isa StructT && any(fs -> compat(want, fs), (v.sum::StructT).fieldsums)])
+        push!(opts, (1.5, :getprop))
     end
     kind = wpick(rng, opts)
 
@@ -157,7 +232,36 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         f = pick(rng, fnsreturning(ctx, want))
         sig = pick(rng, f.sigs)
         args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
+        # varargs method: sometimes append extra trailing args, occasionally splat a vector
+        if f.vararg && rand(rng) < 0.5
+            for _ in 1:rand(rng, 0:2)
+                push!(args, genex(ctx, pick(rng, CONCRETE_MENU)))
+            end
+            if rand(rng) < 0.3
+                push!(args, Ex(:splat, AnyT(), nothing, [genex(ctx, VecT(IntT))]))
+            end
+        end
         return Ex(:call, f.ret, f.name, args)
+    elseif kind === :kwcall
+        cands = [f for f in ctx.fns if !isempty(f.kwnames) && compat(want, f.ret)]
+        f = pick(rng, cands)
+        sig = f.sigs[1]
+        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
+        # pass a random subset of declared kwargs (all default to Int)
+        chosen = [kw for kw in f.kwnames if rand(rng, Bool)]
+        for kw in chosen
+            push!(args, genex(ctx, IntT))
+        end
+        return Ex(:kwcall, f.ret, (f.name, chosen), args)
+    elseif kind === :builtin
+        return Ex(:guard, AnyT(), nothing, [Ex(:src, AnyT(), pick(rng, BUILTIN_PROBES))])
+    elseif kind === :getprop
+        cands = [v for v in visiblevars(ctx) if v.sum isa StructT && any(fs -> compat(want, fs), (v.sum::StructT).fieldsums)]
+        v = pick(rng, cands)
+        s = v.sum::StructT
+        idxs = [i for i in eachindex(s.fieldsums) if compat(want, s.fieldsums[i])]
+        i = pick(rng, idxs)
+        return Ex(:prop, s.fieldsums[i], s.fieldnames[i], [Ex(:var, v.sum, v.name)])
     elseif kind === :closure
         return genclosure(ctx, want isa FnT ? want : FnT(TySum[IntT], AnyT()))
     end
@@ -203,10 +307,13 @@ const CONCRETE_MENU = TySum[IntT, IntT, IntT, FloatT, FloatT, BoolT, StrT, SymT]
 
 function newvarsum(ctx::Ctx)
     r = rand(ctx.rng)
-    r < 0.55 && return pick(ctx.rng, CONCRETE_MENU)
-    r < 0.70 && return VecT(pick(ctx.rng, TySum[IntT, FloatT, AnyT()]))
-    r < 0.80 && return TupT(TySum[pick(ctx.rng, CONCRETE_MENU) for _ in 1:rand(ctx.rng, 2:3)])
-    r < 0.92 && return FnT(TySum[pick(ctx.rng, TySum[IntT, FloatT, AnyT()]) for _ in 1:rand(ctx.rng, 1:2)], AnyT())
+    if !isempty(ctx.structs) && r < 0.12
+        return pick(ctx.rng, ctx.structs)
+    end
+    r < 0.52 && return pick(ctx.rng, CONCRETE_MENU)
+    r < 0.68 && return VecT(pick(ctx.rng, TySum[IntT, FloatT, AnyT()]))
+    r < 0.78 && return TupT(TySum[pick(ctx.rng, CONCRETE_MENU) for _ in 1:rand(ctx.rng, 2:3)])
+    r < 0.90 && return FnT(TySum[pick(ctx.rng, TySum[IntT, FloatT, AnyT()]) for _ in 1:rand(ctx.rng, 1:2)], AnyT())
     return AnyT()
 end
 
@@ -220,19 +327,57 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     end
     anyvec = any(v -> v.sum isa VecT, visiblevars(ctx))
     anyvec && push!(opts, (1.0, :push), (0.7, :setindex), (0.5, :alias))
+    anymutstruct = any(v -> v.sum isa StructT && (v.sum::StructT).ismutable, visiblevars(ctx))
+    anymutstruct && push!(opts, (0.8, :setprop))
+    push!(opts, (0.6, :compr))
     kind = wpick(rng, opts)
 
     if kind === :assignnew
         sum = newvarsum(ctx)
         rhs = genex(ctx, sum)
         name = freshname(ctx, "v")
-        st = St(:assign, (name, rhs.sum, true); exs=[rhs])
+        st = St(:assign, (name, rhs.sum, true, false); exs=[rhs])
         declare!(ctx, VInfo(name, rhs.sum))
         return st
     elseif kind === :reassign
         v = pick(rng, visiblevars(ctx))
-        rhs = v.sum isa AnyT ? genex(ctx, pick(rng, CONCRETE_MENU)) : genex(ctx, v.sum)
-        return St(:assign, (v.name, v.sum, false); exs=[rhs])
+        # An FnT rhs must not be able to capture any reassignable function
+        # variable (would let two closures form a call cycle → unbounded
+        # recursion). Hiding FnT vars during rhs generation closes that loophole.
+        rhs = if v.sum isa FnT
+            withoutfns(ctx) do
+                genex(ctx, v.sum)
+            end
+        elseif v.sum isa AnyT
+            genex(ctx, pick(rng, CONCRETE_MENU))
+        else
+            genex(ctx, v.sum)
+        end
+        # Writing a module global from inside local scope needs `global`.
+        needsglobal = v.isglobal && inlocal(ctx)
+        return St(:assign, (v.name, v.sum, false, needsglobal); exs=[rhs])
+    elseif kind === :setprop
+        cands = [v for v in visiblevars(ctx) if v.sum isa StructT && (v.sum::StructT).ismutable]
+        v = pick(rng, cands)
+        s = v.sum::StructT
+        i = rand(rng, 1:length(s.fieldnames))
+        return St(:setprop, (v.name, s.fieldnames[i]); exs=[genex(ctx, s.fieldsums[i])])
+    elseif kind === :compr
+        # v = Type[ body for i in 1:n (if cond)? ]
+        eltsum = pick(rng, TySum[IntT, FloatT])
+        ivar = freshname(ctx, "c")
+        n = rand(rng, 0:ctx.cfg.maxloop)
+        hasfilter = rand(rng) < 0.4
+        pushscope!(ctx)
+        declare!(ctx, VInfo(ivar, IntT))
+        body = genex(ctx, eltsum)
+        kids = hasfilter ? [body, genex(ctx, BoolT)] : [body]
+        popscope!(ctx)
+        name = freshname(ctx, "v")
+        st = St(:assign, (name, VecT(eltsum), true, false);
+                exs=[Ex(:compr, VecT(eltsum), (ivar, n, hasfilter), kids)])
+        declare!(ctx, VInfo(name, VecT(eltsum)))
+        return st
     elseif kind === :observe
         s = pick(rng, TySum[IntT, FloatT, BoolT, StrT, SymT, AnyT(), VecT(IntT), TupT(TySum[IntT, StrT])])
         return St(:observe; exs=[genex(ctx, s)])
@@ -332,10 +477,26 @@ function genfundef(ctx::Ctx)::St
         typed = s isa ConcT && rand(rng, Bool)
         push!(params, (freshname(ctx, "a"), s, typed))
     end
+    # optional positional default on the last param (Int-valued)
+    ndefaults = (nparams > 0 && rand(rng) < 0.25) ? 1 : 0
+    # optional trailing vararg
+    vararg = rand(rng) < 0.2
+    varargname = vararg ? freshname(ctx, "va") : :_
+    # optional keyword params (all Int, with defaults)
+    kwparams = Tuple{Symbol,Any}[]
+    if rand(rng) < 0.3
+        for _ in 1:rand(rng, 1:2)
+            push!(kwparams, (freshname(ctx, "kw"), rand(rng, -5:5)))
+        end
+    end
     retsum = pick(rng, CONCRETE_MENU)
     pushscope!(ctx)
     for (pn, ps, _) in params
         declare!(ctx, VInfo(pn, ps))
+    end
+    vararg && declare!(ctx, VInfo(varargname, TupT(TySum[])))  # a Tuple; only used opaquely
+    for (kn, _) in kwparams
+        declare!(ctx, VInfo(kn, IntT))
     end
     wasinfunc = ctx.infunc
     ctx.infunc = true
@@ -346,9 +507,39 @@ function genfundef(ctx::Ctx)::St
     retex = genex(ctx, retsum)
     ctx.infunc = wasinfunc
     popscope!(ctx)
-    fi = FnInfo(name, [TySum[p[2] for p in params]], retex.sum)
+    fi = FnInfo(name, [TySum[p[2] for p in params]], retex.sum,
+                Symbol[kn for (kn, _) in kwparams], vararg)
     push!(ctx.fns, fi)
-    return St(:fundef, (name, params, retex.sum); exs=[retex], blocks=[body])
+    return St(:fundef, (name, params, retex.sum, kwparams, vararg, varargname, ndefaults);
+              exs=[retex], blocks=[body])
+end
+
+# A struct or mutable struct definition. Fields are concrete-summarized so
+# construction and field access have well-defined summaries.
+function genstructdef(ctx::Ctx)::St
+    rng = ctx.rng
+    name = freshname(ctx, "S")
+    nf = rand(rng, 1:3)
+    fnames = [freshname(ctx, "fld") for _ in 1:nf]
+    fsums = TySum[pick(rng, CONCRETE_MENU) for _ in 1:nf]
+    ismutable = rand(rng, Bool)
+    s = StructT(name, fnames, fsums, ismutable)
+    push!(ctx.structs, s)
+    # register the constructor as a function so call sites can build values
+    push!(ctx.fns, FnInfo(name, [copy(fsums)], s))
+    return St(:structdef, s)
+end
+
+# A module-level global variable (declared with `const` occasionally). Written
+# in the `pre` section and visible to functions and body alike.
+function genglobal(ctx::Ctx)::St
+    rng = ctx.rng
+    s = pick(rng, CONCRETE_MENU)
+    rhs = genex(ctx, s)
+    name = freshname(ctx, "g")
+    v = VInfo(name, rhs.sum, true)
+    push!(ctx.scopes[1], v)   # module-global scope
+    return St(:assign, (name, rhs.sum, true, false); exs=[rhs])
 end
 
 # A second method for an existing function: same arity, different first-param
@@ -382,7 +573,8 @@ function genextramethod(ctx::Ctx, fi::FnInfo)::Union{St,Nothing}
     popscope!(ctx)
     push!(fi.sigs, newsig)
     fi.ret = joinsum(fi.ret, retex.sum)
-    return St(:fundef, (fi.name, params, retex.sum); exs=[retex], blocks=[St[]])
+    return St(:fundef, (fi.name, params, retex.sum, Tuple{Symbol,Any}[], false, :_, 0);
+              exs=[retex], blocks=[St[]])
 end
 
 # ---------------------------------------------------------------------------
@@ -390,6 +582,15 @@ end
 
 function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     ctx = Ctx(rng, cfg)
+    # pre: structs then globals (both live in module scope, scopes[1])
+    pre = St[]
+    for _ in 1:rand(rng, cfg.nstructs)
+        push!(pre, genstructdef(ctx))
+    end
+    for _ in 1:rand(rng, cfg.nglobals)
+        push!(pre, genglobal(ctx))
+    end
+    # fundefs
     fundefs = St[]
     for _ in 1:rand(rng, cfg.nfundefs)
         push!(fundefs, genfundef(ctx))
@@ -398,7 +599,19 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
             st === nothing || push!(fundefs, st)
         end
     end
-    pushscope!(ctx)  # the toplevel `let`
+    # mid: bare toplevel statements (exercise the toplevel-frame path directly,
+    # not the `let`-wrapped one). Assignments here create module globals.
+    mid = St[]
+    for _ in 1:rand(rng, cfg.nmidstmts)
+        st = genstmt(ctx; blockdepth=2)   # blockdepth>=2 keeps these flat (no nested blocks at toplevel)
+        # a new binding created at true toplevel is a global
+        if st.kind === :assign && st.meta[3]
+            last(ctx.scopes[end]).isglobal = true
+        end
+        push!(mid, st)
+    end
+    # body: the `let` block
+    pushscope!(ctx)
     body = St[]
     for _ in 1:rand(rng, cfg.nbodystmts)
         push!(body, genstmt(ctx))
@@ -408,10 +621,10 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     # keeps the choice sequence short for Supposition-driven generation.
     count = 0
     for v in reverse(visiblevars(ctx))
-        v.sum isa FnT && continue  # functions normalize to :__fn__; nothing to learn
+        (v.sum isa FnT) && continue  # functions normalize to :__fn__; nothing to learn
         push!(body, St(:observe; exs=[Ex(:var, v.sum, v.name)]))
         (count += 1) == 3 && break
     end
     popscope!(ctx)
-    return Program(fundefs, body)
+    return Program(pre, fundefs, mid, body)
 end

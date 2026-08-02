@@ -51,6 +51,25 @@ function render(e::Ex)::String
         return "((" * plist * ") -> (" * capn * " = " * render(e.kids[1]) * "; " * capn * "))"
     elseif k === :guard
         return "(try " * render(e.kids[1]) * " catch __e; (:__thrown, nameof(typeof(__e))) end)"
+    elseif k === :src
+        return e.meta::String
+    elseif k === :splat
+        return "(" * render(e.kids[1]) * ")..."
+    elseif k === :prop
+        return "(" * render(e.kids[1]) * ")." * String(e.meta::Symbol)
+    elseif k === :kwcall
+        fname, kwnames = e.meta
+        npos = length(e.kids) - length(kwnames)
+        posargs = [render(e.kids[i]) for i in 1:npos]
+        kwargs = [String(kwnames[j]) * " = " * render(e.kids[npos + j]) for j in eachindex(kwnames)]
+        allargs = isempty(kwargs) ? join(posargs, ", ") :
+                  join(posargs, ", ") * (isempty(posargs) ? "" : ", ") * "; " * join(kwargs, ", ")
+        return String(fname::Symbol) * "(" * allargs * ")"
+    elseif k === :compr
+        ivar, n, hasfilter = e.meta
+        eltty = e.sum isa VecT ? typename((e.sum::VecT).elt) : "Any"
+        base = eltty * "[" * render(e.kids[1]) * " for " * String(ivar) * " in 1:" * string(n)
+        return hasfilter ? base * " if " * render(e.kids[2]) * "]" : base * "]"
     elseif k === :stackprobe
         # Not produced by any rule: a genuine, permanent interp/compiled
         # divergence (interpreter frames are visible in stacktrace()), used by
@@ -64,8 +83,19 @@ function render(st::St, io::IO, ind::Int)
     pad = " "^ind
     k = st.kind
     if k === :assign
-        name, _, _ = st.meta
-        println(io, pad, String(name), " = ", render(st.exs[1]))
+        name = st.meta[1]
+        needsglobal = length(st.meta) >= 4 && st.meta[4]::Bool
+        println(io, pad, needsglobal ? "global " : "", String(name), " = ", render(st.exs[1]))
+    elseif k === :structdef
+        s = st.meta::StructT
+        println(io, pad, s.ismutable ? "mutable struct " : "struct ", String(s.name))
+        for (fn, fs) in zip(s.fieldnames, s.fieldsums)
+            println(io, pad, "    ", String(fn), "::", typename(fs))
+        end
+        println(io, pad, "end")
+    elseif k === :setprop
+        vname, fname = st.meta
+        println(io, pad, "(", String(vname), ").", String(fname), " = ", render(st.exs[1]))
     elseif k === :observe
         println(io, pad, "__obs__(", render(st.exs[1]), ")")
     elseif k === :if
@@ -116,9 +146,25 @@ function render(st::St, io::IO, ind::Int)
         end
         println(io, pad, "end")
     elseif k === :fundef
-        name, params, _ = st.meta
-        plist = join([String(pn) * (typed ? "::" * typename(ps) : "") for (pn, ps, typed) in params], ", ")
-        println(io, pad, "function ", String(name), "(", plist, ")")
+        name, params = st.meta[1], st.meta[2]
+        kwparams = length(st.meta) >= 4 ? st.meta[4] : Tuple{Symbol,Any}[]
+        vararg = length(st.meta) >= 5 ? st.meta[5]::Bool : false
+        varargname = length(st.meta) >= 6 ? st.meta[6]::Symbol : :_
+        ndefaults = length(st.meta) >= 7 ? st.meta[7]::Int : 0
+        pparts = String[]
+        for (i, (pn, ps, typed)) in enumerate(params)
+            base = String(pn) * (typed ? "::" * typename(ps) : "")
+            # trailing `ndefaults` positional params get an Int default
+            if ndefaults > 0 && i > length(params) - ndefaults
+                base *= " = 0"
+            end
+            push!(pparts, base)
+        end
+        vararg && push!(pparts, String(varargname) * "...")
+        plist = join(pparts, ", ")
+        kwlist = isempty(kwparams) ? "" :
+                 "; " * join([String(kn) * " = " * repr(kv) for (kn, kv) in kwparams], ", ")
+        println(io, pad, "function ", String(name), "(", plist, kwlist, ")")
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "    return ", render(st.exs[1]))
         println(io, pad, "end")
@@ -150,8 +196,14 @@ end
 
 function render(prog::Program)::String
     io = IOBuffer()
+    for st in prog.pre        # struct defs + module globals
+        render(st, io, 0)
+    end
     for fd in prog.fundefs
         render(fd, io, 0)
+    end
+    for st in prog.mid        # bare toplevel statements
+        render(st, io, 0)
     end
     println(io, "let")
     renderblock(prog.body, io, 4)
