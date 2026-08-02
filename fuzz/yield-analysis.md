@@ -416,6 +416,33 @@ are a cheap background variant, not a priority; and the thing neither idea
 addresses — knowing *which* constructs are missing rather than guessing — is
 still P2, which is why it remains the top remaining item.
 
+## Campaign results, all axes
+
+Julia 1.11.9, this branch, all with `--fresh`:
+
+| axis | cases | outcome |
+|---|---|---|
+| differential (`native`) | 700 | 696 agreed, 4 aborted, 0 discarded, 0 findings |
+| stepping (`step`) | 500 | 498 agreed, 2 aborted, 0 findings |
+| eval_code (`evalcode`) | 400 | 400 agreed, 0 findings |
+| corpus (`corpus`) | 200 | 99 executed, 101 discarded as junk, 0 findings |
+
+No interpreter bugs from any of them. Three *generator* bugs were found and
+fixed along the way (toplevel `while` fuel in a soft scope, the missing
+`StructT` branch in `genex_inner`, per-method vararg tracking), the last of
+which the differential axis structurally could not report.
+
+That is a real negative result, and it is worth stating plainly rather than
+dressing up: the run-to-completion surface is hardened, and the new axes are
+calibrated but have not yet been run at the scale where they would be expected
+to produce anything. These campaigns are hundreds to low thousands of cases;
+the systems in the literature that find interpreter bugs run 10^8 and up. The
+value delivered here is that four axes now exist, three of them cover surfaces
+that had no systematic testing at all, and each has been shown to actually
+exercise what it claims — 1076 eval_code checks across 56 distinct variables,
+99 real fragments reaching the interpreter per 200 corpus cases. The next
+thing to do with them is run them long, not build a fifth.
+
 ## References
 
 - Fuzzilli: https://github.com/googleprojectzero/fuzzilli (Docs/HowFuzzilliWorks.md)
