@@ -30,33 +30,52 @@ assertion inside it.
 
 ## Files
 
-- `candidate.jl` — the program that was executing when the worker died,
-  recovered from the crash-safe journal. 69 lines, not yet minimized.
+- `minimized.jl` — 29 lines, reduced from the original 69 by `fuzz/crashmin.jl`
+  in 219 subprocess runs. Reproduces standalone.
+- `candidate.jl` — the original program, recovered from the crash-safe journal.
+- `verify.jl` — runs a file statement by statement in a fresh module,
+  swallowing ordinary exceptions, so only a process death is visible.
 - `backtrace.txt` — the raw crash output.
 
 ## Reproducing
 
 ```sh
-julia --project=fuzz -e '
-  m = Module(:CrashCase)
-  for st in Meta.parseall(read("candidate.jl", String)).args
-      st isa LineNumberNode && continue
-      Core.eval(m, st)
-  end'
+julia --startup-file=no verify.jl minimized.jl
+# [pid] signal 6 (-6): Aborted
+# moveToStack at src/llvm-alloc-opt.cpp:802
 ```
 
-Note `candidate.jl` calls `__obs__`, the harness's observation hook. Either
-define `__obs__(x) = nothing` in the module first or delete those lines —
-minimization will remove them anyway, since they are not what crashes.
+No JuliaInterpreter involved: `verify.jl` only calls `Core.eval`. It swallows
+runtime exceptions on purpose — `minimized.jl` references names that
+minimization deleted the definitions of, and those throw at *runtime*, whereas
+the abort happens earlier, while the `let` block's thunk is being compiled.
+Deleting them was legitimate for the same reason: they are not part of what
+crashes.
 
-The whole program is also regenerable from its seed, which is the more robust
-reproducer while the file is still large:
+The program is also regenerable from its seed:
 
 ```sh
 julia --project=fuzz fuzz/run.jl --engine native --n 1 --seed 5000644 --big
 ```
 
-## Minimizing
+## What is left in the minimized case
+
+The surviving ingredients point at atomic fields on a stack-promotable
+allocation:
+
+- a `mutable struct` with two `@atomic` fields and one plain field,
+- two instances of it constructed inside a `let`, one within a `try`,
+- an `@atomic v.fld -= ...` modify on the second,
+- a self-recursive `Int64` function whose calls supply the field values.
+
+A hand-written program with just those elements — atomic struct, construction
+in a `let`, `@atomic -=` inside a `try` — does *not* abort, so the trigger
+needs more of the surrounding context than the shape alone suggests; the
+nested recursive calls feeding the constructor arguments are likely load
+bearing. Further reduction would want C-Reduce or a Julia-aware reducer
+working below line granularity.
+
+## Minimizing further
 
 `fuzz/crashmin.jl` shrinks a program that kills the process, by running every
 candidate in a subprocess and keeping any edit that still dies by signal:
