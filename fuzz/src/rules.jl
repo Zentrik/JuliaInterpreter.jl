@@ -412,8 +412,11 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     opts = Tuple{Float64,Symbol}[(4.0, :assignnew)]
     !isempty(reassign_targets(ctx)) && push!(opts, (1.5, :reassign))
     allowobs && push!(opts, (2.5, :observe))
-    if blockdepth < 2
-        push!(opts, (1.2, :if), (1.0, :for), (0.7, :while), (0.6, :let), (0.7, :try))
+    if blockdepth < ctx.cfg.maxblockdepth
+        # Deeper nesting is reachable but progressively rarer, so raising the
+        # cap doesn't blow up program size / abort rate. Depth 0 is unscaled.
+        d = ctx.cfg.blockdecay ^ blockdepth
+        push!(opts, (1.2d, :if), (1.0d, :for), (0.7d, :while), (0.6d, :let), (0.7d, :try))
     end
     anyvec = any(v -> v.sum isa VecT, visiblevars(ctx))
     # push! grows a vector by one element per call; a global vector pushed from
@@ -435,7 +438,7 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     # the undefined-variable dimension: conditionally-defined bindings observed
     # via @isdefined and guarded reads (UndefVarError as expected oracle data)
     allowobs && push!(opts, (0.55, :maybeundef))
-    allowobs && blockdepth <= 2 && push!(opts, (0.5, :loopundef))
+    allowobs && blockdepth < ctx.cfg.maxblockdepth && push!(opts, (0.5, :loopundef))
     # `local x::T = v` — conversion/typeassert on every later reassignment
     inlocal(ctx) && push!(opts, (0.7, :typedlocal))
     # control-flow exits; break/continue through try/finally is the :enter/:leave
@@ -510,15 +513,15 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     elseif kind === :if
         cond = genex(ctx, BoolT)
         haselse = rand(rng, Bool)
-        thenb = genblock(ctx, blockdepth; n=rand(rng, 1:3))
+        thenb = genblock(ctx, blockdepth)
         blocks = [thenb]
-        haselse && push!(blocks, genblock(ctx, blockdepth; n=rand(rng, 1:3)))
+        haselse && push!(blocks, genblock(ctx, blockdepth))
         return St(:if, haselse; exs=[cond], blocks=blocks)
     elseif kind === :for
         ivar = freshname(ctx, "i")
         n = rand(rng, 0:ctx.cfg.maxloop)
         ctx.loopdepth += 1
-        body = genblock(ctx, blockdepth; n=rand(rng, 1:3), extra=[VInfo(ivar, IntT)])
+        body = genblock(ctx, blockdepth; extra=[VInfo(ivar, IntT)])
         ctx.loopdepth -= 1
         return St(:for, (ivar, n); blocks=[body])
     elseif kind === :while
@@ -527,10 +530,15 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         cond = genex(ctx, BoolT)
         # The rendered fuel decrement is the first statement of the loop body,
         # so a generated `continue` cannot skip it — termination is preserved.
+        # At module toplevel the fuel counter is a *global* and the loop body is
+        # a soft scope, where a bare `fuel -= 1` would silently declare a new
+        # local and throw UndefVarError reading it. Qualify the decrement with
+        # `global` there so the counter actually decrements.
+        attop = !inlocal(ctx)
         ctx.loopdepth += 1
-        body = genblock(ctx, blockdepth; n=rand(rng, 1:3))
+        body = genblock(ctx, blockdepth)
         ctx.loopdepth -= 1
-        return St(:while, (fuelvar, fuel); exs=[cond], blocks=[body])
+        return St(:while, (fuelvar, fuel, attop); exs=[cond], blocks=[body])
     elseif kind === :let
         nb = rand(rng, 1:2)
         bindings = Tuple{Symbol,TySum}[]
@@ -541,13 +549,13 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
             push!(bindings, (freshname(ctx, "l"), rhs.sum))
             push!(rhss, rhs)
         end
-        body = genblock(ctx, blockdepth; n=rand(rng, 1:3), extra=[VInfo(n, s) for (n, s) in bindings])
+        body = genblock(ctx, blockdepth; extra=[VInfo(n, s) for (n, s) in bindings])
         return St(:let, bindings; exs=rhss, blocks=[body])
     elseif kind === :try
         excvar = freshname(ctx, "err")
         hasfinally = rand(rng) < 0.3
         haselse = rand(rng) < 0.25   # try/catch/else — distinct (1.8+) lowering
-        body = genblock(ctx, blockdepth; n=rand(rng, 1:3))
+        body = genblock(ctx, blockdepth)
         handler = genblock(ctx, blockdepth; n=rand(rng, 1:2), extra=[VInfo(excvar, AnyT())])
         # occasionally rethrow out of the handler (conditionally): exception
         # propagation out of an interpreted catch block
@@ -616,7 +624,19 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     error("unreachable stmt kind $kind")
 end
 
-function genblock(ctx::Ctx, blockdepth::Int; n::Int=2, extra::Vector{VInfo}=VInfo[])
+# A block statement count for a block whose statements sit at `childdepth`
+# (1 = a block directly under a top-level statement). The ceiling is
+# maxblockstmts at the top level and shrinks by one per extra nesting level
+# (never below minblockstmts), so deep blocks stay small even as the depth cap
+# rises — bounding total program size and abort rate.
+function blockn(ctx::Ctx, childdepth::Int)
+    cfg = ctx.cfg
+    hi = max(cfg.minblockstmts, cfg.maxblockstmts - (childdepth - 1))
+    return rand(ctx.rng, cfg.minblockstmts:hi)
+end
+
+function genblock(ctx::Ctx, blockdepth::Int; n::Int=blockn(ctx, blockdepth + 1),
+                  extra::Vector{VInfo}=VInfo[])
     pushscope!(ctx)
     for v in extra
         declare!(ctx, v)
@@ -679,8 +699,11 @@ function genfundef(ctx::Ctx)::St
     ctx.retsum = retsum   # enables early `return` statements of the right summary
     ctx.loopdepth = 0     # function boundary: enclosing loops aren't break targets
     body = St[]
+    # blockdepth 0: a function body nests control flow like the let body does,
+    # so try/loop/if inside an *interpreted function frame* — the :enter/:leave
+    # and exception-frame-unwinding surface — becomes generable.
     for _ in 1:rand(rng, 0:3)
-        push!(body, genstmt(ctx; allowobs=true, blockdepth=1))
+        push!(body, genstmt(ctx; allowobs=true, blockdepth=0))
     end
     retex = genex(ctx, retsum)
     ctx.infunc, ctx.retsum, ctx.loopdepth = wasinfunc, wasret, wasloop
@@ -786,10 +809,14 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     end
     # mid: bare toplevel statements (exercise the toplevel-frame path directly,
     # not the `let`-wrapped one). Assignments here create module globals.
+    # blockdepth 1 (was a flat 2): a toplevel `for`/`if`/`try` is one
+    # ExprSplitter fragment exercising loop/branch/exception handling in the
+    # toplevel frame — a distinct path from the same construct inside `let`.
     mid = St[]
     for _ in 1:rand(rng, cfg.nmidstmts)
-        st = genstmt(ctx; blockdepth=2)   # blockdepth>=2 keeps these flat (no nested blocks at toplevel)
-        # a new binding created at true toplevel is a global
+        st = genstmt(ctx; blockdepth=1)
+        # a new binding created at true toplevel is a global (nested control-flow
+        # statements aren't :assign, so their block-local bindings aren't marked)
         if st.kind === :assign && st.meta[3]
             last(ctx.scopes[end]).isglobal = true
         end
@@ -801,14 +828,25 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     for _ in 1:rand(rng, cfg.nbodystmts)
         push!(body, genstmt(ctx))
     end
-    # Always end by observing a few live variables so every program compares
-    # state. Deterministically the last few: no RNG draw needed here, which
+    # End by observing *every* live binding, so the final state of the whole
+    # program is oracle data rather than just its last three variables. State
+    # the interpreter got wrong in a binding nothing happened to observe was
+    # previously invisible. Emitted deterministically (no RNG draw), which
     # keeps the choice sequence short for Supposition-driven generation.
-    count = 0
     for v in reverse(visiblevars(ctx))
-        (v.sum isa FnT) && continue  # functions normalize to :__fn__; nothing to learn
-        push!(body, St(:observe; exs=[Ex(:var, v.sum, v.name)]))
-        (count += 1) == 3 && break
+        if v.sum isa FnT
+            # A function value normalizes to :__fn__, so identity teaches
+            # nothing — but its *behavior* is comparable. Call it on inert
+            # arguments, guarded so a MethodError becomes oracle data instead
+            # of truncating the program.
+            f = v.sum::FnT
+            args = Ex[defaultex(p isa AnyT ? IntT : p) for p in f.psums]
+            push!(body, St(:observe;
+                           exs=[Ex(:guard, AnyT(), nothing,
+                                   [Ex(:callvar, f.ret, v.name, args)])]))
+        else
+            push!(body, St(:observe; exs=[Ex(:var, v.sum, v.name)]))
+        end
     end
     popscope!(ctx)
     return Program(pre, fundefs, mid, body)

@@ -73,12 +73,15 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                   outdir::String=joinpath(@__DIR__, "..", "findings"),
                   journaldir::String=joinpath(@__DIR__, "..", "journal"),
                   cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true,
-                  modes::Tuple=(:rec, :cmp))
-    j = Journal(journaldir)
+                  modes::Tuple=(:rec, :cmp), seeddisk::Bool=true, journalsync::Bool=true)
+    j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
-    # pre-seed dedup with findings already on disk so restarts don't re-report
-    isdir(outdir) && for d in readdir(outdir)
+    # Pre-seed dedup with findings already on disk so restarts don't re-report.
+    # Fingerprint buckets are coarse, so this also suppresses *unrelated* bugs
+    # that happen to share a bucket with something already reported — pass
+    # seeddisk=false (CLI --fresh) to hunt within already-reported buckets.
+    seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
     end
     t0 = time()

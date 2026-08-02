@@ -35,7 +35,10 @@
 #   :observe  meta = nothing                                exs = [ex]
 #   :if       meta = haselse::Bool                          exs = [cond]  blocks = [then] or [then, else]
 #   :for      meta = (ivar, n::Int)                         blocks = [body]
-#   :while    meta = (fuelvar, fuel::Int)                   exs = [cond]  blocks = [body]
+#   :while    meta = (fuelvar, fuel::Int[, attoplevel::Bool])  exs = [cond]  blocks = [body]
+#             attoplevel renders the fuel decrement as `global fv -= 1`: at module
+#             toplevel the body is a soft scope, where a bare decrement would
+#             declare a new local and throw UndefVarError instead of counting down
 #   :fundef   meta = (name, params, retsum[, kwparams, vararg::Bool])  exs = [retex]  blocks = [body]
 #             params::Vector{Tuple{Symbol,TySum,Bool}} (name, sum, typed);
 #             kwparams::Vector{Tuple{Symbol,Any}} (name, literal default value)

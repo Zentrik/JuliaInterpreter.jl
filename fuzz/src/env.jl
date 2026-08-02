@@ -30,7 +30,12 @@ Base.@kwdef struct Cfg
     nfundefs::UnitRange{Int} = 0:3
     nmidstmts::UnitRange{Int} = 0:3   # extra bare-toplevel statements
     nbodystmts::UnitRange{Int} = 5:14
-    maxblockstmts::Int = 5     # statements inside if/for/while/let/try blocks
+    maxblockstmts::Int = 3     # max statements inside if/for/while/let/try blocks
+    minblockstmts::Int = 1     # min statements inside a block
+    maxblockdepth::Int = 3     # control-flow nesting cap (was a hard-coded 2)
+    blockdecay::Float64 = 0.6  # control-flow weight is scaled by blockdecay^depth,
+                               # so deep nesting is reachable but rare (keeps program
+                               # size and abort rate bounded as the cap rises)
     maxloop::Int = 4           # for-loop trip count / while fuel
     maxstring::Int = 6         # literal string length
 end

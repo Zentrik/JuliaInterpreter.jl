@@ -27,12 +27,29 @@ function obssig(@nospecialize(x))
 end
 sigat(o::Outcome, i::Int) = i <= length(o.obs) ? obssig(o.obs[i]) : :missing
 
+# Observation equality. `isequal` alone is too weak an oracle here: it holds
+# across types (`isequal(1, 1.0)`, `isequal(true, 1)` are both true), so an
+# interpreter that produced a Float64 where compiled Julia produced an Int —
+# a promotion/conversion bug, and exactly the kind a hand-written interpreter
+# makes — would compare *equal* and never be reported.
+#
+# So compare types as well as values. `isequal` still does the value work, which
+# keeps the deliberate NaN/-0.0 semantics: all NaNs agree, 0.0 and -0.0 differ.
+# The normalizer (SETUP_SRC) has already scrubbed identity-dependent types, so
+# every type reaching here is one both sides should genuinely agree on.
+obseq(@nospecialize(a), @nospecialize(b)) = typeof(a) === typeof(b) && isequal(a, b)
+# Containers: the normalizer maps arrays to Vector{Any} and tuples elementwise,
+# so recurse rather than compare container types (which are already uniform).
+obseq(a::Tuple, b::Tuple) = length(a) == length(b) && all(obseq(x, y) for (x, y) in zip(a, b))
+obseq(a::Vector{Any}, b::Vector{Any}) =
+    length(a) == length(b) && all(obseq(x, y) for (x, y) in zip(a, b))
+
 # First index where the observation streams disagree; 0 if one is a prefix of
 # the other.
 function firstdiff(a::Vector{Any}, b::Vector{Any})
     n = min(length(a), length(b))
     for i in 1:n
-        isequal(a[i], b[i]) || return i
+        obseq(a[i], b[i]) || return i
     end
     return 0
 end
@@ -67,16 +84,30 @@ function classify(ref::Outcome, int::Outcome)::Verdict
         end
         return Verdict(:exception_divergence,
                        "ref threw $(ref.excname) ($(ref.errstr)); interp threw $(int.excname) ($(int.errstr))",
-                       ref.excname, int.excname, 0)
+                       ref.excname, int.excname, 0, tailsig(ref), tailsig(int))
     end
     if ref.status === :done && int.status === :threw
         return Verdict(:interp_only_throw,
                        "interp threw $(int.excname): $(int.errstr)",
-                       :none, int.excname, 0)
+                       :none, int.excname, 0, tailsig(ref), tailsig(int))
     end
     return Verdict(:ref_only_throw,
                    "ref threw $(ref.excname): $(ref.errstr); interp completed",
-                   ref.excname, :none, 0)
+                   ref.excname, :none, 0, tailsig(ref), tailsig(int))
+end
+
+# Salt for exception-class fingerprints. Without it every interp-only
+# UndefVarError (say) shares one dedup bucket, so the first such finding ever
+# reported permanently masks every later, unrelated one.
+#
+# The shape of the *last* observation before the throw is the discriminator: it
+# says what the program was doing when it diverged. Deliberately not the stream
+# length or the divergence index — those change on almost every statement
+# removal, and the shrinker only keeps edits that preserve the fingerprint, so
+# an unstable salt would reject nearly every shrink step.
+function tailsig(o::Outcome)
+    isempty(o.obs) && return :empty
+    return obssig(o.obs[end])
 end
 
 function divdetail(ref::Outcome, int::Outcome, i::Int)

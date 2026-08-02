@@ -127,11 +127,15 @@ function render(st::St, io::IO, ind::Int)
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "end")
     elseif k === :while
-        fuelvar, fuel = st.meta
+        fuelvar, fuel = st.meta[1], st.meta[2]
+        # At module toplevel the counter is a global and the body is a soft
+        # scope: an unqualified decrement would declare a new local and throw
+        # UndefVarError, so the loop never runs its fuel down.
+        attop = length(st.meta) >= 3 && st.meta[3]::Bool
         fv = String(fuelvar)
         println(io, pad, fv, " = ", fuel)
         println(io, pad, "while ", render(st.exs[1]), " && (", fv, " > 0)")
-        println(io, pad, "    ", fv, " -= 1")
+        println(io, pad, "    ", attop ? "global " : "", fv, " -= 1")
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "end")
     elseif k === :let

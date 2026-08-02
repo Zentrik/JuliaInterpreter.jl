@@ -44,8 +44,15 @@ Supposition.produce!(tc::TestCase, pg::ProgramGen) = genprogram(TCRNG(tc), pg.cf
 Run up to `rounds` Supposition `@check` passes of `examples` cases each.
 Each round hunts for a divergence not already suppressed, reported on disk,
 or found in an earlier round (found fingerprints are filtered in the property
-itself, so successive rounds look for *new* findings). A round with no
-finding ends the campaign.
+itself, so successive rounds look for *new* findings). The campaign stops
+after `patience` consecutive rounds find nothing new — a single empty round
+is weak evidence of exhaustion, since each round samples a fresh
+`examples`-sized slice of a much larger space.
+
+`seeddisk=false` ignores findings already on disk when seeding the dedup set,
+so a rerun re-reports known findings instead of silently counting them as
+duplicates (fingerprint buckets are coarse enough that an already-reported
+finding can mask unrelated new ones).
 
 Counterexamples are Supposition-shrunk by choice-sequence replay, then
 polished by the greedy IR shrinker, and reported through the same
@@ -55,17 +62,19 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
                               outdir::String=joinpath(@__DIR__, "..", "findings"),
                               journaldir::String=joinpath(@__DIR__, "..", "journal"),
                               cfg::Cfg=Cfg(), doshrink::Bool=true,
-                              modes::Tuple=(:rec, :cmp))
+                              modes::Tuple=(:rec, :cmp), patience::Int=1,
+                              seeddisk::Bool=true, journalsync::Bool=true)
     seen = Set{String}()
-    isdir(outdir) && for d in readdir(outdir)
+    seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
     end
     # Journal every candidate before it runs: an uncatchable crash (e.g. a
     # generated program that traps compiled Julia's codegen) kills the worker,
     # and journal/current.jl is then the only record of what did it.
-    j = Journal(journaldir)
+    j = Journal(journaldir; sync=journalsync)
     gen = ProgramGen(cfg)
     nfound = 0
+    dry = 0        # consecutive rounds with no new finding
     for round in 1:rounds
         # Track the smallest failing program ourselves: robust against
         # Supposition report internals, and lets us reuse writefinding.
@@ -90,9 +99,15 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
         sr = @check max_examples = examples prop(gen)
         b = best[]
         if b === nothing
-            @info "supposition round found nothing new; stopping" round examples
-            break
+            dry += 1
+            if dry >= patience
+                @info "supposition campaign exhausted" round examples dry_rounds = dry
+                break
+            end
+            @info "supposition round found nothing new; continuing" round examples dry_rounds = dry patience
+            continue
         end
+        dry = 0
         prog, v0, mode = b
         r = run_both(render(prog); nstmts, interp=modeinterp(mode))
         # verdict of the *minimal* program (fall back to the recorded one if

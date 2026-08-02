@@ -224,7 +224,9 @@ function shrink(prog::Program, fp::String; nstmts::Int, maxattempts::Int=400,
                 csts[ci] = St(st.kind, (st.meta[1], 0), st.exs, st.blocks)
                 edited = true
             elseif st.kind === :while && st.meta[2] > 0
-                csts[ci] = St(st.kind, (st.meta[1], 0), st.exs, st.blocks)
+                # keep the trailing toplevel flag: dropping it would un-qualify
+                # the fuel decrement and change the program's meaning
+                csts[ci] = St(st.kind, (st.meta[1], 0, st.meta[3:end]...), st.exs, st.blocks)
                 edited = true
             else
                 for (j, e) in enumerate(st.exs)
