@@ -191,6 +191,15 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         push!(opts, (1.0, :leaf))
     elseif want isa FnT
         push!(opts, (1.0, :closure))
+    elseif want isa StructT
+        # Without this, a struct want fell through to the AnyT menu, which can
+        # produce Any-summarized expressions (guarded probes, division results)
+        # where a struct value is required — passing one to a `::S`-annotated
+        # parameter throws MethodError and truncates the program. :leaf builds
+        # the struct (existing variable or a fresh construction); the :callfn
+        # and :getprop options appended below cover the other two ways to get
+        # one, so nothing is lost.
+        push!(opts, (1.0, :leaf))
     else # AnyT
         push!(opts, (2.0, :leaf), (1.5, :guardix), (1.0, :callvar), (0.8, :guarddiv), (0.6, :ternary),
               (1.4, :builtin))
@@ -199,6 +208,7 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         # propagating through interpreted frames
         !isempty(ctx.fns) && push!(opts, (0.8, :badcall))
     end
+    # (swarm masking / policy skew are applied at the wpickrule call below)
     # Calls into generated functions, for any want their return satisfies:
     if !isempty(fnsreturning(ctx, want))
         push!(opts, (2.0, :callfn))
@@ -211,7 +221,7 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     if !isempty([v for v in visiblevars(ctx) if v.sum isa StructT && any(fs -> compat(want, fs), (v.sum::StructT).fieldsums)])
         push!(opts, (1.5, :getprop))
     end
-    kind = wpick(rng, opts)
+    kind = wpickrule(ctx, opts)
 
     if kind === :leaf
         return genleaf(ctx, want)
@@ -281,14 +291,19 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         isempty(vs) && return genleaf(ctx, want)
         v = pick(rng, vs)
         fs = v.sum::FnT
-        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in fs.psums]
+        args = Ex[genex(ctx, p isa AnyT ? anyargsum(ctx) : p) for p in fs.psums]
         return Ex(:callvar, fs.ret, v.name, args)
     elseif kind === :callfn
         f = pick(rng, fnsreturning(ctx, want))
-        sig = pick(rng, f.sigs)
-        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
+        # Pick the *method*, and consult that method's own vararg flag: only the
+        # signature created by genfundef has a `va...`, so appending trailing
+        # args because some other method of the same function is variadic builds
+        # a call that matches nothing and dies with a MethodError.
+        si = rand(rng, 1:length(f.sigs))
+        sig = f.sigs[si]
+        args = Ex[genex(ctx, p isa AnyT ? anyargsum(ctx) : p) for p in sig]
         # varargs method: sometimes append extra trailing args, occasionally splat a vector
-        if f.vararg && rand(rng) < 0.5
+        if f.varargs[si] && rand(rng) < 0.5
             for _ in 1:rand(rng, 0:2)
                 push!(args, genex(ctx, pick(rng, CONCRETE_MENU)))
             end
@@ -301,7 +316,7 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         cands = [f for f in ctx.fns if !isempty(f.kwnames) && compat(want, f.ret)]
         f = pick(rng, cands)
         sig = f.sigs[1]
-        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
+        args = Ex[genex(ctx, p isa AnyT ? anyargsum(ctx) : p) for p in sig]
         # pass a random subset of declared kwargs (all default to Int)
         chosen = [kw for kw in f.kwnames if rand(rng, Bool)]
         for kw in chosen
@@ -313,8 +328,10 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     elseif kind === :badcall
         f = pick(rng, ctx.fns)
         sig = pick(rng, f.sigs)
-        args = Ex[genex(ctx, p isa AnyT ? pick(rng, TySum[IntT, FloatT, StrT, BoolT]) : p) for p in sig]
-        idxs = [i for i in eachindex(sig) if sig[i] isa ConcT]
+        args = Ex[genex(ctx, p isa AnyT ? anyargsum(ctx) : p) for p in sig]
+        # A struct-typed parameter given a scalar is as good a MethodError probe
+        # as a mistyped scalar, so include those slots too.
+        idxs = [i for i in eachindex(sig) if sig[i] isa ConcT || sig[i] isa StructT]
         if !isempty(idxs)
             i = pick(rng, idxs)
             wrongs = [s for s in TySum[IntT, FloatT, StrT, BoolT, SymT] if !compat_eq(s, sig[i])]
@@ -376,6 +393,46 @@ end
 # Statements
 
 const CONCRETE_MENU = TySum[IntT, IntT, IntT, FloatT, FloatT, BoolT, StrT, SymT]
+
+# Summary for a generated function's parameter or return value. Scalars stay
+# dominant, but tuples/vectors/structs/functions now cross call boundaries:
+# previously every parameter and return was concretized to a scalar, so an
+# interpreted callee could never receive or return a container, a struct, or a
+# closure — no higher-order generated functions, and no aggregate passing at
+# all. Those are ordinary Julia and distinct interpreter paths (argument
+# destructuring, boxed captures crossing frames, struct dispatch).
+function boundarysum(ctx::Ctx)
+    rng = ctx.rng
+    r = rand(rng)
+    r < 0.62 && return pick(rng, CONCRETE_MENU)
+    r < 0.72 && return AnyT()
+    if r < 0.80
+        return TupT(TySum[pick(rng, CONCRETE_MENU) for _ in 1:rand(rng, 2:3)])
+    end
+    r < 0.88 && return VecT(pick(rng, TySum[IntT, FloatT, AnyT()]))
+    if r < 0.95 && !isempty(ctx.structs)
+        return pick(rng, ctx.structs)
+    end
+    return FnT(TySum[pick(rng, TySum[IntT, FloatT]) for _ in 1:rand(rng, 1:2)], AnyT())
+end
+
+# May a parameter of this summary carry a type annotation? Struct annotations
+# are the interesting ones — they make dispatch on generated types real.
+annotatable(s::TySum) = s isa ConcT || s isa StructT || s isa VecT || s isa TupT || s isa FnT
+
+# What to pass into an `Any`-typed parameter. Scalars dominate, but a container,
+# struct, closure or `nothing` reaching an Any slot is what makes the callee's
+# dispatch genuinely dynamic — the localmethtable path this fuzzer targets.
+function anyargsum(ctx::Ctx)
+    rng = ctx.rng
+    r = rand(rng)
+    r < 0.70 && return pick(rng, TySum[IntT, FloatT, StrT, BoolT, SymT])
+    r < 0.78 && return NothingT
+    r < 0.86 && return TupT(TySum[pick(rng, CONCRETE_MENU) for _ in 1:rand(rng, 2:3)])
+    r < 0.94 && return VecT(pick(rng, TySum[IntT, FloatT]))
+    isempty(ctx.structs) && return pick(rng, TySum[IntT, StrT])
+    return pick(rng, ctx.structs)
+end
 # Non-growable scalars only. Used for struct fields: a String field could be
 # grown in place (x.f = string(x.f, x.f)) inside a looping/oft-called context,
 # and structs have no per-field bound. Int/Float/Bool/Sym exercise field
@@ -384,7 +441,12 @@ const SCALAR_NONGROW = TySum[IntT, IntT, FloatT, FloatT, BoolT, SymT]
 
 function newvarsum(ctx::Ctx)
     r = rand(ctx.rng)
-    if !isempty(ctx.structs) && r < 0.12
+    # Struct-valued bindings gate every struct rule (field read/write, atomic
+    # modify, struct aliasing), so the policies that target those rules raise
+    # the rate of creating one — boosting the rule weights alone does nothing
+    # when no variable of the right shape is ever in scope.
+    structrate = (ctx.policy === :mutation || ctx.policy === :builtins) ? 0.35 : 0.12
+    if !isempty(ctx.structs) && r < structrate
         return pick(ctx.rng, ctx.structs)
     end
     r < 0.52 && return pick(ctx.rng, CONCRETE_MENU)
@@ -445,7 +507,7 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     # and exception-frame-unwinding surface
     ctx.loopdepth > 0 && push!(opts, (1.0, :brk), (0.8, :cont))
     ctx.retsum !== nothing && push!(opts, (0.9, :ret))
-    kind = wpick(rng, opts)
+    kind = wpickrule(ctx, opts)
 
     if kind === :assignnew
         sum = newvarsum(ctx)
@@ -669,8 +731,8 @@ function genfundef(ctx::Ctx)::St
     nparams = rand(rng, 0:3)
     params = Tuple{Symbol,TySum,Bool}[]
     for i in 1:nparams
-        s = rand(rng) < 0.25 ? AnyT() : pick(rng, CONCRETE_MENU)
-        typed = s isa ConcT && rand(rng, Bool)
+        s = boundarysum(ctx)
+        typed = annotatable(s) && rand(rng, Bool)
         push!(params, (freshname(ctx, "a"), s, typed))
     end
     # optional positional default on the last param (Int-valued)
@@ -685,7 +747,7 @@ function genfundef(ctx::Ctx)::St
             push!(kwparams, (freshname(ctx, "kw"), rand(rng, -5:5)))
         end
     end
-    retsum = pick(rng, CONCRETE_MENU)
+    retsum = boundarysum(ctx)
     pushscope!(ctx)
     for (pn, ps, _) in params
         declare!(ctx, VInfo(pn, ps))
@@ -724,9 +786,21 @@ function genstructdef(ctx::Ctx)::St
     name = freshname(ctx, "S")
     nf = rand(rng, 1:3)
     fnames = [freshname(ctx, "fld") for _ in 1:nf]
-    fsums = TySum[pick(rng, SCALAR_NONGROW) for _ in 1:nf]
+    # Mostly non-growable scalars (see SCALAR_NONGROW), but a field may also
+    # hold a vector or a function. Both are safe against unbounded growth: a
+    # field write *replaces* the value rather than appending to it (`push!`
+    # only ever targets vector-typed variables), so the per-field bound the
+    # scalar-only rule was protecting is preserved.
+    fsums = TySum[rand(rng) < 0.15 ?
+                  (rand(rng, Bool) ? VecT(pick(rng, TySum[IntT, FloatT])) :
+                                     FnT(TySum[IntT], AnyT())) :
+                  pick(rng, SCALAR_NONGROW) for _ in 1:nf]
     ismutable = rand(rng, Bool)
-    mask = ismutable ? [rand(ctx.rng) < 0.3 for _ in 1:nf] : fill(false, nf)
+    # @atomic fields lower to the ordering-carrying getfield/setfield!/
+    # modifyfield! arities that src/builtins.jl hand-dispatches, so the policy
+    # aimed at builtins declares them more often.
+    atomicrate = ctx.policy === :builtins ? 0.6 : 0.35
+    mask = ismutable ? [rand(ctx.rng) < atomicrate for _ in 1:nf] : fill(false, nf)
     s = StructT(name, fnames, fsums, ismutable, mask)
     push!(ctx.structs, s)
     # register the constructor as a function so call sites can build values
@@ -757,12 +831,17 @@ function genextramethod(ctx::Ctx, fi::FnInfo)::Union{St,Nothing}
     sig = fi.sigs[1]
     isempty(sig) && return nothing
     first0 = sig[1]
-    alts = [s for s in (IntT, FloatT, StrT, BoolT) if !(first0 isa ConcT && compat_eq(s, first0))]
+    # Generated struct types are dispatch alternatives too, not just scalars:
+    # dispatching between a struct method and a scalar method exercises the
+    # interpreter's method lookup on types the program itself defined.
+    cands = TySum[IntT, FloatT, StrT, BoolT]
+    append!(cands, ctx.structs)
+    alts = [s for s in cands if !compat_eq(s, first0)]
     isempty(alts) && return nothing
     newsig = TySum[pick(rng, alts); sig[2:end]]
     params = Tuple{Symbol,TySum,Bool}[]
     for s in newsig
-        push!(params, (freshname(ctx, "a"), s, s isa ConcT))
+        push!(params, (freshname(ctx, "a"), s, annotatable(s)))
     end
     params[1] = (params[1][1], params[1][2], true)  # the distinguishing param must be typed
     retsum = pick(rng, CONCRETE_MENU)
@@ -780,6 +859,7 @@ function genextramethod(ctx::Ctx, fi::FnInfo)::Union{St,Nothing}
     selfidx === nothing || push!(ctx.fns, fi)
     popscope!(ctx)
     push!(fi.sigs, newsig)
+    push!(fi.varargs, false)   # this method is rendered without a `va...`
     fi.ret = joinsum(fi.ret, retex.sum)
     return St(:fundef, (fi.name, params, retex.sum, Tuple{Symbol,Any}[], false, :_, 0);
               exs=[retex], blocks=[St[]])
@@ -788,8 +868,19 @@ end
 # ---------------------------------------------------------------------------
 # Whole programs
 
-function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
+genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program = genprogram(Ctx(rng, cfg))
+
+# Generate with one policy forced, overriding the drawn one. For measuring what
+# a policy actually does to the distribution (fuzz/metrics.jl --policy NAME);
+# campaigns draw the policy per program instead.
+function genprogram_policy(rng::AbstractRNG, cfg::Cfg, policy::Symbol)::Program
     ctx = Ctx(rng, cfg)
+    ctx.policy = policy
+    return genprogram(ctx)
+end
+
+function genprogram(ctx::Ctx)::Program
+    rng, cfg = ctx.rng, ctx.cfg
     # pre: structs then globals (both live in module scope, scopes[1])
     pre = St[]
     for _ in 1:rand(rng, cfg.nstructs)
@@ -797,6 +888,20 @@ function genprogram(rng::AbstractRNG, cfg::Cfg=Cfg())::Program
     end
     for _ in 1:rand(rng, cfg.nglobals)
         push!(pre, genglobal(ctx))
+    end
+    # A mutable struct is only interesting if some *value* of it exists: field
+    # writes, @atomic modify, and struct aliasing all require a binding of that
+    # type in scope, and relying on newvarsum to happen to create one left the
+    # whole atomics surface at ~1% of programs. Seed a module-global instance so
+    # the rules that need one can fire — including from inside function bodies,
+    # which is how a mutation reaches an interpreted frame.
+    for s in ctx.structs
+        s.ismutable || continue
+        rand(rng) < 0.6 || continue
+        name = freshname(ctx, "sv")
+        args = Ex[genleaf(ctx, fs) for fs in s.fieldsums]
+        push!(pre, St(:assign, (name, s, true, false); exs=[Ex(:call, s, s.name, args)]))
+        push!(ctx.scopes[1], VInfo(name, s, true))
     end
     # fundefs
     fundefs = St[]

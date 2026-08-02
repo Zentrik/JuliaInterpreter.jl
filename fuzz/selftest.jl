@@ -36,8 +36,13 @@ end
 
     @testset "supposition engine" begin
         @test supposition_valid
-        # the config floor is 5 body statements + 3 tail observations
-        @test supposition_minimal == 8
+        # The config floor: nbodystmts bottoms out at 5, and choice-sequence
+        # shrinking drives each toward the first/highest-weighted statement rule
+        # (:assignnew), so a minimal program is 5 assignments — each declaring a
+        # binding, and every live binding gets a tail observation — hence 10.
+        # This is a canary for "shrinking still reaches the floor": if a grammar
+        # change moves the floor, re-derive rather than relax it.
+        @test supposition_minimal == 10
     end
 
     @testset "generator determinism" begin
@@ -82,6 +87,16 @@ end
         # NaN must compare equal to itself; 0.0 and -0.0 must differ
         @test classify(done(NaN), done(NaN)).class === :agree
         @test classify(done(0.0), done(-0.0)).class === :value_divergence
+        # Type divergences are findings: `isequal` alone would call all three of
+        # these equal, hiding exactly the promotion/conversion bugs a
+        # hand-written interpreter is most likely to have.
+        @test classify(done(1), done(1.0)).class === :value_divergence
+        @test classify(done(true), done(1)).class === :value_divergence
+        @test classify(done(Any[1]), done(Any[1.0])).class === :value_divergence
+        @test classify(done((1, 2)), done((1, 2.0))).class === :value_divergence
+        # ... while same-type, same-value streams (including nested) still agree
+        @test classify(done(Any[1, 2]), done(Any[1, 2])).class === :agree
+        @test classify(done((1, "a")), done((1, "a"))).class === :agree
         # aborted with matching prefix is a discard, mismatched prefix is real
         aborted(obs...) = Outcome(:aborted, :none, Any[obs...], "", "")
         @test classify(done(1, 2, 3), aborted(1)).class === :aborted
@@ -102,6 +117,17 @@ end
         @test fingerprint(vc) != fingerprint(vd)
         # ... while identical shapes still dedup
         @test fingerprint(vc) == fingerprint(classify(done(5), done(7)))
+
+        # Exception-class verdicts must not all share one bucket either: with an
+        # unsalted (class, refexc, intexc) key, the first interp-only
+        # UndefVarError reported would mask every later, unrelated one.
+        threw(exc, obs...) = Outcome(:threw, exc, Any[obs...], "", "")
+        ta = classify(done(1, :marker_a), threw(:UndefVarError, 1, :marker_a))
+        tb = classify(done(1, 99), threw(:UndefVarError, 1, 99))
+        @test ta.class === :interp_only_throw && tb.class === :interp_only_throw
+        @test fingerprint(ta) != fingerprint(tb)
+        # same shape still dedups, so reruns don't re-report one bug forever
+        @test fingerprint(tb) == fingerprint(classify(done(1, 7), threw(:UndefVarError, 1, 7)))
     end
 
     @testset "targeted differential: wave-3 constructs agree" begin
@@ -275,6 +301,64 @@ end
         # Divergences here are findings against JuliaInterpreter, not harness bugs;
         # they should be rare enough that the smoke test still validates the plumbing.
         @test ndiverge <= 5
+    end
+
+    @testset "stepping axis agrees with plain interpretation" begin
+        # The step axis asserts three invariants: stepping terminates, raises no
+        # error from JuliaInterpreter's own code, and reaches the same
+        # observations as running. Random command walks over generated programs
+        # must satisfy all three — a failure here is a finding against
+        # commands.jl/breakpoints.jl, not a harness bug, so it is worth the
+        # noise of reporting it loudly.
+        nbad = 0
+        for seed in 1:20
+            src = render(genprogram(Xoshiro(seed)))
+            ex = FuzzJI.parsegate(src)
+            ex === nothing && continue
+            plain = FuzzJI.run_interp(ex; nstmts=500_000)
+            st = FuzzJI.step_program(src; rng=Xoshiro(seed), maxcmds=4000)
+            st === nothing && continue
+            v = FuzzJI.classify_step(plain, st)
+            if v.class !== :agree
+                nbad += 1
+                @warn "stepping divergence (a real finding — triage it!)" seed v.class v.detail
+            end
+        end
+        @test nbad == 0
+    end
+
+    @testset "stepping oracle detects a planted divergence" begin
+        # Prove the step oracle can actually fail: compare a program's real
+        # observations against a deliberately wrong stepped stream, and against
+        # a stepped run that reported an internal error.
+        plain = FuzzJI.Outcome(:done, :none, Any[1, 2, 3], "", "")
+        wrong = FuzzJI.StepOutcome(:done, Any[1, 99, 3], "", 10, Symbol[])
+        @test FuzzJI.classify_step(plain, wrong).class === :step_divergence
+        short = FuzzJI.StepOutcome(:done, Any[1, 2], "", 10, Symbol[])
+        @test FuzzJI.classify_step(plain, short).class === :step_divergence
+        hang = FuzzJI.StepOutcome(:nonterminating, Any[1], "budget", 4000, Symbol[])
+        @test FuzzJI.classify_step(plain, hang).class === :step_nonterminating
+        # An identical stepped stream agrees.
+        @test FuzzJI.classify_step(plain, FuzzJI.StepOutcome(:done, Any[1, 2, 3], "", 5, Symbol[])).class === :agree
+
+        # Throw classification is decided by comparing against plain
+        # interpretation, NOT by whether the backtrace mentions
+        # JuliaInterpreter: a program-thrown exception unwinds through
+        # interpreter frames too, so that heuristic alone reports every
+        # deliberately-throwing generated program as an interpreter bug.
+        threwplain = FuzzJI.Outcome(:threw, :DomainError, Any[1], "", "")
+        samethrow = FuzzJI.StepOutcome(:threw, Any[1], "d", 5, Symbol[], :lookup_var, :DomainError)
+        @test FuzzJI.classify_step(threwplain, samethrow).class === :agree
+        # ... but throwing where plain interpretation completed is a finding,
+        # as is throwing something different than plain interpretation does.
+        steponly = FuzzJI.StepOutcome(:threw, Any[1, 2, 3], "d", 5, Symbol[], :next_line!, :UndefVarError)
+        @test FuzzJI.classify_step(plain, steponly).class === :step_only_throw
+        different = FuzzJI.StepOutcome(:threw, Any[1], "d", 5, Symbol[], :next_line!, :BoundsError)
+        @test FuzzJI.classify_step(threwplain, different).class === :step_exception_divergence
+        # Breakages in different interpreter functions get different buckets.
+        other = FuzzJI.StepOutcome(:threw, Any[1, 2, 3], "d", 5, Symbol[], :until_line!, :UndefVarError)
+        @test fingerprint(FuzzJI.classify_step(plain, steponly)) !=
+              fingerprint(FuzzJI.classify_step(plain, other))
     end
 
     @testset "canary: pipeline detects a genuine known divergence" begin

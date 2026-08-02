@@ -18,8 +18,10 @@ include("classify.jl")
 include("shrink.jl")
 include("journal.jl")
 include("driver.jl")
+include("stepfuzz.jl")
 include("supposition.jl")
 
-export campaign, supposition_campaign, genprogram, render, run_both, classify, shrink, Cfg, ProgramGen
+export campaign, supposition_campaign, step_campaign, genprogram, render, run_both, classify,
+       shrink, Cfg, ProgramGen
 
 end

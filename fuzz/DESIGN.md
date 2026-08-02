@@ -21,7 +21,19 @@ julia --project=fuzz fuzz/run.jl --selftest                    # harness accepta
 julia --project=fuzz fuzz/run.jl --n 5000                      # Supposition-driven campaign
 julia --project=fuzz fuzz/run.jl --engine native --n 10000 --seed 1  # seeded-RNG campaign
 julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recursive-interp only
+julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis
+julia --project=fuzz fuzz/run.jl --engine native --n 5000 --big --fresh  # larger programs, re-report known buckets
+julia --project=fuzz fuzz/metrics.jl --n 500                    # what the generator actually produces
 ```
+
+Generator size is configurable from the CLI (`--big`, `--maxblockdepth`,
+`--maxblockstmts`, `--maxdepth`, `--maxloop`, `--bodystmts LO:HI`);
+`fuzz/metrics.jl` reports the resulting distribution without executing
+anything, which is the fast way to check whether a grammar change did what
+you meant. `--fresh` stops pre-seeding the dedup set from `findings/` (coarse
+buckets otherwise let an already-reported finding mask new ones), `--patience
+K` keeps a Supposition campaign going for K consecutive empty rounds, and
+`--nosync` drops the per-candidate journal fsync for throughput.
 
 Findings land in `fuzz/findings/<class>-<fingerprint>/` as a standalone
 `repro.jl` (runs with `julia --project=fuzz repro.jl`) plus `meta.md` with the
@@ -205,6 +217,49 @@ ever reported would mask all future value bugs as duplicates. Still excluded:
 messages (drift across Julia versions) and the divergence index (moves under
 shrinking). `SUPPRESSIONS` in `driver.jl` holds predicates for known-reported
 findings so reruns only surface news.
+
+### The stepping axis (`stepfuzz.jl`)
+
+A second axis with a different target and a different oracle. The differential
+axis above tests run-to-completion semantics — the surface `test/juliatests.jl`
+(Julia's own test suite under the interpreter) and every Debugger.jl/Revise
+user already exercise heavily. The *debugger* machinery is not covered by any
+of that, and it is where this package's bugs historically are: counting fix
+commits per file, `construct.jl` (9), `utils.jl`/`eval_code` (7),
+`commands.jl` (3) and `breakpoints.jl` (3) against `interpret.jl` (4) and
+`builtins.jl` (2).
+
+`--engine step` generates the same programs, then drives each `ExprSplitter`
+fragment through a **random `debug_command` walk** (`:n :s :c :finish :nc :se
+:si :until :sl :sr`, including the thinly-tested "advanced" commands, with
+`:until` sometimes given an out-of-range line, and break-on-error armed half
+the time) instead of running it. Stepping has no compiled counterpart to diff
+against, so the oracle is the set of invariants a debugger must satisfy
+whatever the user types:
+
+| class | meaning |
+|---|---|
+| `step_internal_error` | an exception raised *by JuliaInterpreter's own code* (detected by looking for package frames in the backtrace; program-thrown exceptions are expected and ignored) |
+| `step_nonterminating` | the command budget ran out — the historical shape is a command that returns the frame unchanged forever |
+| `step_divergence` | stepping to completion produced different observations than plain interpretation: the debugger executed or skipped the wrong statements |
+| `step_only_throw` | stepping threw where plain interpretation completed |
+
+The third is the subtle one and the reason this axis exists: several past
+fixes (`next_line!` stopping on assignment-only lines, the
+argument-destructuring preamble, self-field-access wrappers) are all "the
+debugger ran the wrong statements", which nothing detects without comparing
+the stepped observation stream against the plain one.
+
+`step_internal_error` fingerprints are salted with the innermost
+JuliaInterpreter function in the backtrace, so distinct internal errors don't
+collapse into one dedup bucket.
+
+One harness obligation worth knowing: the walk refreshes `frame.world` on
+toplevel frames before each command, mirroring what the interpreter's own
+toplevel loop does (`src/interpret.jl`) and what the differential executor
+does. `debug_command` has no toplevel loop of its own, so without this every
+method the program defines at runtime — including the harness's `__obs__` in
+the fresh module — is "too new" for the frame's world.
 
 ### Shrinking (`shrink.jl`)
 

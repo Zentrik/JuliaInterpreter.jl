@@ -18,10 +18,13 @@ mutable struct FnInfo
     name::Symbol
     sigs::Vector{Vector{TySum}}  # one entry per method (positional sums)
     ret::TySum                   # join over methods
-    kwnames::Vector{Symbol}      # optional keyword params (callers may pass any subset)
-    vararg::Bool                 # last method accepts trailing args
+    kwnames::Vector{Symbol}      # keyword params — first method only (see :kwcall)
+    varargs::Vector{Bool}        # per *method*: does this signature accept trailing args?
 end
-FnInfo(name::Symbol, sigs, ret::TySum) = FnInfo(name, sigs, ret, Symbol[], false)
+FnInfo(name::Symbol, sigs, ret::TySum) =
+    FnInfo(name, sigs, ret, Symbol[], fill(false, length(sigs)))
+FnInfo(name::Symbol, sigs, ret::TySum, kwnames::Vector{Symbol}, vararg::Bool) =
+    FnInfo(name, sigs, ret, kwnames, fill(vararg, length(sigs)))
 
 Base.@kwdef struct Cfg
     maxdepth::Int = 4          # expression nesting
@@ -38,7 +41,56 @@ Base.@kwdef struct Cfg
                                # size and abort rate bounded as the cap rises)
     maxloop::Int = 4           # for-loop trip count / while fuel
     maxstring::Int = 6         # literal string length
+    swarm::Bool = true         # per-program random feature-subset masking
+    policy::Bool = true        # per-program generation-policy weight skew
 end
+
+# --- swarm testing + generation policies -----------------------------------
+#
+# Two ways to stop diluting the interesting rules, both per program.
+#
+# Swarm (Groce et al., ISSTA 2012): each program disables a random subset of
+# optional features instead of enabling everything. Some bugs need feature X
+# and are *suppressed* by feature Y also being present — with everything always
+# on, those bugs are unreachable no matter how many programs you draw. Turning
+# features off also concentrates the remaining budget: a program with only 6 of
+# 14 rule families available emits each of them far more often than one
+# choosing among all 14.
+#
+# Policies (YARPGen, OOPSLA 2020): skew the weight distribution toward one
+# subsystem per program, so a construct that is ~1% of statements under uniform
+# weights becomes common in the programs that target it. Cheap to add, and
+# retargetable when a subsystem saturates.
+
+# Rule families a program may switch off. Deliberately excludes :assignnew and
+# :observe (a program with neither generates nothing and compares nothing).
+const SWARMABLE = (:if, :for, :while, :let, :try, :push, :setindex, :alias, :setprop,
+                   :amodify, :compr, :maybeundef, :loopundef, :typedlocal, :brk, :cont,
+                   :ret, :reassign)
+
+const POLICIES = (
+    :uniform,    # no skew — keeps the historical distribution in the mix
+    :exceptions, # try/catch/finally, rethrow, exits crossing a try boundary
+    :dispatch,   # multi-method calls, wrong-typed calls, kwargs, closures
+    :builtins,   # the intrinsics/builtins probe dictionary and atomics
+    :toplevel,   # bare-toplevel statements, globals, undefined-variable probes
+    :mutation,   # vectors, structs, aliasing, field and atomic writes
+)
+
+# Weight multipliers per (policy, rule). Missing entries default to 1.0.
+const POLICY_BOOST = Dict{Symbol,Dict{Symbol,Float64}}(
+    :uniform    => Dict{Symbol,Float64}(),
+    :exceptions => Dict(:try => 6.0, :brk => 3.0, :cont => 3.0, :ret => 3.0,
+                        :for => 2.0, :while => 2.0, :guardix => 2.0, :guarddiv => 2.0,
+                        :badcall => 2.0),
+    :dispatch   => Dict(:callfn => 4.0, :kwcall => 4.0, :badcall => 4.0, :callvar => 3.0,
+                        :closure => 3.0),
+    :builtins   => Dict(:builtin => 8.0, :amodify => 4.0, :setprop => 2.0),
+    :toplevel   => Dict(:maybeundef => 4.0, :loopundef => 4.0, :typedlocal => 3.0,
+                        :reassign => 2.0),
+    :mutation   => Dict(:push => 3.0, :setindex => 3.0, :alias => 4.0, :setprop => 3.0,
+                        :amodify => 3.0, :compr => 2.0),
+)
 
 mutable struct Ctx
     rng::AbstractRNG
@@ -52,10 +104,44 @@ mutable struct Ctx
     loopdepth::Int                  # enclosing for/while loops (break/continue legality)
     retsum::Union{Nothing,TySum}    # current function's return summary (nothing at toplevel);
                                     # gates `return` statements and fixes their value summary
+    enabled::Set{Symbol}            # swarm: rule families this program may use
+    policy::Symbol                  # generation policy skewing the weights
 end
 
-Ctx(rng::AbstractRNG, cfg::Cfg=Cfg()) =
-    Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false, 0, nothing)
+function Ctx(rng::AbstractRNG, cfg::Cfg=Cfg())
+    # Draw the swarm mask and policy first, so they are part of the choice
+    # sequence and shrink like everything else.
+    enabled = Set{Symbol}()
+    for r in SWARMABLE
+        # Each feature is kept with p=0.7: enough off per program to get real
+        # configuration diversity, few enough that programs stay expressive.
+        (!cfg.swarm || rand(rng) < 0.7) && push!(enabled, r)
+    end
+    policy = cfg.policy ? pick(rng, POLICIES) : :uniform
+    return Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false, 0, nothing,
+               enabled, policy)
+end
+
+# Swarm gate: is this rule family available in the program being generated?
+# Rules not in SWARMABLE are always on.
+swarmon(ctx::Ctx, rule::Symbol) = !ctx.cfg.swarm || rule in ctx.enabled || !(rule in SWARMABLE)
+
+# Apply the program's policy to a (weight, rule) menu, dropping swarm-disabled
+# rules. Every weighted choice over rule names goes through here.
+function policyweights(ctx::Ctx, opts::Vector{Tuple{Float64,Symbol}})
+    boost = POLICY_BOOST[ctx.policy]
+    out = Tuple{Float64,Symbol}[]
+    for (w, r) in opts
+        swarmon(ctx, r) || continue
+        push!(out, (w * get(boost, r, 1.0), r))
+    end
+    # Never hand back an empty menu: fall back to the unfiltered options.
+    return isempty(out) ? opts : out
+end
+
+# Weighted pick over rule options, with swarm masking and policy skew applied.
+wpickrule(ctx::Ctx, opts::Vector{Tuple{Float64,Symbol}}) =
+    wpick(ctx.rng, policyweights(ctx, opts))
 
 # Is generation currently inside a local (non-module) scope? Determines
 # whether writing to a module global needs the `global` keyword.

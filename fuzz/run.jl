@@ -20,6 +20,11 @@
 #   native — seeded-RNG loop (one integer seed per candidate); the only mode
 #     with the crash-safe journal, so use it when hunting worker crashes:
 #     while true; julia --project=fuzz fuzz/run.jl --engine native --n 100000 --seed $RANDOM; done
+#   step — the debugger axis: drives each generated program through a random
+#     debug_command walk instead of running it, asserting that stepping
+#     terminates, raises no internal error, and reaches the same observations
+#     as plain interpretation. Targets commands.jl/breakpoints.jl.
+#     --maxcmds bounds the walk; --nobreakpoints disables break-on-error.
 #
 # --modes selects the interpreter configurations each candidate runs under:
 #   rec (RecursiveInterpreter), cmp (Compiled mode / NonRecursiveInterpreter),
@@ -32,7 +37,8 @@ function parseargs(args)
     o = Dict{String,Any}("engine" => "supposition", "n" => 1000, "seed" => 1,
                          "budget" => 300_000, "selftest" => false, "noshrink" => false,
                          "modes" => "both", "big" => false, "fresh" => false,
-                         "patience" => 1, "nosync" => false)
+                         "patience" => 1, "nosync" => false, "noswarm" => false,
+                         "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false)
     # Cfg overrides start unset (nothing) and fall through to the profile default.
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop", "bodystmts")
         o[k] = nothing
@@ -60,6 +66,14 @@ function parseargs(args)
             o["fresh"] = true
         elseif a == "--nosync"         # drop the per-candidate journal fsync (throughput)
             o["nosync"] = true
+        elseif a == "--noswarm"        # enable every feature in every program
+            o["noswarm"] = true
+        elseif a == "--nopolicy"       # uniform weights (no per-program skew)
+            o["nopolicy"] = true
+        elseif a == "--maxcmds"        # step engine: command budget per program
+            o["maxcmds"] = parse(Int, args[i += 1])
+        elseif a == "--nobreakpoints"  # step engine: don't arm break-on-error
+            o["nobreakpoints"] = true
         elseif a == "--patience"       # consecutive empty supposition rounds before stopping
             o["patience"] = parse(Int, args[i += 1])
         elseif a == "--maxdepth"
@@ -100,7 +114,9 @@ function makecfg(o)
                  maxblockdepth  = ov(:maxblockdepth, "maxblockdepth"),
                  blockdecay     = base.blockdecay,
                  maxloop        = ov(:maxloop, "maxloop"),
-                 maxstring      = base.maxstring)
+                 maxstring      = base.maxstring,
+                 swarm          = !o["noswarm"],
+                 policy         = !o["nopolicy"])
 end
 
 o = parseargs(ARGS)
@@ -128,6 +144,12 @@ elseif o["engine"] == "native"
                      modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"])
     @info "campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
+elseif o["engine"] == "step"
+    stats = step_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
+                          seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                          maxcmds=o["maxcmds"], usebreakpoints=!o["nobreakpoints"])
+    @info "step campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
+    exit(stats.findings == 0 ? 0 : 2)
 else
-    error("unknown engine $(o["engine"]) (expected: supposition | native)")
+    error("unknown engine $(o["engine"]) (expected: supposition | native | step)")
 end

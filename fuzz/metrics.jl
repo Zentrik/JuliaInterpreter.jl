@@ -26,7 +26,8 @@ using .FuzzJI
 using .FuzzJI: Xoshiro, St, Program, sections, nstatements
 
 function parseargs(args)
-    o = Dict{String,Any}("n" => 500, "big" => false)
+    o = Dict{String,Any}("n" => 500, "big" => false, "noswarm" => false, "nopolicy" => false,
+                         "policy" => nothing)
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop")
         o[k] = nothing
     end
@@ -37,6 +38,12 @@ function parseargs(args)
             o["n"] = parse(Int, args[i += 1])
         elseif a == "--big"
             o["big"] = true
+        elseif a == "--noswarm"
+            o["noswarm"] = true
+        elseif a == "--nopolicy"
+            o["nopolicy"] = true
+        elseif a == "--policy"     # force one policy for every program (validates the boosts)
+            o["policy"] = Symbol(args[i += 1])
         elseif a in ("--maxdepth", "--maxblockdepth", "--maxblockstmts", "--maxloop")
             o[a[3:end]] = parse(Int, args[i += 1])
         else
@@ -56,7 +63,8 @@ cfg = Cfg(; maxdepth=ov(:maxdepth, "maxdepth"), nglobals=base.nglobals, nstructs
             nfundefs=base.nfundefs, nmidstmts=base.nmidstmts, nbodystmts=base.nbodystmts,
             maxblockstmts=ov(:maxblockstmts, "maxblockstmts"), minblockstmts=base.minblockstmts,
             maxblockdepth=ov(:maxblockdepth, "maxblockdepth"), blockdecay=base.blockdecay,
-            maxloop=ov(:maxloop, "maxloop"), maxstring=base.maxstring)
+            maxloop=ov(:maxloop, "maxloop"), maxstring=base.maxstring,
+            swarm=!o["noswarm"], policy=!o["nopolicy"])
 
 const CTRL = (:if, :for, :while, :let, :try)
 
@@ -73,11 +81,25 @@ function ctrldepth(sts, d=0)
     return m
 end
 
+# Some constructs are expression kinds, not statement kinds (a comprehension is
+# an :assign whose rhs is an :compr; a builtin probe is a :guard around a :src),
+# so counting statement kinds alone would report them as absent.
+function scanex!(counts, e)
+    haskey(counts, e.kind) && (counts[e.kind] += 1)
+    e.kind === :src && (counts[:builtin] += 1)
+    for k in e.kids
+        scanex!(counts, k)
+    end
+end
+
 # Per-construct occurrence counts, plus the feature *interactions* that matter.
 function scan!(counts, sts; infunc=false, inloop=false, intry=false)
     for st in sts
         k = st.kind
         haskey(counts, k) && (counts[k] += 1)
+        for e in st.exs
+            scanex!(counts, e)
+        end
         infunc && k in CTRL && (counts[:ctrl_in_fn] += 1)
         inloop && k === :try && (counts[:try_in_loop] += 1)
         infunc && inloop && k === :try && (counts[:try_in_loop_in_fn] += 1)
@@ -95,14 +117,24 @@ end
 const TRACKED = (:try, :for, :while, :if, :let, :fundef, :recdef, :structdef, :amodify,
                  :setprop, :alias, :loopundef, :maybeundef, :typedlocal, :brk, :cont, :ret,
                  :compr, :push, :setindex,
+                 # expression-level constructs (counted via scanex!)
+                 :builtin, :guard, :callfn, :callvar, :kwcall, :closure, :closuremut, :call,
                  :ctrl_in_fn, :try_in_loop, :try_in_loop_in_fn, :exit_through_try)
 
 N = o["n"]
 counts = Dict{Symbol,Int}(k => 0 for k in TRACKED)
 withprog = Dict{Symbol,Int}(k => 0 for k in TRACKED)
 depths = Int[]; sizes = Int[]; lines = Int[]
+# --policy forces every program onto one policy, which is how the boost tables
+# get validated: run it against --policy uniform and the targeted rules should
+# move sharply while program size stays put.
+forced = o["policy"]
+forced === nothing || forced in FuzzJI.POLICIES ||
+    error("unknown policy $forced (expected one of $(FuzzJI.POLICIES))")
+genone(seed) = forced === nothing ? genprogram(Xoshiro(seed), cfg) :
+                                    FuzzJI.genprogram_policy(Xoshiro(seed), cfg, forced)
 for seed in 1:N
-    p = genprogram(Xoshiro(seed), cfg)
+    p = genone(seed)
     push!(depths, maximum(ctrldepth(sec) for sec in sections(p)))
     push!(sizes, nstatements(p))
     push!(lines, count(==('\n'), render(p)))
@@ -119,7 +151,8 @@ mean(xs) = round(sum(xs) / length(xs); digits=2)
 pct(x) = string(round(100x / N; digits=1), "%")
 
 println("seeds=$N  maxblockdepth=$(cfg.maxblockdepth) maxblockstmts=$(cfg.maxblockstmts) ",
-        "maxdepth=$(cfg.maxdepth) bodystmts=$(cfg.nbodystmts)")
+        "maxdepth=$(cfg.maxdepth) bodystmts=$(cfg.nbodystmts) ",
+        "swarm=$(cfg.swarm) policy=$(cfg.policy)")
 println("statements/program: mean $(mean(sizes))  max $(maximum(sizes))")
 println("rendered lines/program: mean $(mean(lines))  max $(maximum(lines))")
 println("control-flow depth: mean $(mean(depths))  max $(maximum(depths))  ",
