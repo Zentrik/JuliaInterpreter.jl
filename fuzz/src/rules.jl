@@ -375,16 +375,19 @@ function genclosure(ctx::Ctx, want::FnT)::Ex
         # the update must keep cap's summary: mix cap with an expression of the same summary
         upd = Ex(:binop, cap.sum, cap.sum == IntT ? pick(rng, [:+, :-, :*]) : pick(rng, [:+, :*]),
                  [Ex(:var, cap.sum, cap.name), genex(ctx, cap.sum)])
+        ctx.rtscopes -= 1
         popscope!(ctx)
         retex = Ex(:var, cap.sum, cap.name)
         return Ex(:closuremut, FnT(want.psums, cap.sum), (params, cap.name), [upd, retex])
     end
     pushscope!(ctx)
+    ctx.rtscopes += 1
     for (p, s) in zip(params, want.psums)
         declare!(ctx, VInfo(p, s isa AnyT ? AnyT() : s))
     end
     retsum = want.ret isa AnyT ? pick(rng, TySum[IntT, FloatT, BoolT, StrT]) : want.ret
     body = genex(ctx, retsum)
+    ctx.rtscopes -= 1
     popscope!(ctx)
     return Ex(:closure, FnT(want.psums, retsum), params, [body])
 end
@@ -560,9 +563,11 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         n = rand(rng, 0:ctx.cfg.maxloop)
         hasfilter = rand(rng) < 0.4
         pushscope!(ctx)
+        ctx.rtscopes += 1
         declare!(ctx, VInfo(ivar, IntT))
         body = genex(ctx, eltsum)
         kids = hasfilter ? [body, genex(ctx, BoolT)] : [body]
+        ctx.rtscopes -= 1
         popscope!(ctx)
         name = freshname(ctx, "v")
         st = St(:assign, (name, VecT(eltsum), true, false);
@@ -575,9 +580,9 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     elseif kind === :if
         cond = genex(ctx, BoolT)
         haselse = rand(rng, Bool)
-        thenb = genblock(ctx, blockdepth)
+        thenb = genblock(ctx, blockdepth; scoping=false)
         blocks = [thenb]
-        haselse && push!(blocks, genblock(ctx, blockdepth))
+        haselse && push!(blocks, genblock(ctx, blockdepth; scoping=false))
         return St(:if, haselse; exs=[cond], blocks=blocks)
     elseif kind === :for
         ivar = freshname(ctx, "i")
@@ -596,7 +601,7 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         # a soft scope, where a bare `fuel -= 1` would silently declare a new
         # local and throw UndefVarError reading it. Qualify the decrement with
         # `global` there so the counter actually decrements.
-        attop = !inlocal(ctx)
+        attop = !inruntimelocal(ctx)
         ctx.loopdepth += 1
         body = genblock(ctx, blockdepth)
         ctx.loopdepth -= 1
@@ -671,8 +676,10 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         n = rand(rng, 2:3)
         when = rand(rng, 2:n)
         pushscope!(ctx)
+        ctx.rtscopes += 1
         declare!(ctx, VInfo(ivar, IntT))
         rhs = genex(ctx, pick(rng, TySum[IntT, FloatT]))
+        ctx.rtscopes -= 1
         popscope!(ctx)
         return St(:loopundef, (ivar, xname, n, when); exs=[rhs])
     elseif kind === :typedlocal
@@ -697,9 +704,14 @@ function blockn(ctx::Ctx, childdepth::Int)
     return rand(ctx.rng, cfg.minblockstmts:hi)
 end
 
+# `scoping` says whether this block introduces a *runtime* scope. `for`, `while`,
+# `let` and `try` bodies do; an `if` branch does not, so a binding made in one at
+# toplevel is a module global. Generation scopes are pushed either way, because
+# name visibility follows the block regardless.
 function genblock(ctx::Ctx, blockdepth::Int; n::Int=blockn(ctx, blockdepth + 1),
-                  extra::Vector{VInfo}=VInfo[])
+                  extra::Vector{VInfo}=VInfo[], scoping::Bool=true)
     pushscope!(ctx)
+    scoping && (ctx.rtscopes += 1)
     for v in extra
         declare!(ctx, v)
     end
@@ -707,6 +719,7 @@ function genblock(ctx::Ctx, blockdepth::Int; n::Int=blockn(ctx, blockdepth + 1),
     for _ in 1:n
         push!(sts, genstmt(ctx; blockdepth=blockdepth + 1))
     end
+    scoping && (ctx.rtscopes -= 1)
     popscope!(ctx)
     return sts
 end
@@ -749,6 +762,12 @@ function genfundef(ctx::Ctx)::St
     end
     retsum = boundarysum(ctx)
     pushscope!(ctx)
+    # infunc goes up *before* the parameters are declared: declare! classifies a
+    # binding as global or local from the context it is created in, and a
+    # parameter declared while the context still says "module toplevel" would be
+    # recorded as a global.
+    wasinfunc, wasret, wasloop = ctx.infunc, ctx.retsum, ctx.loopdepth
+    ctx.infunc = true
     for (pn, ps, _) in params
         declare!(ctx, VInfo(pn, ps))
     end
@@ -756,8 +775,6 @@ function genfundef(ctx::Ctx)::St
     for (kn, _) in kwparams
         declare!(ctx, VInfo(kn, IntT))
     end
-    wasinfunc, wasret, wasloop = ctx.infunc, ctx.retsum, ctx.loopdepth
-    ctx.infunc = true
     ctx.retsum = retsum   # enables early `return` statements of the right summary
     ctx.loopdepth = 0     # function boundary: enclosing loops aren't break targets
     body = St[]
@@ -927,8 +944,12 @@ function genprogram(ctx::Ctx)::Program
         end
         push!(mid, st)
     end
-    # body: the `let` block
+    # body: the `let` block. That `let` is a real runtime scope, so bindings
+    # made here are locals, not globals — without counting it, a `while` in the
+    # body would emit `global fuel -= 1` for a variable that is local to the
+    # `let`, which is a lowering error rather than merely wrong.
     pushscope!(ctx)
+    ctx.rtscopes += 1
     body = St[]
     for _ in 1:rand(rng, cfg.nbodystmts)
         push!(body, genstmt(ctx))
@@ -953,6 +974,7 @@ function genprogram(ctx::Ctx)::Program
             push!(body, St(:observe; exs=[Ex(:var, v.sum, v.name)]))
         end
     end
+    ctx.rtscopes -= 1
     popscope!(ctx)
     return Program(pre, fundefs, mid, body)
 end

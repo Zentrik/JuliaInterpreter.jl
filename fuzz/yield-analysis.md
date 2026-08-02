@@ -370,6 +370,124 @@ corpus-admission feedback) and **P3 items 12–13** (`eval_code` and
 `ExprSplitter` axes — `utils.jl`/`construct.jl` carry the two densest fix
 histories in the package and neither is fuzzed yet), then **P4** (EMI).
 
+## The first long run
+
+Five sharded axes (`fuzz/longrun.sh`), restart-looping. What it produced:
+
+**One real bug, in Julia rather than in JuliaInterpreter.** `julia` aborts
+inside its own LLVM allocation-optimization pass (`llvm-alloc-opt.cpp`,
+`moveToStack`) while compiling a generated program. It surfaced on the
+*reference* side — plain `Core.eval` — so the interpreter is not involved.
+Two shards hit it independently with identical backtraces. Recovered by
+deterministic replay to seed 5000644 and reduced from 69 to 29 lines; see
+`findings/julia-codegen-abort-allocopt/`.
+
+That the harness finds compiler bugs is a side effect worth naming: it
+compiles every generated program as its reference, so it is a codegen fuzzer
+for free, on exactly the type-unstable deeply-nested input that stresses
+escape analysis. The AFL work on the Julia binary found a comparable class.
+
+**Four harness bugs, which is the more useful output of a first long run.**
+Each was killing batches or manufacturing findings, and none was reachable by
+short campaigns:
+
+- Observation slots can be *unassigned*, not merely absent: `push!` grows the
+  array then stores, so an interpretation stopping in between leaves a live
+  element that was never written. Reading it killed whole batches — sometimes
+  `UndefRefError`, sometimes a segfault, both inside the comparator.
+- `inlocal` counts *generation* scopes, which are pushed for `if` blocks too,
+  but `if` introduces no runtime scope. Runtime scopes are now tracked
+  separately; without that, a `while` fuel counter written inside a toplevel
+  `if` silently never decremented.
+- The parse gate lowered the whole program in one call, so a per-statement
+  scope error slipped through and then failed on *both* sides with different
+  exception types — reported as an exception divergence. One generator mistake
+  of this shape produced 32 spurious findings in a single run.
+- The journal's seed history was flushed only when the per-candidate fsync was
+  on, so a killed shard lost its history exactly when it was wanted.
+
+The crashed-candidate recovery path also had a hole: the journal holds the
+program that was executing, but the *next* batch overwrote it immediately, so
+a crash destroyed its own reproducer. Fixed by setting it aside on restart.
+
+**Still no JuliaInterpreter bug.** The interpreter-facing axes ran clean. Given
+the fix-history argument above, the most likely reading is that they need
+hours rather than that they are pointed wrong — but that is a hypothesis, not
+a result, and it stays untested until a run goes the distance on fixed code.
+
+## On "bigger programs" vs "splice real code"
+
+Both were raised as ways to attack the same problem. They are not equally
+valuable, and the difference is worth stating because it changes where effort
+goes.
+
+**Bigger programs are the weaker lever.** Program length does not change which
+interpreter code paths are reachable — the grammar's *vocabulary* does. A
+200-statement program built from the same rules as a 30-statement one visits
+the same `step_expr!` arms, just more times. What length buys is deeper
+feature *interaction*, which is real but already addressed more cheaply by the
+nesting fix (P0.1) and swarm concentration (P1.1): both raised interaction
+rates with program size held flat. Length also costs throughput and raises the
+abort rate, since `RecursiveInterpreter` burns budget interpreting Base. It is
+supported (`--big`, ~65 statements/program) and worth running as a background
+variant, but it is not where the next bug is.
+
+**Real code is the stronger lever, for a specific reason:** it contains
+constructs the grammar will never invent. Generators, `do` blocks,
+broadcasting, `where` clauses with constraints, iteration protocols, macros
+expanding to arbitrary lowered forms — no one is going to write grammar rules
+for all of that, and each is a distinct path through `construct.jl` and
+`interpret.jl`. This is the tree-splicer/icemaker result: derive inputs from a
+corpus instead of growing a grammar forever.
+
+**But it cannot use the differential value oracle**, and that is the part
+worth being careful about. Real code does I/O, calls `rand` and `time`,
+iterates dictionaries, depends on machine state — comparing observation
+streams against compiled Julia would produce endless false positives. That is
+precisely why the grammar excludes all of it by construction. Splicing real
+code into the *existing* axis would not "spice up" the differential fuzzer; it
+would break its oracle.
+
+The resolution is to pair real code with an oracle that needs no determinism.
+`--engine corpus` compares **failure mode only**: if `Core.eval` cannot run
+the fragment, discard it; if compiled Julia ran it and the interpreter did
+not, that is a finding. Plus the stepping invariants, which never needed
+determinism either. Note that this became possible only *because* the stepping
+axis was built first — before that there was no determinism-free oracle to
+attach a corpus to.
+
+So the honest ordering is: real code yes, and it is now built; bigger programs
+are a cheap background variant, not a priority; and the thing neither idea
+addresses — knowing *which* constructs are missing rather than guessing — is
+still P2, which is why it remains the top remaining item.
+
+## Campaign results, all axes
+
+Julia 1.11.9, this branch, all with `--fresh`:
+
+| axis | cases | outcome |
+|---|---|---|
+| differential (`native`) | 700 | 696 agreed, 4 aborted, 0 discarded, 0 findings |
+| stepping (`step`) | 500 | 498 agreed, 2 aborted, 0 findings |
+| eval_code (`evalcode`) | 400 | 400 agreed, 0 findings |
+| corpus (`corpus`) | 200 | 99 executed, 101 discarded as junk, 0 findings |
+
+No interpreter bugs from any of them. Three *generator* bugs were found and
+fixed along the way (toplevel `while` fuel in a soft scope, the missing
+`StructT` branch in `genex_inner`, per-method vararg tracking), the last of
+which the differential axis structurally could not report.
+
+That is a real negative result, and it is worth stating plainly rather than
+dressing up: the run-to-completion surface is hardened, and the new axes are
+calibrated but have not yet been run at the scale where they would be expected
+to produce anything. These campaigns are hundreds to low thousands of cases;
+the systems in the literature that find interpreter bugs run 10^8 and up. The
+value delivered here is that four axes now exist, three of them cover surfaces
+that had no systematic testing at all, and each has been shown to actually
+exercise what it claims — 1076 eval_code checks across 56 distinct variables,
+99 real fragments reaching the interpreter per 200 corpus cases. The next
+thing to do with them is run them long, not build a fifth.
+
 ## References
 
 - Fuzzilli: https://github.com/googleprojectzero/fuzzilli (Docs/HowFuzzilliWorks.md)

@@ -39,18 +39,104 @@
 
 using JuliaInterpreter: ExprSplitter, Frame
 
-# Constructs that make a fragment unsafe to execute in-process: side effects on
-# the machine, unbounded blocking, or anything that could take the fuzzer down
-# with it. Matched textually against the rendered fragment — deliberately
-# conservative, since a false skip only costs corpus size.
-const CORPUS_DENY = (
-    "ccall", "unsafe_", "@threads", "Threads.", "@async", "@spawn", "@distributed",
-    "remotecall", "addprocs", "run(", "readline", "readuntil", "stdin", "download",
-    "open(", "write(", "rm(", "mkdir", "mktemp", "touch(", "cp(", "mv(",
-    "include(", "Pkg.", "exit(", "sleep(", "@time", "@timed", "@profile",
-    "while true", "Base.eval", "Core.eval", "@eval", "atexit", "finalizer",
-    "ENV[", "cd(", "libc", "dlopen", "@test_throws", "GC.gc",
-)
+# Corpus fragments print: a `@testset` lifted from Julia's test suite writes a
+# summary, and a failing one writes a stack trace. That is the fragment doing
+# its job, not a finding — but at campaign scale it buries the harness's own
+# reports and costs real I/O (measured: 261 KB in 11 minutes from one shard).
+# Only stdout is redirected; the harness logs through stderr, so its @info
+# output and any finding it reports still reach the log.
+function quiet_stdout(f)
+    old = stdout
+    rd, wr = redirect_stdout()
+    # Drain the pipe, or a fragment that prints more than the buffer blocks
+    # forever waiting for a reader.
+    drain = @async read(rd)
+    try
+        return f()
+    finally
+        redirect_stdout(old)
+        close(wr)
+        wait(drain)
+        close(rd)
+    end
+end
+
+# Operations a corpus fragment must not perform in the fuzzer's own process:
+# they touch the machine outside it, block without bound, or hand execution to
+# another task or the compiler in ways this harness cannot bound.
+#
+# These are *names checked in call position*, not substrings of the rendered
+# source. Text matching gets this wrong in both directions: `myopen(x)` contains
+# "open(" and would be skipped for no reason, while a call written `Base.rm(p)`
+# or `f = rm; f(p)` slips past a search for "rm(". Walking the AST and looking
+# at what is actually being called is the same policy expressed precisely.
+#
+# This is still a policy list rather than a guarantee — an indirect call
+# (`getfield(Base, :rm)(p)`) defeats any static check. The guarantee has to come
+# from isolation, and the harness's existing answer is the crash-safe journal
+# plus a restart loop (see DESIGN.md): a case that kills the worker leaves its
+# reproducer behind. This list keeps the common, obviously-unsafe cases from
+# needing that recovery at all.
+const UNSAFE_NAMES = Set{Symbol}([
+    # process, filesystem, network
+    :run, :open, :write, :read, :readline, :readuntil, :readlines, :rm, :mkdir, :mkpath,
+    :mktemp, :mktempdir, :touch, :cp, :mv, :chmod, :cd, :download, :redirect_stdout,
+    :redirect_stderr, :exit, :atexit, :finalizer,
+    # concurrency: task bodies escape the interpreter, and blocking hangs the run
+    :sleep, :wait, :fetch, :schedule, :yield, :take!, :put!, :lock, :unlock,
+    :addprocs, :remotecall, :remotecall_fetch, :remote_do,
+    # foreign calls and raw memory
+    :ccall, :cglobal, :dlopen, :dlsym, :unsafe_load, :unsafe_store!, :unsafe_wrap,
+    :unsafe_pointer_to_objref, :pointer, :pointer_from_objref,
+    # reflection that re-enters eval or the package system
+    :eval, :include, :include_string, :evalfile,
+])
+
+const UNSAFE_MACROS = Set{Symbol}([
+    Symbol("@async"), Symbol("@sync"), Symbol("@spawn"), Symbol("@threads"),
+    Symbol("@distributed"), Symbol("@everywhere"), Symbol("@eval"), Symbol("@generated"),
+    Symbol("@time"), Symbol("@timed"), Symbol("@elapsed"), Symbol("@profile"),
+    Symbol("@allocated"), Symbol("@ccall"), Symbol("@cfunction"), Symbol("@test_throws"),
+])
+
+# The callee of a call expression, reduced to a bare name: `f`, `Mod.f`, and
+# `f{T}` all answer `:f`, so a qualified or parameterized spelling cannot slip
+# past the check.
+function calleename(@nospecialize(f))
+    while true
+        if f isa Symbol
+            return f
+        elseif f isa Expr && f.head === :. && length(f.args) >= 2 && f.args[2] isa QuoteNode
+            f = (f.args[2]::QuoteNode).value    # Mod.name -> name
+        elseif f isa Expr && (f.head === :curly || f.head === :where)
+            f = f.args[1]                       # f{T} -> f
+        elseif f isa GlobalRef
+            return f.name
+        else
+            return nothing
+        end
+    end
+end
+
+# Does this expression call, or macro-expand to, anything on the lists above?
+# Also rejects `while true`, whose only exits are `break`/`return`/throw and
+# which the harness cannot bound if the body has none.
+function calls_unsafe(@nospecialize(ex))::Bool
+    ex isa Expr || return false
+    if ex.head === :call || ex.head === :.
+        n = calleename(ex.head === :call ? ex.args[1] : ex)
+        n !== nothing && n in UNSAFE_NAMES && return true
+    elseif ex.head === :macrocall
+        n = calleename(ex.args[1])
+        n !== nothing && n in UNSAFE_MACROS && return true
+    elseif ex.head === :while
+        ex.args[1] === true && return true
+    end
+    for a in ex.args
+        calls_unsafe(a) && return true
+    end
+    return false
+end
 
 # Method definitions on names owned by another module (`Base.foo(x) = ...`)
 # register globally and would leak between cases — and could break the fuzzer
@@ -72,28 +158,46 @@ end
 function corpus_ok(ex)::Bool
     ex isa LineNumberNode && return false
     ex isa Expr || return false
-    # `module` blocks and imports pull in the world; skip both.
+    # `module` blocks and imports are handled separately: imports become the
+    # fragment's prelude, and a nested module pulls in its own world.
     ex.head in (:module, :import, :using, :export, :toplevel) && return false
     defines_foreign_method(ex) && return false
-    src = try
-        string(ex)
-    catch
-        return false
-    end
-    length(src) > 4000 && return false
-    any(d -> occursin(d, src), CORPUS_DENY) && return false
+    calls_unsafe(ex) && return false
+    # Very large fragments cost interpretation time out of proportion to what
+    # they add, and are usually whole test suites rather than units of code.
+    exprsize(ex) > 600 && return false
     return true
 end
 
+# Node count — a structural size measure, unlike the length of the rendered
+# string, which varies with identifier length and formatting.
+function exprsize(@nospecialize(ex))
+    ex isa Expr || return 1
+    n = 1
+    for a in ex.args
+        n += exprsize(a)
+    end
+    return n
+end
+
+# A fragment plus the imports its own file declared. Carrying the file's
+# `using`/`import` lines with it is what makes a lifted snippet runnable: a
+# fragment from a Dates test needs `using Dates`, one from SparseArrays needs
+# something else entirely, and no fixed list of stdlibs gets that right.
+struct Fragment
+    ex::Expr
+    prelude::Vector{Expr}
+end
+
 """
-    load_corpus(dirs; maxfiles, maxperfile) -> Vector{Expr}
+    load_corpus(dirs; maxfiles, maxperfile) -> Vector{Fragment}
 
 Parse every `.jl` file under `dirs` and collect the top-level expressions that
-pass `corpus_ok`. These are the raw material for both the standalone and
-spliced modes.
+pass `corpus_ok`, each tagged with the `using`/`import` statements from the
+file it came from.
 """
 function load_corpus(dirs::Vector{String}; maxfiles::Int=400, maxperfile::Int=40)
-    out = Expr[]
+    out = Fragment[]
     nfiles = 0
     for dir in dirs
         isdir(dir) || continue
@@ -115,11 +219,16 @@ function load_corpus(dirs::Vector{String}; maxfiles::Int=400, maxperfile::Int=40
                 end
                 (parsed isa Expr && parsed.head === :toplevel) || continue
                 nfiles += 1
+                # The file's own imports, in file order, so a fragment can be
+                # replayed in an environment resembling the one it was written
+                # for.
+                prelude = Expr[ex for ex in parsed.args
+                               if ex isa Expr && (ex.head === :using || ex.head === :import)]
                 taken = 0
                 for ex in parsed.args
                     taken >= maxperfile && break
                     corpus_ok(ex) || continue
-                    push!(out, ex)
+                    push!(out, Fragment(ex, prelude))
                     taken += 1
                 end
             end
@@ -143,13 +252,17 @@ function default_corpus_dirs()
     return dirs
 end
 
-# Build one case: `k` fragments spliced together. k == 1 is "run real code as
-# written"; k > 1 produces combinations that exist in no file, which is the
-# point of splicing.
-function splice_case(rng::AbstractRNG, corpus::Vector{Expr}, k::Int)
+# Build one case: `k` fragments spliced together, carrying the union of their
+# files' imports. k == 1 is "run real code as written"; k > 1 produces
+# combinations that exist in no file, which is the point of splicing.
+function splice_case(rng::AbstractRNG, corpus::Vector{Fragment}, k::Int)
     isempty(corpus) && return nothing
-    parts = Expr[pick(rng, corpus) for _ in 1:k]
-    return Expr(:toplevel, parts...)
+    parts = Fragment[pick(rng, corpus) for _ in 1:k]
+    prelude = Expr[]
+    for p in parts, imp in p.prelude
+        any(isequal(imp), prelude) || push!(prelude, imp)
+    end
+    return (Expr(:toplevel, (p.ex for p in parts)...), prelude)
 end
 
 struct CorpusOutcome
@@ -159,7 +272,9 @@ struct CorpusOutcome
     status::Symbol   # :ok | :junk | :internal_error | :step_internal_error | :step_stuck
     detail::String
     site::Symbol
+    prelude::Vector{Expr}   # the imports the reference run actually needed
 end
+CorpusOutcome(status, detail, site) = CorpusOutcome(status, detail, site, Expr[])
 
 # Spliced real code fails constantly on its own terms — a fragment lifted out of
 # a test file references names its file imported, so `@testset` and `Diagonal`
@@ -173,44 +288,95 @@ end
 # code has no obligation to reproduce. If `Core.eval` also dies, the fragment is
 # junk and is discarded. Only "compiled Julia handled this and the interpreter
 # did not" is a finding.
-# A module that real test-suite code has a chance of running in. Without these
-# imports a fragment lifted from Julia's test/ dir dies immediately on `@test`
-# or `Random` and is discarded as junk — measured, 128 of 150 cases were thrown
-# away for that reason alone, so the axis was testing almost nothing.
-const CORPUS_PRELUDE = [:(using Test), :(using Random), :(using LinearAlgebra),
-                        :(using Dates), :(using Printf)]
-
-function corpusmodule()
+# A module a lifted fragment has a chance of running in: the imports come from
+# the fragment's own file, so whatever it was written against is what gets
+# loaded. Without any prelude, 128 of 150 cases were discarded for missing
+# names and the axis tested almost nothing.
+function corpusmodule(prelude::Vector{Expr})
     m = freshmodule()
-    for st in CORPUS_PRELUDE
+    for st in prelude
         try
             Core.eval(m, st)
         catch
-            # a stdlib that isn't available just means fewer fragments run
+            # a dependency that will not load just means fewer fragments run
         end
     end
     return m
 end
 
-function eval_ref(ex::Expr)
-    m = corpusmodule()
-    try
-        for st in ex.args
-            st isa LineNumberNode && continue
-            Core.eval(m, st)
+# Which already-loaded module would supply this name? A fragment lifted out of
+# Julia's test suite usually does *not* carry the import it needs — the file was
+# `include`d by a runtests.jl that had already done `using Test` — so its own
+# prelude is incomplete no matter how faithfully it is collected.
+#
+# Rather than guess a fixed list of stdlibs, ask the failure what it wants:
+# `UndefVarError` names the missing binding, and the set of modules that could
+# provide it is discoverable from the ones already loaded in this process. That
+# covers whatever the corpus happens to need, including modules a future corpus
+# directory pulls in.
+function supplying_module(name::Symbol)
+    for (_, m) in Base.loaded_modules
+        m === Main && continue
+        try
+            name in names(m) && isdefined(m, name) && return m
+        catch
+            continue
         end
-        return (:done, :none)
-    catch err
-        return (:threw, scrubexc(err))
     end
+    return nothing
 end
 
-function corpus_run(ex::Expr; nstmts::Int)
-    refstatus, refexc = eval_ref(ex)
-    m = corpusmodule()
+# Evaluate with compiled Julia, repairing missing imports as they surface. The
+# repaired prelude is returned so the interpreted run sees the same environment.
+function eval_ref(ex::Expr, prelude::Vector{Expr}; maxrepairs::Int=4)
+    prelude = copy(prelude)
+    for _ in 0:maxrepairs
+        m = corpusmodule(prelude)
+        err = try
+            for st in ex.args
+                st isa LineNumberNode && continue
+                Core.eval(m, st)
+            end
+            nothing
+        catch e
+            e
+        end
+        err === nothing && return (:done, :none, prelude)
+        # Unwrap the LoadError that macro expansion wraps failures in.
+        while err isa LoadError
+            err = err.error
+        end
+        if err isa UndefVarError
+            mod = supplying_module(err.var)
+            if mod !== nothing
+                imp = Expr(:using, Expr(:., Symbol(mod)))
+                if !any(isequal(imp), prelude)
+                    push!(prelude, imp)
+                    continue      # retry with the name in scope
+                end
+            end
+        end
+        return (:threw, scrubexc(err), prelude)
+    end
+    return (:threw, :UndefVarError, prelude)
+end
+
+function corpus_run(ex::Expr, prelude::Vector{Expr}; nstmts::Int)
+    # eval_ref returns the prelude it needed, so the interpreted run and the
+    # stepping run see exactly the environment the reference succeeded in.
+    refstatus, refexc, prelude = eval_ref(ex, prelude)
+    m = corpusmodule(prelude)
     intstatus, intexc, detail, site = try
-        for (mod, frag) in ExprSplitter(m, ex)
-            frame = Frame(mod, frag)
+        # `ExprSplitter`/`Frame` expand macros while building the frame, and the
+        # prelude was evaluated *at runtime* — so `using Test` is newer than the
+        # world this function was compiled in, and a `@testset` in the fragment
+        # resolves against a world that has not seen the import. Compiled Julia
+        # does not hit this because `Core.eval` expands in the latest world.
+        # Without invokelatest the axis reports "compiled Julia ran this and the
+        # interpreter threw UndefVarError: @testset" — a difference manufactured
+        # entirely by the harness.
+        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+            frame = Base.invokelatest(Frame, mod, frag)
             budget = nstmts
             while true
                 ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
@@ -229,11 +395,11 @@ function corpus_run(ex::Expr; nstmts::Int)
          s === nothing ? :none : Symbol(s[1]))
     end
     # The fragment doesn't stand alone (missing imports, bad splice): discard.
-    refstatus === :threw && return CorpusOutcome(:junk, "reference threw $refexc", :none)
-    intstatus === :done && return CorpusOutcome(:ok, "", :none)
+    refstatus === :threw && return CorpusOutcome(:junk, "reference threw $refexc", :none, prelude)
+    intstatus === :done && return CorpusOutcome(:ok, "", :none, prelude)
     return CorpusOutcome(:internal_error,
                          "compiled Julia ran this fragment; the interpreter threw $intexc\n$detail",
-                         site)
+                         site, prelude)
 end
 
 # Step the same case. Real code is nondeterministic, so its *values* are not
@@ -245,13 +411,16 @@ end
 # error. A throw is still only reported when it surfaces inside
 # JuliaInterpreter: stepping executes the same code, which may legitimately
 # throw partway if a command skips an initialization.
-function corpus_step(ex::Expr, rng::AbstractRNG; maxcmds::Int)
-    m = corpusmodule()
+function corpus_step(ex::Expr, prelude::Vector{Expr}, rng::AbstractRNG; maxcmds::Int)
+    m = corpusmodule(prelude)
     interp = RecursiveInterpreter()
     total = 0
     try
-        for (mod, frag) in ExprSplitter(m, ex)
-            frame = Frame(mod, frag)
+        # invokelatest for the same reason as corpus_run: the prelude's imports
+        # are newer than this function's world, and frame construction expands
+        # the fragment's macros.
+        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+            frame = Base.invokelatest(Frame, mod, frag)
             status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total)
             total += n
             status === :stuck && return CorpusOutcome(:step_stuck,
@@ -280,7 +449,14 @@ Draw `n` cases by splicing `1:maxsplice` fragments of real Julia source, run
 each interpreted and stepped, and report anything that breaks JuliaInterpreter
 itself.
 """
-function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=200_000,
+# Throughput note: this axis is ~3s/case, roughly 30x slower than the
+# generated-program axes, and that is the axis working rather than a problem to
+# fix. Generated programs are small and mostly discarded cheaply; real code
+# that passes the reference gate actually runs, and running it under
+# RecursiveInterpreter means interpreting Base. The statement budget is
+# correspondingly lower than the other axes' — a real fragment that needs more
+# than this is not going to finish, and aborting it early buys more cases.
+function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
                          outdir::String=joinpath(@__DIR__, "..", "findings"),
                          journaldir::String=joinpath(@__DIR__, "..", "journal"),
                          dirs::Vector{String}=default_corpus_dirs(), maxsplice::Int=3,
@@ -301,18 +477,20 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=200_000,
             seed = baseseed + i - 1
             rng = Xoshiro(seed)
             k = rand(rng, 1:maxsplice)
-            case = splice_case(rng, corpus, k)
-            case === nothing && continue
-            src = join([string(a) for a in case.args], "\n")
+            sc = splice_case(rng, corpus, k)
+            sc === nothing && continue
+            case, prelude = sc
+            src = join(vcat([string(p) for p in prelude], [string(a) for a in case.args]), "\n")
             journal_case!(j, seed, src)
             stats.cases += 1
             # Lowering is part of what we are testing, so no parse gate here:
             # a fragment that does not lower is skipped by ExprSplitter itself.
-            o = corpus_run(case; nstmts)
-            # Only step fragments compiled Julia already ran cleanly: stepping a
-            # fragment that cannot run at all says nothing about the debugger.
-            if o.status === :ok && dostep
-                o = corpus_step(case, rng; maxcmds)
+            o = quiet_stdout() do
+                r = corpus_run(case, prelude; nstmts)
+                # Only step fragments compiled Julia already ran cleanly:
+                # stepping one that cannot run at all says nothing about the
+                # debugger.
+                (r.status === :ok && dostep) ? corpus_step(case, r.prelude, rng; maxcmds) : r
             end
             v = corpusverdict(o)
             # Track discards separately: if nearly every case is junk, the

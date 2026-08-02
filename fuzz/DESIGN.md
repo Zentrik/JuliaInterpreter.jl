@@ -1,5 +1,10 @@
 # FuzzJI: differential fuzzing of JuliaInterpreter against compiled Julia
 
+> **Picking this up?** Start with [`NEXT.md`](NEXT.md): current state of each
+> axis, the ranked work list, and the calibration traps that cost the most
+> time. This file explains how the harness works; `yield-analysis.md` explains
+> why it is built this way.
+
 Generate random-but-valid Julia programs, run each one twice in the same
 process — compiled (`Core.eval`, the reference) and interpreted
 (`ExprSplitter` + `Frame`, the system under test) — and compare everything
@@ -303,12 +308,26 @@ this and the interpreter did not" is reported, plus the stepping invariants
 from the axis above. Comparing whether execution failed, never what it
 computed, is what makes nondeterministic real code usable as input.
 
-Two things that matter in practice: a denylist keeps fragments with side
-effects (I/O, processes, threads, `ccall`) and unbounded blocking out of the
-corpus, and definitions of another module's methods are skipped since they
-would leak between cases. The sandbox module imports `Test`, `Random`,
-`LinearAlgebra`, `Dates` and `Printf` — without that prelude, 128 of 150 cases
-were discarded for missing names; with it, roughly half of all cases execute.
+Two mechanisms make this work in practice, both deliberately derived rather
+than enumerated:
+
+- **Safety filtering is an AST check, not a text search.** `calls_unsafe`
+  walks the expression and looks at what sits in *call position*, reducing
+  `f`, `Mod.f` and `f{T}` to a bare name. Substring matching on rendered
+  source is wrong in both directions: `myopen(path)` contains `"open("` and
+  would be dropped for nothing, while `Base.rm(p)` slips past a search for
+  `"rm("`. It is still a policy list, and no static check survives an indirect
+  call — the actual guarantee is the crash-safe journal plus a restart loop,
+  which already exists for exactly this.
+- **Missing imports are recovered from the failure, not guessed.** A fragment
+  lifted from Julia's test suite usually does not carry the import it needs,
+  because the `runtests.jl` that included it had already done `using Test`. So
+  the reference run reads the `UndefVarError`, finds a loaded module that
+  exports that name (`supplying_module`), adds the import and retries. No list
+  of stdlibs to maintain, and it covers whatever a future corpus directory
+  happens to need. Measured on 200 cases: 23% of cases execute using only the
+  imports each fragment's own file declared, 49% with repair.
+
 The `ran` vs `discarded_junk` counters exist so that ratio stays visible: a
 campaign that discards everything would otherwise report a perfect
 100%-agreed line while testing nothing.
@@ -376,20 +395,26 @@ and belong in `SUPPRESSIONS` if hit).
   destructuring, do-blocks, `@generated` functions, parametric structs,
   inner constructors, defaults referencing earlier params. CI: a time-boxed
   nightly job that uploads `findings/` as artifacts and exits 2 on news.
-- **M3 — feedback + debugger axis**: a `CoverageInterp <: Interpreter`
-  recording which stmt heads/builtins/intrinsics/dispatch paths each case
-  touches (cheap semantic coverage: report grammar gaps, bias seeds);
-  fuzz `debug_command` scripts (`:n`/`:s`/`:until`/`:finish` + random
-  breakpoints) over the same programs, asserting no internal error and
-  final-value agreement. Structured concurrency subset (`@sync`/`@async`,
-  `fetch`, bounded `Channel`, `-t1`, observations only from the root task) —
-  noting task bodies escape interpretation (the scheduler, not interpreted
-  code, invokes them), so the surface is task setup, `@sync` lowering,
-  exception propagation, and `:enter`/`:leave` interaction with task
-  switches.
-- **M4 — pluggable lowerer**: the harness's lowering step as an injectable
-  function; a JuliaLowering.jl configuration to flush out flisp-idiom
-  assumptions in `construct.jl`/`commands.jl` before Base switches lowerers.
+- **M3 — debugger axis** (done): `--engine step` fuzzes `debug_command` walks,
+  and `--engine evalcode` fuzzes `eval_code` at paused frames. See the two
+  sections above. The *feedback* half of M3 — a `CoverageInterp <: Interpreter`
+  recording which statement heads, builtin arms and dispatch paths each case
+  touches — is **not** done and is the highest-value remaining item.
+- **M3.5 — corpus axis** (done): `--engine corpus` runs and splices real Julia
+  source, with an oracle that compares failure mode only so nondeterministic
+  code is usable.
+- Still open, in priority order: semantic coverage (above), version-aware
+  triage of reference-side crashes, shrinking for the three newer axes, an
+  `ExprSplitter` axis, throughput, EMI, a nightly CI job. Structured
+  concurrency (`@sync`/`@async` with observations only from the root task) and
+  a **pluggable lowerer** — the lowering step as an injectable function, so a
+  JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
+  `construct.jl`/`commands.jl` before Base switches lowerers — remain
+  unstarted.
+
+**→ See [`NEXT.md`](NEXT.md)** for the full ranked work list, the current
+state of each axis, and the calibration traps worth knowing before touching
+any of it.
 
 ## Design decisions log
 
