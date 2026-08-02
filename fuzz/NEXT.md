@@ -1,11 +1,14 @@
 # FuzzJI: state of play and what to do next
 
-Handoff document. Read `DESIGN.md` for how the harness works and
-`yield-analysis.md` for why it is built this way; this file is the short
-version of *where things stand* and *what to pick up*.
+Handoff document. Read `DESIGN.md` for how the harness works,
+`yield-analysis.md` for why it is built this way, and `determinism.md` for
+what the determinism requirement actually forces — and how to relax it; this
+file is the short version of *where things stand* and *what to pick up*.
 
-Last updated after the session that added the stepping, eval_code and corpus
-axes.
+Last updated after merging two parallel sessions: the one that added the
+stepping, eval_code and corpus axes plus the campaign tooling, and the one
+that produced the determinism analysis and the generation-generality
+proposals now folded into the ranked list below.
 
 ---
 
@@ -43,23 +46,37 @@ anything — the literature's numbers are 10^8 and up, these runs are 10^3–10^
 
 ## Work items, ranked
 
-### 1. Version-aware triage of reference-side crashes
+This list merges two sessions' proposals: the axis/tooling session that first
+wrote this file, and the determinism/generality session (`determinism.md`,
+plus the reflection-prober design in item 4). The ordering logic is
+unchanged — expected yield per engineering-hour, with oracle strength and new
+surfaces ahead of raw input volume.
 
-Small, and it directly fixes a hole that cost a lot of time.
+### 1. Finding-intake hardening
 
-Today a crash on the **reference** side (compiled Julia) lands in the same
-`findings/` bucket as an interpreter divergence, and nothing checks whether it
-still reproduces on current Julia. Both matter:
+Small, first, and bought with time already lost. Three gates between "the
+harness noticed something" and "a human looks at it":
 
-- A reference-side crash is a *Julia* bug, not a JuliaInterpreter bug. Classify
-  and route it separately — different verdict class, different directory.
-- Before reporting one, re-run it under the newest installed Julia
-  (`juliaup` makes `julia +1.12 file.jl` a one-liner). If it passes there, say
-  so in the report.
-
-The whole codegen-crash episode — journal replay, minimization, C-Reduce, a
-delegated reduction agent — was work on a bug fixed a release earlier, and one
-version check up front would have answered it.
+- **Version-aware triage of reference-side crashes.** A crash on the
+  **reference** side (compiled Julia) is a *Julia* bug, not a
+  JuliaInterpreter bug — classify and route it separately, different verdict
+  class, different directory. And before reporting one, re-run it under the
+  newest installed Julia (`juliaup` makes `julia +1.12 file.jl` a
+  one-liner); if it passes there, say so in the report. The whole
+  codegen-crash episode — journal replay, minimization, C-Reduce, a
+  delegated reduction agent — was work on a bug fixed a release earlier, and
+  one version check up front would have answered it.
+- **Confirm-on-divergence** (`determinism.md` §6). A finding is currently
+  reported after one reference run and one interpreted run. Instead: on
+  divergence, rerun the reference; if it disagrees with *itself*, classify
+  `nondet_discard` (tracked next to `aborted`, never reported); otherwise
+  rerun the interpreted side, and discard likewise if unstable. Costs
+  nothing on the agree path, stabilizes shrinking, and turns every future
+  nondeterminism mistake — grammar, prelude, or corpus — into a tracked
+  discard instead of a false finding. Prerequisite for item 5.
+- **rr for intermittent repros.** When a `findings/` repro crashes
+  only sometimes, capture it under `julia --bug-report=rr` (rr support is
+  first-class in Julia) before any hand minimization.
 
 ### 2. Semantic coverage of the interpreter (P2 in `yield-analysis.md`)
 
@@ -75,7 +92,9 @@ touches: statement heads, which builtin arms in `builtins.jl`, which
   Each is either a grammar gap or dead code, and either answer is useful. This
   also becomes the regression check for grammar changes — `metrics.jl` shows
   what is *generated*, this would show what is *reached*, which is the
-  question that actually matters.
+  question that actually matters. It also tells item 4 which dispatch arms
+  the prober needs to reach, and which of the still-open grammar gaps below
+  actually matter.
 - **Stage two.** Feed it back as corpus admission: keep a candidate whose
   choice sequence hit new coverage, mutate and splice from those. The
   Supposition `TCRNG` adapter already makes generation a pure function of a
@@ -97,9 +116,60 @@ RNG stream matters for `step` (see `diag_stuck.jl`): the walk continues the
 same RNG the generator used, so a shrunk program must be replayed the same
 way or the command sequence changes.
 
-Close this before the next long unattended run, not after.
+Close this before the next long unattended run, not after. Item 5's corpus
+upgrade raises the stakes: a value oracle on real code will produce its
+findings in real-code-sized fragments.
 
-### 4. An `ExprSplitter` axis (P3 item 13)
+### 4. Replace `BUILTIN_PROBES` with a reflection-driven prober
+
+The 76 verbatim probe strings cover ~23 distinct builtins and never receive
+generated values. Meanwhile `src/builtins.jl` special-cases **79 builtins
+across 44 dispatch arms** — and that file is itself *generated* by
+`bin/generate_builtins.jl`, which enumerates every `Core.Builtin` by
+reflection. The fuzzer should consume the same enumeration: for each builtin
+and intrinsic, generate guarded calls with an arity sweep (0 through n+1)
+and arguments drawn from the TySum-directed generator — a mix of
+type-plausible and deliberately wrong — so probes finally see generated
+structs, vectors, closures and atomic orderings. Hand-curated knowledge
+shrinks from "author every probe" to an exceptions table of roughly a dozen
+entries: the SIGFPE intrinsics (`sdiv_int` on zero), unspecified-value
+contracts (out-of-range `unsafe_trunc`, fptosi of NaN — `determinism.md`
+§1's class U), and anything else whose contract says "unspecified". This
+scales across Julia versions automatically and turns item 2's never-hit-arm
+report into a to-do list the generator can act on.
+
+### 5. Determinism unlocks, the cheap half (`determinism.md` §9)
+
+Item 1's confirm-on-divergence gate is the safety net for all three; in
+order:
+
+- **Explicit RNG + content-keyed containers.** `__RNG__ = Xoshiro(seed)` in
+  the prelude, with `rand`/`randn`/`shuffle!` rules drawing from it — both
+  sides execute the same generator code, so streams agree bit-for-bit.
+  Unlocks data-dependent control flow and indices, which every guarded rule
+  currently lacks. Plus `Dict`/`Set` keyed by content-hashed types
+  (Int/String/Symbol/Char and immutable combinations): already
+  deterministic cross-engine, iteration order included, and the
+  associative-container and iteration-protocol paths are untested today.
+- **Corpus self-agreement certification.** The corpus axis demotes *all*
+  real code to the failure-mode oracle because real code is "not
+  deterministic" — but that property is per-fragment and measurable. Seed
+  the sandbox RNG before every run, run the compiled reference **twice**;
+  if it agrees with itself, the fragment is certified observationally
+  deterministic and graduates to the full differential value oracle
+  (`classify` applies unchanged). The single largest step toward testing
+  real-world code. Track the certification rate next to
+  `ran`/`discarded_junk` so a collapse is visible.
+- **Virtual doubles.** `__vtime__` (monotone counter), `__venv__` (Dict
+  double of ENV), `__vfs__` (Dict-backed pseudo-files) in `SETUP_SRC`,
+  raising the real exception types so guarded observations stay meaningful.
+  The point is not I/O — it is that resource-handle idioms
+  (`open(...) do`, `try ... finally close(h)`) become generable, and those
+  are the closure + `finally` + early-exit compositions wave 3 exists to
+  stress. Curated deterministic `ccall`s (`strlen`/`memcmp`/libm on
+  generated values) for the `:foreigncall` conversion path ride along.
+
+### 6. An `ExprSplitter` axis (P3 item 13)
 
 `construct.jl` has the densest fix history in the package (9 commits) and is
 still only exercised incidentally. A dedicated axis would feed it adversarial
@@ -109,7 +179,18 @@ global declarations in odd positions, scope blocks that cannot be split.
 Oracle: the sequence of `(mod, frag)` pairs is consistent with what
 `Core.eval` does with the same source, and no internal error.
 
-### 5. Throughput
+Ordering between items 4–6 is soft. This one has the strongest pure
+bug-density argument (fix history); item 5 has the strongest
+breadth-of-tested-code argument. A session should pick by which question it
+is trying to answer.
+
+### 7. A nightly CI job
+
+Time-boxed, uploads `findings/` as artifacts, exits 2 on news. Mentioned in
+the roadmap, never built. Worth building as soon as item 1 lands — unattended
+runs are only as useful as the trustworthiness of what they report.
+
+### 8. Throughput
 
 The `native` axis runs ~2 cases/s and it multiplies everything. The cost is
 three fresh modules per candidate, re-lowering on the interpreted side, and
@@ -117,19 +198,34 @@ the reference JIT-compiling every generated function from scratch. Module
 pooling and skipping the double lowering are the obvious wins.
 
 Ranked here rather than higher because it makes a *low-bug-density* surface
-faster. Raising the rate on the axes in items 2–4 is worth more.
+faster. Raising the rate on the axes in items 2–6 is worth more. (Item 5's
+extra reference runs barely move this: confirm-on-divergence only pays on
+divergences, and the corpus certification run is compiled-side, the cheap
+side.)
 
-### 6. EMI — equivalence modulo inputs (P4)
+### Long-horizon, in one place
 
-Profile which statements execute on a given input (nearly free, the
-interpreter is instrumentable in pure Julia), mutate code that is dead on that
-input, and require `interp(P) == interp(P′)`. A second oracle orthogonal to
-compiled-vs-interpreted. Biggest lift of anything here.
-
-### 7. A nightly CI job
-
-Time-boxed, uploads `findings/` as artifacts, exits 2 on news. Mentioned in
-the roadmap, never built.
+- **Coverage stage two** — corpus admission + choice-sequence
+  mutation/splicing over the `TCRNG` substrate (item 2's second half).
+- **EMI — equivalence modulo inputs (P4).** Profile which statements execute
+  on a given input (nearly free, the interpreter is instrumentable in pure
+  Julia), mutate code that is dead on that input, and require
+  `interp(P) == interp(P′)`. A second oracle orthogonal to
+  compiled-vs-interpreted. Biggest lift of anything here.
+- **Determinism taint + relation observations** (`determinism.md` §5): a
+  `det` bit in `TySum`; tainted values (`objectid`, pointers, `gensym`)
+  observed as *relations* rather than values — identity semantics becomes
+  testable while the values never compare.
+- **Schedule-invariant task subset** (`determinism.md` §7): `@sync`/`@async`
+  with observables independent of interleaving by construction — sound with
+  no determinization infrastructure at all.
+- **LLM-seeded corpus**: generality without rule-authoring; the
+  certification gate decides what is admitted, so the oracle stack doesn't
+  care about provenance.
+- **Explicit non-item: whole-system deterministic execution**
+  (Antithesis/Hermit-style hypervisors). Wrong layer for a two-engine
+  oracle — determinism is not agreement; see `determinism.md` §2. rr for
+  crash repro (item 1) is the part of that toolbox worth having.
 
 ### Still-open grammar gaps
 
