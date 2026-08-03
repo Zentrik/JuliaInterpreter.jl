@@ -2,7 +2,10 @@
 
 struct Verdict
     class::Symbol   # :agree | :aborted | :nondet_discard | :value_divergence |
-                    # :exception_divergence | :interp_only_throw | :ref_only_throw
+                    # :exception_divergence | :interp_only_throw | :ref_only_throw |
+                    # :compiler_interp_divergence | :julia_engine_divergence
+                    # (the last two are three-way adjudication classes; see
+                    # threeway/engine_divergence at the bottom of this file)
     detail::String
     refexc::Symbol
     intexc::Symbol
@@ -139,8 +142,15 @@ nondetverdict(side::Symbol) =
                             "interpreted side disagreed with itself on re-run",
             :none, :none, 0)
 
+# Is this a *JuliaInterpreter* finding — something to dedup, shrink and write to
+# findings/? Excludes the tracked non-findings (agree/aborted/nondet_discard) and
+# the two three-way classes: :compiler_interp_divergence is not a JuliaInterpreter
+# bug at all (the mode matched Julia's own interpreter, only the compiler differs),
+# and :julia_engine_divergence is a *Julia* finding written to its own bucket by
+# the driver, never through the ordinary finding path.
 isfinding(v::Verdict) =
-    v.class !== :agree && v.class !== :aborted && v.class !== :nondet_discard
+    v.class !== :agree && v.class !== :aborted && v.class !== :nondet_discard &&
+    v.class !== :compiler_interp_divergence && v.class !== :julia_engine_divergence
 
 # Deduplication key. Deliberately excludes the divergence index (it moves
 # under shrinking) and any message text (it drifts across Julia versions), but
@@ -238,4 +248,71 @@ function confirmreport(origsrc::String, shrunksrc::String, fp::String; nstmts::I
     origsrc == shrunksrc && return nothing
     confirmsrc(origsrc, fp; nstmts, interp) && return origsrc
     return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Three-way adjudication (DESIGN.md oracle section)
+#
+# The four engines: C = compiled Julia (run_ref), rec/cmp = JuliaInterpreter
+# (run_interp), JI = Julia's built-in interpreter under --compile=min (run_ji,
+# ji.jl). C, rec and cmp always run; JI runs LAZILY, only after a SUT mode has
+# already diverged from C, because the compiler defers *nothing* while any
+# interpreter defers the class-U checks — so a C-vs-mode divergence might be a
+# real JuliaInterpreter bug or merely the compiler-vs-interpreter difference that
+# JI, being Julia's *own* interpreter, exhibits too.
+#
+# The comparison used for every engine pair is `outcomeeq` — the same status +
+# exception-name + observation-stream (elementwise and length) equality the
+# confirm-on-divergence gate uses, so "agrees with" means agrees in exactly the
+# dimensions `classify` looks at.
+#
+# Order of the whole pipeline (unchanged safety net first):
+#   classify(C, mode) -> confirm (nondet filter) -> threeway (JI adjudication)
+# The confirm gate still runs *before* JI, so a nondeterministic candidate is a
+# nondet_discard and never reaches the adjudicator.
+
+"""
+    threeway(v, ref, int, ji) -> Verdict
+
+Reclassify a confirmed C-vs-mode finding `v` using JI's outcome:
+
+- `ji === nothing` (JI unavailable — timeout/crash): return `v` unchanged. Never
+  hide a real divergence behind an engine that could not answer.
+- `outcomeeq(int, ji)` (the mode matches Julia's own interpreter, only the
+  compiler differs): `:compiler_interp_divergence` — a compiler-vs-interpreter
+  difference, not a JuliaInterpreter bug. Counted in stats, never written as a
+  JuliaInterpreter finding.
+- otherwise (the mode matches neither C nor JI): return `v` unchanged — a real
+  JuliaInterpreter bug, reported as today.
+"""
+function threeway(v::Verdict, ref::Outcome, int::Outcome, ji::Union{Outcome,Nothing})::Verdict
+    ji === nothing && return v
+    outcomeeq(int, ji) || return v
+    return Verdict(:compiler_interp_divergence, v.detail, v.refexc, v.intexc,
+                   v.dividx, v.refsig, v.intsig)
+end
+
+"""
+    engine_divergence(ref, ji) -> Bool
+
+Do Julia's two OWN engines disagree — compiled (`ref`) versus the built-in
+interpreter (`ji`)? True means this candidate is a `:julia_engine_divergence`: a
+Julia bug OR a known class-U compiler/interpreter difference, not a
+JuliaInterpreter bug. Written to a separate findings bucket for triage. `nothing`
+(JI unavailable) is never a divergence.
+"""
+engine_divergence(ref::Outcome, ji::Union{Outcome,Nothing}) =
+    ji !== nothing && !outcomeeq(ref, ji)
+
+"""
+    julia_verdict(ref, ji) -> Verdict
+
+A `:julia_engine_divergence` verdict describing how compiled Julia and the
+built-in interpreter differ, built from `classify(ref, ji)` so it carries the
+same exception-name / observation-shape granularity the fingerprint needs.
+"""
+function julia_verdict(ref::Outcome, ji::Outcome)::Verdict
+    base = classify(ref, ji)
+    return Verdict(:julia_engine_divergence, base.detail, base.refexc, base.intexc,
+                   base.dividx, base.refsig, base.intsig)
 end
