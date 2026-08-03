@@ -1,12 +1,16 @@
 # Nightly differential fuzzing of JuliaInterpreter (fuzz/, NEXT.md item 7).
 #
-# Two lanes:
+# Three lanes (campaigns run at -O1 — faster, and it sidesteps the codegen-
+# induced GC-corruption crash; see fuzz/longrun.sh):
 #   - '1.12' (required): the supported Julia. New findings turn this lane red.
-#   - 'pre' (continue-on-error): the NEXT Julia, where JuliaInterpreter's bug
-#     density historically concentrates. A red pre lane is early warning of
-#     upcoming breakage, not a bug in current code. The selftest acts as a
-#     support gate: if the harness itself does not pass on 'pre', the job stops
-#     there — campaign findings are never produced on an unsupported Julia.
+#   - 'pre' (continue-on-error): the upcoming release (RC/beta).
+#   - 'nightly' (continue-on-error): Julia master — earliest warning of an
+#     interpreter break or a codegen/GC regression.
+# The forward lanes are advisory: JuliaInterpreter's bug density historically
+# concentrates on new Julias, so a red pre/nightly lane is early warning of
+# upcoming breakage, not a bug in current code. The selftest is a support gate:
+# if the harness does not pass on a lane's Julia, the job stops there, so
+# campaign findings are never produced on an unsupported Julia.
 #
 # Findings (fuzz/findings/ is gitignored, so a checkout starts empty), the
 # longrun logs and any crash-journal evidence are always uploaded as artifacts;
@@ -30,7 +34,9 @@ jobs:
   fuzz:
     name: Fuzz Julia ${{ matrix.version }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.version == 'pre' }}
+    # Only the supported release lane (1.12) is required; the forward-looking
+    # lanes are advisory early warning, so their failures never fail the workflow.
+    continue-on-error: ${{ matrix.version != '1.12' }}
     # duration (default 3 h) + up to ~30 min of longrun batch overshoot
     # + setup/selftest/upload, comfortably under GitHub's 6 h job limit.
     timeout-minutes: 350
@@ -38,8 +44,10 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.12'   # required lane
-          - 'pre'    # early-warning lane on the upcoming Julia
+          - '1.12'      # required lane, the supported release
+          - 'pre'       # early warning: the upcoming release (RC/beta)
+          - 'nightly'   # earliest warning: Julia master, where a GC/codegen
+                        # regression or an interpreter break shows up first
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,9 +61,9 @@ jobs:
       - name: Instantiate the fuzz environment
         run: julia --project=fuzz -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
       - name: Support gate (fuzz selftest)
-        # A failure here ends the job before any campaign runs: on 'pre' that
-        # means "this Julia is not supported yet", and continue-on-error keeps
-        # the workflow green while the lane itself is marked failed.
+        # A failure here ends the job before any campaign runs: on 'pre'/'nightly'
+        # that means "this Julia is not supported yet", and continue-on-error
+        # keeps the workflow green while the lane itself is marked failed.
         run: julia --project=fuzz fuzz/run.jl --selftest
       - name: Snapshot findings
         run: |
@@ -72,9 +80,9 @@ jobs:
           # Distinct per-run seed offset so each night explores NEW programs
           # instead of re-testing the same sequence. The +1000000 band sits
           # above local runs' default (bash $RANDOM, 0..32767) so CI and laptop
-          # campaigns never overlap. Both matrix lanes share this base on
-          # purpose: 1.12 and the pre-release test identical programs, so the
-          # only variable is the Julia version.
+          # campaigns never overlap. All matrix lanes share this base on
+          # purpose: the Julia versions test identical programs, so the only
+          # variable is the Julia version.
           export SEED_BASE=$(( 1000000 + RUN_NUMBER ))
           ./fuzz/longrun.sh "$DURATION"
       - name: Upload findings
