@@ -328,7 +328,9 @@ function evaluate_call!(interp::Interpreter, frame::Frame, call_expr::Expr, ente
 end
 function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
     if fargs[1] === Core.eval
-        return Core.eval(fargs[2], fargs[3])  # not a builtin, but worth treating specially
+        # not a builtin, but worth treating specially; splat so that a wrong-arity
+        # call raises the native MethodError rather than a BoundsError on fargs
+        return Core.eval(fargs[2:end]...)
     elseif fargs[1] === Base.rethrow
         if length(fargs) > 1
             exc = fargs[2]

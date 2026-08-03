@@ -1807,3 +1807,14 @@ end
         @test err_interp.msg == err_native.msg
     end
 end
+
+@testset "Core.eval arity errors match native" begin
+    ce_va(a...) = Core.eval(a...)
+    @test (@interpret ce_va(Main, :(1 + 1))) === 2
+    for badargs in ((), (Main,), (Main, :(1 + 1), 42))
+        err_native = try ce_va(badargs...); nothing catch err; err end
+        err_interp = try @interpret ce_va(badargs...); nothing catch err; err end
+        @test err_native isa MethodError
+        @test typeof(err_interp) === typeof(err_native)
+    end
+end
