@@ -631,6 +631,71 @@ end
         @test nvalue >= 25
     end
 
+    @testset "builtin prober: optimizer barriers defer probes to runtime" begin
+        # Probe arguments are wrapped in `Base.compilerbarrier(:const, …)` at
+        # render time so the compiled reference cannot constant-fold the call and
+        # must defer to the runtime builtin/intrinsic — matching the interpreter.
+        # Constant-required slots (cast target types, atomic orderings, module
+        # refs, the memoryref boundscheck flag) must stay BARE, or the reference
+        # gets a NEW compile-time error / loses a safety guarantee.
+        guard(s) = "(try $s catch __e; (:__thrown, nameof(typeof(__e))) end)"
+
+        # (a) A mismatched-type numeric-intrinsic call — the const-fold class-U
+        #     window — agrees under barriers: both engines defer to the runtime
+        #     intrinsic and raise the same ErrorException, instead of the
+        #     reference folding the constant operands to a compile-time TypeError.
+        bmis = "Core.Intrinsics.add_int(Base.compilerbarrier(:const, Int8(1)), " *
+               "Base.compilerbarrier(:const, 2))"
+        rmis = run_both("__obs__($(guard(bmis)))"; nstmts=200_000)
+        @test rmis !== nothing
+        refm, intm = rmis
+        @test classify(refm, intm).class === :agree
+        @test refm.obs == Any[(:__thrown, :ErrorException)]
+
+        # (b) Validity by construction is preserved, barriers are actually
+        #     emitted, and NO constant-required slot is ever barriered.
+        ordpats = [Regex("compilerbarrier\\(:const, " *
+                         replace(o, "(" => "\\(", ")" => "\\)") * "[,)]")
+                   for o in FuzzJI.PROBE_ORDERINGS]
+        castre = Regex("(?:" * join(String.(collect(FuzzJI.CAST_INTRINSICS)), "|") *
+                       ")\\(Base\\.compilerbarrier")
+        nlowerfail = 0; nbarriers = 0
+        castbad = 0; fencebad = 0; ordbad = 0; bcbad = 0
+        for seed in 1:200
+            src = render(FuzzJI.genprogram_policy(Xoshiro(seed), Cfg(), :builtins))
+            FuzzJI.parsegate(src) === nothing && (nlowerfail += 1)
+            nbarriers += count(_ -> true, eachmatch(r"Base\.compilerbarrier\(:const,", src))
+            occursin(castre, src) && (castbad += 1)
+            occursin(r"atomic_fence\(Base\.compilerbarrier", src) && (fencebad += 1)
+            occursin(r"memoryref[a-z_!]*\([^\n]*compilerbarrier\(:const, true", src) && (bcbad += 1)
+            any(p -> occursin(p, src), ordpats) && (ordbad += 1)
+        end
+        @test nlowerfail == 0        # validity by construction still holds
+        @test nbarriers > 200        # barriers are genuinely being emitted
+        @test castbad == 0           # cast target Types never barriered
+        @test fencebad == 0          # atomic_fence ordering never barriered
+        @test ordbad == 0            # atomic ordering symbols never barriered
+        @test bcbad == 0             # memoryref boundscheck flag never barriered
+
+        # the slot predicate, unit-level
+        @test FuzzJI.probe_arg_mustbeliteral("Core.Intrinsics.trunc_int", 1, FuzzJI.psrc("Int8"))
+        @test !FuzzJI.probe_arg_mustbeliteral("Core.Intrinsics.trunc_int", 2, FuzzJI.psrc("300"))
+        @test FuzzJI.probe_arg_mustbeliteral("Core.Intrinsics.atomic_fence", 1, FuzzJI.psrc(":acquire"))
+        @test FuzzJI.probe_arg_mustbeliteral("Core.getfield", 3, FuzzJI.psrc(":not_atomic"))
+        @test FuzzJI.probe_arg_mustbeliteral("Core.getglobal", 1, FuzzJI.psrc("Base"))
+        @test !FuzzJI.probe_arg_mustbeliteral("Core.Intrinsics.add_int", 1, FuzzJI.psrc("1"))
+
+        # (c) Value-preserving: a valid recipe'd probe still returns its value
+        #     under barriers (`:const` passes the argument through unchanged).
+        vsrc = "Core.getfield(Base.compilerbarrier(:const, (10, 20, 30)), " *
+               "Base.compilerbarrier(:const, 2))"
+        rv = run_both("__obs__($(guard(vsrc)))"; nstmts=200_000)
+        @test rv !== nothing
+        refv, intv = rv
+        @test classify(refv, intv).class === :agree
+        @test refv.obs == Any[20]
+    end
+
     @testset "stepping axis agrees with plain interpretation" begin
         # The step axis asserts three invariants: stepping terminates, raises no
         # error from JuliaInterpreter's own code, and reaches the same

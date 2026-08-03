@@ -273,6 +273,28 @@ divergences also surfaced (`_apply_iterate` with a non-`iterate` first
 argument, `compilerbarrier` with an unknown setting) — both unreachable from
 lowered code, both now confined to recipes.
 
+**Optimizer barriers on probe arguments (landed).** Every probe argument is now
+wrapped in `Base.compilerbarrier(:const, …)` at render time (`render.jl`, the
+`:probe` branch; the exclusion predicate is `probe_arg_mustbeliteral` in
+`probes.jl`). The barrier passes the value through unchanged but blocks constant
+propagation, so the compiled reference cannot fold the call and defers to the
+runtime builtin/intrinsic — matching the interpreter. This closes the
+optimization-dependent class-U where the reference folds constant operands to a
+*compile-time* error (mismatched-type integer operands, invalid ordering) while
+the interpreter reaches the runtime error, and it spares the three-way JI
+adjudicator a subprocess for divergences that no longer arise. `:const` is
+type-preserving, so valid calls still return their value. Constant-required
+slots stay bare — cast-intrinsic target `Type`s, atomic ordering symbols
+(`atomic_fence` + the field/global/memoryref families), module refs to the
+global-binding builtins, and the `memoryref*` boundscheck flag — a barrier there
+would be a new compile-time error or a lost safety guarantee. Because the
+reference now defers, the mismatched-operand arm of the numeric intrinsics
+(`sametype_intargs`/`sametype_floatargs`) is re-enabled on a fraction of draws:
+verified with 286 barriered mismatched calls through `run_both`, 0 divergences.
+The selftest asserts (a) a mismatched-type intrinsic agrees under barriers, (b)
+200 probe-heavy seeds all lower with 0 constant-required slots barriered, and
+(c) a valid recipe'd probe still returns its value.
+
 Closing evidence: 1500 probe-heavy candidates (native engine, `builtins`
 policy, both interpreter modes) through a restart-looping subprocess soak with
 the journal armed. Three process deaths, all reference-side Julia defects with
@@ -518,7 +540,7 @@ never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # ~336 assertions, ~2min
+julia --project=fuzz fuzz/run.jl --selftest              # 372 assertions, ~2min
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/coverage.jl --n 20             # what a campaign reaches (smoke)
 julia --project=fuzz fuzz/coverage.jl --n 400 --shards 2 \

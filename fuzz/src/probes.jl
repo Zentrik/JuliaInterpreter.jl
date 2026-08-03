@@ -321,6 +321,54 @@ const PROBE_ORDERINGS = String[
     ":acquire_release", ":sequentially_consistent",
 ]
 
+# ---------------------------------------------------------------------------
+# Optimizer barriers on probe arguments (DESIGN.md, prober section).
+#
+# `Base.compilerbarrier(:const, x)` passes `x` through unchanged but blocks
+# constant propagation, so the compiled reference cannot constant-fold the call
+# and must defer to the runtime builtin/intrinsic — exactly what the interpreter
+# always does. Barriering a probe's arguments therefore (1) closes the class-U
+# false-positive window where the reference folds constant operands to a
+# *compile-time* error (a TypeError raised while the thunk is compiled, outside
+# the program's own `try`) while the interpreter defers to the runtime intrinsic
+# (an ErrorException), and (2) removes the reason the JI subprocess would have to
+# adjudicate the divergence, since no divergence arises. `:const` is chosen over
+# `:type`/`inferencebarrier` because it is *type*-preserving: a valid call stays
+# valid and returns the same value, so barriers are value-preserving.
+#
+# The wrapping happens at render time (render.jl, the :probe branch); this
+# predicate names the argument slots that must stay BARE literals instead.
+# A barrier on one of these is worse than the class-U it removes — either a NEW
+# compile-time error on the reference side, or a lost safety guarantee:
+#
+#   * CAST_INTRINSICS first arg — the target Type. Codegen reads the target
+#     width from this slot; it must be a literal.
+#   * atomic_fence — its sole argument is the memory ordering.
+#   * atomic ordering symbols anywhere (the getfield/setfield!/swapfield!/…
+#     field family, the *global family, and the memoryref* family all pass a
+#     trailing ordering symbol) — kept literal so the ordering-dispatch phase is
+#     the same on both sides.
+#   * module references handed to the global-binding builtins (Base/Core/Main/
+#     the program's own module) — left literal, there is no folding to defer and
+#     no reason to perturb binding resolution.
+#   * the memoryref* boundscheck flag (a literal `true`/`false`) — memory
+#     safety: the recipes pass a literal `true` so an out-of-range index can
+#     only ever raise BoundsError; that guarantee must not be weakened.
+const PROBE_MODULE_LITERALS = Set{String}(["Base", "Core", "Main", "(@__MODULE__)"])
+
+function probe_arg_mustbeliteral(spelling::AbstractString, slot::Int, arg::Ex)::Bool
+    name = Symbol(last(split(spelling, '.')))
+    name in CAST_INTRINSICS && slot == 1 && return true
+    name === :atomic_fence && return true
+    if arg.kind === :src
+        s = strip(arg.meta::String)
+        s in PROBE_ORDERINGS && return true
+        s in PROBE_MODULE_LITERALS && return true
+        startswith(String(name), "memoryref") && (s == "true" || s == "false") && return true
+    end
+    return false
+end
+
 psrc(s::AbstractString) = Ex(:src, AnyT(), String(s))
 # A reference to something the *program* defines (a struct type, a generated
 # function). Rendered like `psrc` would render it, but as a `:var` node, so
@@ -809,23 +857,35 @@ end
 
 # A binary/n-ary numeric intrinsic requires *all* operands to share one type.
 # Drawing each operand independently (an Int64 leaf here, an Int8(3) there) makes
-# a mismatched call, and a mismatch is a class-U false positive, not an
-# interpreter bug: when the reference can constant-fold the operands it validates
-# the type mismatch at *compile time* and raises a TypeError from inside the
-# thunk (outside the program's `try`), while the interpreter defers to the
-# runtime intrinsic and raises an ErrorException — and which happens depends on
-# optimization. Pick one type for the whole call so the arms still see success
-# paths without manufacturing that divergence. (Same shape as the atomic-ordering
-# fix: don't feed intrinsics arguments the reference rejects at a different phase
-# than the interpreter.)
+# a mismatched call. Without barriers a mismatch was a class-U false positive,
+# not an interpreter bug: when the reference could constant-fold the operands it
+# validated the type mismatch at *compile time* and raised a TypeError from
+# inside the thunk (outside the program's `try`), while the interpreter deferred
+# to the runtime intrinsic and raised an ErrorException — and which happened
+# depended on optimization. That fold requires constant *values*; the probe
+# argument barrier (`Base.compilerbarrier(:const, …)`, render.jl) blocks
+# constant propagation, so the reference can no longer fold and both engines
+# raise the same runtime ErrorException. RE-ENABLED under barriers: a fraction of
+# calls now draw mixed operand types on purpose, exercising the mismatched-type
+# dispatch arm the same-type-only fix had to exclude. Verified: 286 barriered
+# mismatched numeric-intrinsic calls through run_both, 0 divergences. The
+# majority stays same-typed so the arms still see success paths (real arithmetic,
+# not only the error arm).
+intmixarg(ctx::Ctx) = psrc(pick(ctx.rng,
+    ["1", "Int8(1)", "Int16(2)", "Int32(3)", "Int64(4)", "UInt8(5)", "UInt32(6)"]))
+floatmixarg(ctx::Ctx) = psrc(pick(ctx.rng,
+    ["1.5", "1.0f0", "Float16(2.0)", "2.0", "Float32(3.0)"]))
 function sametype_intargs(ctx::Ctx, nargs::Int)
     rng = ctx.rng
+    # mixed widths/signs — safe only because every operand is barriered
+    nargs >= 2 && rand(rng) < 0.3 && return Ex[intmixarg(ctx) for _ in 1:nargs]
     rand(rng) < 0.5 && return Ex[genleaf(ctx, IntT) for _ in 1:nargs]   # all Int64
     T = pick(rng, INT_TYPE_LITERALS)
     return Ex[psrc(string(T, "(", pick(rng, ("0", "1", "2", "3", "7")), ")")) for _ in 1:nargs]
 end
 function sametype_floatargs(ctx::Ctx, nargs::Int)
     rng = ctx.rng
+    nargs >= 2 && rand(rng) < 0.3 && return Ex[floatmixarg(ctx) for _ in 1:nargs]
     rand(rng) < 0.5 && return Ex[genleaf(ctx, FloatT) for _ in 1:nargs]  # all Float64
     T = pick(rng, FLOAT_TYPE_LITERALS)
     return Ex[psrc(string(T, "(", pick(rng, ("0.0", "1.5", "2.0", "NaN", "Inf")), ")")) for _ in 1:nargs]

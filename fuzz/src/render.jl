@@ -57,7 +57,22 @@ function render(e::Ex)::String
         # `spelling(args...)`. The spelling comes from the reflection
         # enumeration in probes.jl, so it is always a resolvable callee on the
         # Julia version generating the program; the caller wraps it in a :guard.
-        return (e.meta::String) * "(" * join(map(render, e.kids), ", ") * ")"
+        #
+        # Each argument is wrapped in `Base.compilerbarrier(:const, …)` unless
+        # the slot must stay a bare literal (cast target types, atomic
+        # orderings, module refs, the memoryref boundscheck — see
+        # `probe_arg_mustbeliteral`). The barrier forces the compiled reference
+        # to defer to the runtime builtin/intrinsic, matching the interpreter
+        # and closing the constant-folding class-U false-positive window.
+        spelling = e.meta::String
+        parts = String[]
+        for (i, kid) in enumerate(e.kids)
+            s = render(kid)
+            probe_arg_mustbeliteral(spelling, i, kid) ||
+                (s = "Base.compilerbarrier(:const, " * s * ")")
+            push!(parts, s)
+        end
+        return spelling * "(" * join(parts, ", ") * ")"
     elseif k === :rng
         # A draw from the program's own `__RNG__` (e.g. `rand(__RNG__, Int)`).
         # The RNG object is seeded from a literal baked into both modules, so
