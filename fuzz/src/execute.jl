@@ -231,6 +231,10 @@ end
 
 # Run the reference once and the interpreted side once per mode.
 # Returns nothing (discarded) or (ref, [(mode, Outcome), ...]).
+#
+# One run of each side is what the *oracle* consumes; it is not what a *finding*
+# is allowed to rest on. The confirm-on-divergence gate (`confirm`/`confirmed`,
+# classify.jl) re-runs each side before any divergence is reported.
 function run_all(src::String; nstmts::Int, modes::Tuple=(:rec, :cmp))
     ex = parsegate(src)
     ex === nothing && return nothing

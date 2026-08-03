@@ -9,6 +9,11 @@ Base.@kwdef mutable struct Stats
     findings::Int = 0
     duplicates::Int = 0
     suppressed::Int = 0
+    # Candidate divergences dropped by the confirm-on-divergence gate because a
+    # side disagreed with itself on re-run (classify.jl). Counted per divergence,
+    # like findings/duplicates; a case that only produced these is rolled up out
+    # of `agreed`, so a rising nondet rate cannot hide inside the agreement rate.
+    nondet_discard::Int = 0
 end
 
 # Known, already-reported divergences go here so reruns surface only news.
@@ -103,40 +108,60 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                 continue
             end
             ref, intruns = r
-            anyaborted = anyfinding = false
+            anyaborted = anyfinding = anynondet = false
             for (mode, int) in intruns
-                v = classify(ref, int)
+                # Confirm-on-divergence: a candidate finding only stays one if
+                # both sides reproduce themselves (classify.jl). Costs nothing
+                # unless `classify` already saw a divergence.
+                v = confirmed(classify(ref, int), src, ref, int;
+                              nstmts, interp=modeinterp(mode))
                 if v.class === :agree
                     continue
                 elseif v.class === :aborted
                     anyaborted = true
+                elseif v.class === :nondet_discard
+                    anynondet = true
+                    stats.nondet_discard += 1
+                    @debug "nondet_discard" mode seed detail = v.detail
                 elseif suppressed(v)
                     anyfinding = true
                     stats.suppressed += 1
                 else
-                    anyfinding = true
                     fp = tagfp(mode, fingerprint(v))
                     if fp in seen
+                        anyfinding = true
                         stats.duplicates += 1
                     else
-                        push!(seen, fp)
-                        stats.findings += 1
                         @info "FINDING $(v.class)" mode seed fp detail = first(v.detail, 300)
                         shrunk = doshrink ?
                             shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode),
                                    budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)) :
                             prog
-                        dir = writefinding(outdir, fp, v, seed, src, render(shrunk); mode)
-                        @info "  reported" dir nstatements_orig = nstatements(prog) nstatements_shrunk = nstatements(shrunk)
+                        # Re-confirm what is actually about to be written: the
+                        # shrinker checked each edit once, and once is what the
+                        # gate exists to distrust.
+                        reportsrc = confirmreport(src, render(shrunk), fingerprint(v);
+                                                  nstmts, interp=modeinterp(mode))
+                        if reportsrc === nothing
+                            anynondet = true
+                            stats.nondet_discard += 1
+                            @warn "  not reported: neither the shrunk nor the original program confirmed on re-run" fp seed
+                        else
+                            anyfinding = true
+                            push!(seen, fp)
+                            stats.findings += 1
+                            dir = writefinding(outdir, fp, v, seed, src, reportsrc; mode)
+                            @info "  reported" dir nstatements_orig = nstatements(prog) nstatements_shrunk = nstatements(shrunk) shrunk_confirmed = (reportsrc == render(shrunk))
+                        end
                     end
                 end
             end
             # per-case rollup: a case counts once, worst class wins
-            anyfinding ? nothing : anyaborted ? (stats.aborted += 1) : (stats.agreed += 1)
+            (anyfinding || anynondet) ? nothing : anyaborted ? (stats.aborted += 1) : (stats.agreed += 1)
             if progress > 0 && i % progress == 0
                 rate = round(stats.cases / (time() - t0); digits=1)
                 abortpct = round(100 * stats.aborted / max(1, stats.cases); digits=1)
-                @info "progress" i rate_per_s = rate abort_pct = abortpct stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates
+                @info "progress" i rate_per_s = rate abort_pct = abortpct stats.agreed stats.aborted stats.nondet_discard stats.discarded stats.findings stats.duplicates
             end
         end
     finally

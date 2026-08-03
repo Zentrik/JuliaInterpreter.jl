@@ -1,8 +1,8 @@
 # The oracle: compare the two Outcomes and classify any divergence.
 
 struct Verdict
-    class::Symbol   # :agree | :aborted | :value_divergence | :exception_divergence |
-                    # :interp_only_throw | :ref_only_throw
+    class::Symbol   # :agree | :aborted | :nondet_discard | :value_divergence |
+                    # :exception_divergence | :interp_only_throw | :ref_only_throw
     detail::String
     refexc::Symbol
     intexc::Symbol
@@ -43,6 +43,19 @@ obseq(@nospecialize(a), @nospecialize(b)) = typeof(a) === typeof(b) && isequal(a
 obseq(a::Tuple, b::Tuple) = length(a) == length(b) && all(obseq(x, y) for (x, y) in zip(a, b))
 obseq(a::Vector{Any}, b::Vector{Any}) =
     length(a) == length(b) && all(obseq(x, y) for (x, y) in zip(a, b))
+
+# Outcome equality for the confirm-on-divergence gate (bottom of this file):
+# does a *re-run of the same side* reproduce what the first run of that side did?
+# Deliberately built from the same comparison helpers the oracle uses, so
+# "stable" means stable in exactly the dimensions `classify` looks at: status,
+# exception name, and the observation stream (elementwise plus length —
+# `firstdiff` alone would call a stream and its own prefix equal).
+#
+# Messages and backtraces are not compared, for the same reason `classify`
+# ignores them: they drift without the semantics changing.
+outcomeeq(a::Outcome, b::Outcome) =
+    a.status === b.status && a.excname === b.excname &&
+    length(a.obs) == length(b.obs) && firstdiff(a.obs, b.obs) == 0
 
 # First index where the observation streams disagree; 0 if one is a prefix of
 # the other.
@@ -116,7 +129,18 @@ function divdetail(ref::Outcome, int::Outcome, i::Int)
     return "obs[$i]: ref=$(first(r, 200)) interp=$(first(t, 200))"
 end
 
-isfinding(v::Verdict) = v.class !== :agree && v.class !== :aborted
+# A candidate divergence that did not survive the confirm-on-divergence gate:
+# one of the two sides disagreed with *itself* on a re-run, so the difference
+# the oracle saw says nothing about the interpreter. Tracked like `:aborted` —
+# counted in campaign stats, never deduped, shrunk or reported.
+nondetverdict(side::Symbol) =
+    Verdict(:nondet_discard,
+            side === :ref ? "reference side disagreed with itself on re-run" :
+                            "interpreted side disagreed with itself on re-run",
+            :none, :none, 0)
+
+isfinding(v::Verdict) =
+    v.class !== :agree && v.class !== :aborted && v.class !== :nondet_discard
 
 # Deduplication key. Deliberately excludes the divergence index (it moves
 # under shrinking) and any message text (it drifts across Julia versions), but
@@ -126,3 +150,92 @@ isfinding(v::Verdict) = v.class !== :agree && v.class !== :aborted
 fingerprint(v::Verdict) =
     string(v.class, "-",
            string(hash((v.class, v.refexc, v.intexc, v.refsig, v.intsig)), base=16)[1:min(8, end)])
+
+# ---------------------------------------------------------------------------
+# Confirm-on-divergence (determinism.md §6)
+#
+# A finding used to be reported after exactly one reference run and one
+# interpreted run, which makes any nondeterminism anywhere — a grammar rule
+# that reaches an address-derived value, a prelude oversight, a corpus fragment
+# consuming a process counter — indistinguishable from an interpreter bug.
+#
+# So before a divergence is allowed to become a finding, each side is asked to
+# reproduce *itself*: rerun the reference and compare against the reference
+# outcome the verdict was built from; if that is stable, rerun the interpreted
+# side in the same mode and compare likewise. A side that disagrees with itself
+# means the candidate is nondeterministic and the verdict is not about the
+# interpreter — `nondet_discard`, tracked next to `aborted`, never reported.
+#
+# The reference goes first because it is the cheap side and because it is the
+# more common source of the problem (the interpreted side runs the same
+# generated code, just slower). Cost lands only on divergences, so the
+# agreement path — every candidate but a handful — pays nothing.
+
+"""
+    confirm(src, ref, int; nstmts, interp) -> Symbol
+
+Re-run each side of a candidate divergence, in order, and report the first one
+that fails to reproduce its own outcome: `:nondet_ref`, `:nondet_interp`, or
+`:stable` if both agree with themselves.
+"""
+function confirm(src::String, ref::Outcome, int::Outcome; nstmts::Int,
+                 interp::Interpreter=RecursiveInterpreter())::Symbol
+    ex = parsegate(src)
+    # Unreachable in practice (the caller only has outcomes because the same
+    # source passed the gate), but "cannot re-run it" must mean "cannot confirm
+    # it", never "report it unconfirmed".
+    ex === nothing && return :nondet_ref
+    outcomeeq(ref, run_ref(ex)) || return :nondet_ref
+    outcomeeq(int, run_interp(ex; nstmts, interp)) || return :nondet_interp
+    return :stable
+end
+
+"""
+    confirmed(v, src, ref, int; nstmts, interp) -> Verdict
+
+The gate as a verdict transformer: findings that survive confirmation are
+returned unchanged, findings that do not become `:nondet_discard`, and
+non-findings (`:agree`/`:aborted`) pass through without paying for a re-run.
+"""
+function confirmed(v::Verdict, src::String, ref::Outcome, int::Outcome; nstmts::Int,
+                   interp::Interpreter=RecursiveInterpreter())::Verdict
+    isfinding(v) || return v
+    st = confirm(src, ref, int; nstmts, interp)
+    st === :stable && return v
+    return nondetverdict(st === :nondet_ref ? :ref : :interp)
+end
+
+"""
+    confirmsrc(src, fp; nstmts, interp) -> Bool
+
+Confirmation from source alone: run both sides, require a finding with
+fingerprint `fp`, then require both sides to reproduce themselves. Used after
+shrinking, where the outcomes the verdict was built from belong to a *different*
+program than the one about to be written to `findings/`.
+"""
+function confirmsrc(src::String, fp::String; nstmts::Int,
+                    interp::Interpreter=RecursiveInterpreter())::Bool
+    r = run_both(src; nstmts, interp)
+    r === nothing && return false
+    ref, int = r
+    v = classify(ref, int)
+    (isfinding(v) && fingerprint(v) == fp) || return false
+    return confirm(src, ref, int; nstmts, interp) === :stable
+end
+
+"""
+    confirmreport(origsrc, shrunksrc, fp; nstmts, interp) -> String | nothing
+
+Last gate before `writefinding`. Prefers the shrunk program; falls back to the
+pre-shrink one if shrinking landed on something that no longer confirms (the
+shrinker only checks the fingerprint once per edit, so it can walk into a
+flaky neighbour); returns `nothing` when neither confirms, which is a
+`nondet_discard` — the finding is not written.
+"""
+function confirmreport(origsrc::String, shrunksrc::String, fp::String; nstmts::Int,
+                       interp::Interpreter=RecursiveInterpreter())
+    confirmsrc(shrunksrc, fp; nstmts, interp) && return shrunksrc
+    origsrc == shrunksrc && return nothing
+    confirmsrc(origsrc, fp; nstmts, interp) && return origsrc
+    return nothing
+end

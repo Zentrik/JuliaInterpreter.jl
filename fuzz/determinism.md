@@ -281,8 +281,10 @@ comparable. The complementary strategy: emit more, and *measure*
 determinism where proof is unavailable. Two gates, cheapest first:
 
 **Confirm-on-divergence (do this first, it makes everything else safe).**
-Today a finding is reported after one ref run and one interp run
-(`run_all`, `execute.jl:204-209`). Add: when `classify` produces a finding,
+*Implemented — see `classify.jl`'s `confirm`/`confirmed` and `DESIGN.md`; the
+description below is the design it was built to.*
+A finding used to be reported after one ref run and one interp run
+(`run_all`, `execute.jl`). Add: when `classify` produces a finding,
 rerun the reference; if `ref₂` disagrees with `ref₁`, classify
 `nondet_discard` (tracked alongside `aborted`, never reported). Else rerun
 the interpreted side; unstable → same discard. Only *stable* divergences
@@ -378,8 +380,10 @@ widening of this oracle.
 
 ## 9. Ordered plan
 
-1. **Confirm-on-divergence gate** (hours; `driver.jl`/`classify.jl`; new
-   tracked class `nondet_discard`). Safety net for everything below.
+1. **Confirm-on-divergence gate** — **done** (`classify.jl`:
+   `confirm`/`confirmed`/`confirmsrc`/`confirmreport`, wired into `driver.jl`
+   and `supposition.jl`; new tracked class `nondet_discard`, counted next to
+   `aborted` in campaign stats). Safety net for everything below.
 2. **`__RNG__` + rand rules; `Dict`/`Set` with content-hashed keys**
    (a day). Zero-infrastructure grammar width: data-dependent control flow,
    associative containers under the full oracle.

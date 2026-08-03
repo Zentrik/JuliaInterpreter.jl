@@ -51,6 +51,19 @@ restart loop; `fuzz/journal/current.jl` always holds the candidate that was
 executing, written and fsync'd *before* execution, so even a segfault leaves a
 reproducer.
 
+`fuzz/triage.jl` is the first thing to run on any of them:
+
+```sh
+julia --project=fuzz fuzz/triage.jl fuzz/findings/<dir>/     # or any candidate .jl
+```
+
+It runs each side alone in its own `julia` under a timeout, so *which side
+broke* is answered by exit status rather than by reading a backtrace, and — if
+the reference side is what broke — re-runs it under the newest installed Julia
+(`julia +release`) to answer "already fixed upstream?" before anyone starts
+minimizing. A reference-side crash is a **Julia** bug, not a JuliaInterpreter
+one. Given a findings directory it also writes `triage.md` there.
+
 ## Architecture
 
 ```
@@ -216,6 +229,7 @@ fingerprint. Verdict classes:
 | `exception_divergence` | both threw, different exception types (messages are allowed to drift) |
 | `interp_only_throw` / `ref_only_throw` | one side threw, the other completed |
 | `aborted` | interp budget exhausted, observation prefix consistent → discard (tracked) |
+| `nondet_discard` | a divergence one of the two sides did not reproduce when re-run → discard (tracked) |
 
 A mismatched observation *prefix* on an aborted run is still a
 `value_divergence`. Dedup fingerprints are `(class, ref exc, interp exc,
@@ -226,6 +240,25 @@ ever reported would mask all future value bugs as duplicates. Still excluded:
 messages (drift across Julia versions) and the divergence index (moves under
 shrinking). `SUPPRESSIONS` in `driver.jl` holds predicates for known-reported
 findings so reruns only surface news.
+
+**Confirm-on-divergence.** One run of each side is what the oracle consumes; it
+is not what a *finding* rests on. When `classify` produces a finding, the gate
+(`confirm`/`confirmed`, `classify.jl`) re-runs the reference and compares it
+against the reference outcome the verdict was built from — same status, same
+exception name, same observation stream elementwise and in length. If the
+reference disagrees with *itself*, the candidate is nondeterministic and the
+verdict says nothing about the interpreter: `nondet_discard`, tracked next to
+`aborted`, never deduped, shrunk or written. If the reference is stable, the
+interpreted side is re-run in the same mode and judged the same way. Only
+stable divergences continue. After shrinking, the program about to be written
+is confirmed once more (fingerprint *and* stability); if it fails, the
+pre-shrink program is tried, and if that fails too the candidate is discarded
+rather than reported. Cost lands only on the divergence path, so agreement —
+every candidate but a handful — pays nothing. Both engines gate at every point
+a finding is produced, and `nondet_discard` counts are printed with the
+campaign stats. This is `determinism.md` §6, and it is the safety net that lets
+future grammar work fail *loudly-but-harmlessly*: a nondeterminism mistake
+becomes a tracked discard instead of a false finding.
 
 ### The stepping axis (`stepfuzz.jl`)
 
@@ -473,9 +506,11 @@ and belong in `SUPPRESSIONS` if hit).
   walks got their own replayable seeds, and corpus findings are minimized by a
   statement-level delta debugger shared with `crashmin.jl`. See Shrinking,
   above.
-- Still open, in priority order: semantic coverage (above), version-aware
-  triage of reference-side crashes, an `ExprSplitter` axis, throughput, EMI,
-  a nightly CI job. Structured
+- **Finding-intake hardening** (done, `NEXT.md` item 1, minus the rr step):
+  the confirm-on-divergence gate above, and `fuzz/triage.jl` for version-aware
+  attribution of what broke.
+- Still open, in priority order: semantic coverage (above), an `ExprSplitter`
+  axis, throughput, EMI, a nightly CI job. Structured
   concurrency (`@sync`/`@async` with observations only from the root task) and
   a **pluggable lowerer** — the lowering step as an injectable function, so a
   JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
