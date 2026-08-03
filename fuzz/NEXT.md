@@ -116,6 +116,46 @@ One bug in ~10^4 candidates is not a yield estimate. The axes have not run at
 the scale where they would be expected to produce much — the literature's
 numbers are 10^8 and up, these runs are 10^3–10^4.
 
+**Post-evaluation session (2026-08-03, `evaluation-2026-08-03.md`):** the
+evaluation's recommendations 2–4 are now built. What that added, and what it
+measured:
+
+- **Ground truth exists now** (`mutantbench.sh` / `mutantbench-report.md`):
+  reverting historical fixes and re-fuzzing shows the **step axis rediscovers
+  a real bug at n=300 in ~143 s** (same fingerprint bucket as the historical
+  finding), while **native-rec did NOT rediscover the `_call_latest` bug at
+  n=500** — consistent with it originally needing a ~100-batch campaign, and
+  direct evidence for running long. Curation caveat: only 6 of 14+ examined
+  fixes make clean mutants; the stacked utils.jl/commands.jl history means
+  **no clean mutant exists for the evalcode axis**, so its yield remains
+  unvalidatable for now.
+- **The abort leak.** The determinism-unlock `__RNG__` grammar made *every*
+  program containing a `rand(__RNG__, …)` call exhaust the 300k statement
+  budget under RecursiveInterpreter (72/72 measured; overall abort rate
+  70–72% vs ~1% before the grammar landed) — i.e. since that grammar landed,
+  the native-rec axis was silently testing only the ~28% of programs without
+  the flagship feature. Aborts hit 0/120 at a 1M budget; the structural fix
+  (cheap inline PRNG instead of interpreted Base Random) is in
+  `determinism.md` §3 / the grammar section of DESIGN.md. Lesson for every
+  future grammar feature: **check the abort-rate delta in `--modes rec`
+  before believing the feature is being tested at all** — `dict` programs
+  abort at ~70% when present too, so the same audit applies there.
+- **Throughput** (`throughput-report.md`): the hidden per-candidate cost was
+  each module's own `__fjnorm__` re-specializing per candidate; shared
+  helpers landed for a measured **1.68× on native both-modes** (2.43/s) and
+  1.86× on split (24.5/s). Item 8's remaining ideas (double lowering, module
+  pooling proper) measured small and are documented there.
+- **Nightly CI** (item 7 — done): `.github/workflows/fuzz-nightly.yml`,
+  cron + dispatchable, Julia 1.12 lane (red = bug) plus `pre` lane
+  (continue-on-error; red = upcoming breakage), selftest as a support gate so
+  campaign findings are never produced on an unsupported Julia, findings
+  uploaded as artifacts, fails on news.
+- **Campaign mix reweighted by evidence** (`longrun.sh`): step ×2 shards
+  (only ground-truth-validated axis; breakpoints.jl went 13% → 80% line
+  coverage once the walk drove real breakpoints), native ×1, call ×1 (new
+  public-API axis), corpus ×1, split+evalcode sharing one alternating shard.
+  Shard seed ranges no longer overlap (10^8 spacing).
+
 ---
 
 ## Work items, ranked
@@ -426,14 +466,14 @@ Ordering between items 4–5 is soft. Item 5 has the strongest
 breadth-of-tested-code argument. A session should pick by which question it
 is trying to answer.
 
-### 7. A nightly CI job
+### 7. A nightly CI job — **DONE**
 
-Time-boxed, uploads `findings/` as artifacts, exits 2 on news. Mentioned in
-the roadmap, never built. Item 1 has landed, which was the precondition —
-unattended runs are only as useful as the trustworthiness of what they report,
-and what they report is now confirmed before it is written.
+`.github/workflows/fuzz-nightly.yml`: cron + `workflow_dispatch(duration_seconds)`,
+Julia 1.12 (required) and `pre` (continue-on-error) lanes, the selftest as a
+support gate before any campaign runs, `longrun.sh` time-boxed, findings and
+crash journals uploaded as artifacts, red on new findings.
 
-### 8. Throughput
+### 8. Throughput — **partially done**, see `throughput-report.md`
 
 The `native` axis runs ~2 cases/s and it multiplies everything. The cost is
 three fresh modules per candidate, re-lowering on the interpreted side, and
