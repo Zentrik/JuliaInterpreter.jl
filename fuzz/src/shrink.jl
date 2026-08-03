@@ -39,7 +39,8 @@ function attempt!(b::ShrinkBudget, keep, src::AbstractString)::Bool
     b.runs += 1
     return try
         keep(String(src))::Bool
-    catch
+    catch err
+        err isa InterruptException && rethrow()   # Ctrl-C must still reach the user
         false
     end
 end
