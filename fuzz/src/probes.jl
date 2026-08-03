@@ -801,12 +801,36 @@ function intrinsic_args(ctx::Ctx, t::ProbeTarget)
         return Ex[psrc(pick(rng, PROBE_ORDERINGS))]
     end
     if endswith(n, "_int")
-        return Ex[intarg(ctx) for _ in 1:nargs]
+        return sametype_intargs(ctx, nargs)
     end
     if endswith(n, "_float") || endswith(n, "_llvm") || n == "fpiseq"
-        return Ex[floatarg(ctx) for _ in 1:nargs]
+        return sametype_floatargs(ctx, nargs)
     end
     return nothing
+end
+
+# A binary/n-ary numeric intrinsic requires *all* operands to share one type.
+# Drawing each operand independently (an Int64 leaf here, an Int8(3) there) makes
+# a mismatched call, and a mismatch is a class-U false positive, not an
+# interpreter bug: when the reference can constant-fold the operands it validates
+# the type mismatch at *compile time* and raises a TypeError from inside the
+# thunk (outside the program's `try`), while the interpreter defers to the
+# runtime intrinsic and raises an ErrorException — and which happens depends on
+# optimization. Pick one type for the whole call so the arms still see success
+# paths without manufacturing that divergence. (Same shape as the atomic-ordering
+# fix: don't feed intrinsics arguments the reference rejects at a different phase
+# than the interpreter.)
+function sametype_intargs(ctx::Ctx, nargs::Int)
+    rng = ctx.rng
+    rand(rng) < 0.5 && return Ex[genleaf(ctx, IntT) for _ in 1:nargs]   # all Int64
+    T = pick(rng, INT_TYPE_LITERALS)
+    return Ex[psrc(string(T, "(", pick(rng, ("0", "1", "2", "3", "7")), ")")) for _ in 1:nargs]
+end
+function sametype_floatargs(ctx::Ctx, nargs::Int)
+    rng = ctx.rng
+    rand(rng) < 0.5 && return Ex[genleaf(ctx, FloatT) for _ in 1:nargs]  # all Float64
+    T = pick(rng, FLOAT_TYPE_LITERALS)
+    return Ex[psrc(string(T, "(", pick(rng, ("0.0", "1.5", "2.0", "NaN", "Inf")), ")")) for _ in 1:nargs]
 end
 
 # Does `intrinsic_args` know what this intrinsic's operands look like? An
