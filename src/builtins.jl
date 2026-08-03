@@ -329,7 +329,8 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Expr(:call, invoke, args[2:end]...)
     elseif @static isdefinedglobal(Core, :invokelatest) && f === Core.invokelatest
         args = getargs(interp, args, frame)
-        if !expand
+        if !expand || isempty(args)
+            # a zero-arg call defers to the native builtin for its ArgumentError
             return Some{Any}(Core.invokelatest(args...))
         end
         new_expr = Expr(:call, args[1])
@@ -584,7 +585,8 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Some{Any}(Core._call_in_world(getargs(interp, args, frame)...))
     elseif @static (isdefinedglobal(Core, :_call_latest) && Core._call_latest isa Core.Builtin) && f === Core._call_latest
         args = getargs(interp, args, frame)
-        if !expand
+        if !expand || isempty(args)
+            # a zero-arg call defers to the native builtin for its ArgumentError
             return Some{Any}(Core._call_latest(args...))
         end
         new_expr = Expr(:call, args[1])

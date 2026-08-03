@@ -57,7 +57,8 @@ const REQUIRES_WORLD = Core.Builtin[
     Core.memoryrefmodify!,
 ]
 const CALL_LATEST = """args = getargs(interp, args, frame)
-        if !expand
+        if !expand || isempty(args)
+            # a zero-arg call defers to the native builtin for its ArgumentError
             return Some{Any}(Core._call_latest(args...))
         end
         new_expr = Expr(:call, args[1])

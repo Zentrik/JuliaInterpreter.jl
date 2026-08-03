@@ -1779,3 +1779,20 @@ struct ApplyIterateCallable end
         @test err_interp.msg == err_native.msg
     end
 end
+
+@testset "invokelatest with no arguments raises the native ArgumentError" begin
+    cl_va(a...) = Core._call_latest(a...)
+    err_native = try cl_va(); nothing catch err; err end
+    err_interp = try @interpret cl_va(); nothing catch err; err end
+    @test err_native isa ArgumentError
+    @test typeof(err_interp) === typeof(err_native)
+    @test err_interp.msg == err_native.msg
+    @static if isdefined(Core, :invokelatest)
+        il_va(a...) = Core.invokelatest(a...)
+        err_native = try il_va(); nothing catch err; err end
+        err_interp = try @interpret il_va(); nothing catch err; err end
+        @test err_native isa ArgumentError
+        @test typeof(err_interp) === typeof(err_native)
+        @test err_interp.msg == err_native.msg
+    end
+end
