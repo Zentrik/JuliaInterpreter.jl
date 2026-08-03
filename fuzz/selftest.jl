@@ -5,8 +5,13 @@ using Test
 using Dates   # for the corpus import-repair assertions
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
-               nstatements, Cfg, run_both, run_all, shrink, genprogram, render
+               nstatements, Cfg, run_both, run_all, shrink, genprogram, render,
+               outcomeeq, confirm, confirmed, confirmsrc, confirmreport, nondetverdict
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
+
+# The triage CLI, loaded as a library: its `if abspath(PROGRAM_FILE) == @__FILE__`
+# guard keeps `main` from running when it is included rather than executed.
+include(joinpath(@__DIR__, "triage.jl"))
 
 # The Supposition probes run at file scope, *outside* the testset below: a
 # deliberately failing `@check` inside a parent testset would record failures
@@ -507,6 +512,148 @@ end
         v = classify(r...)
         @test v.class === :value_divergence
         @test v.dividx == 1
+
+        # ... and it must survive the confirm-on-divergence gate: a *deterministic*
+        # divergence is exactly what the gate is supposed to let through. If this
+        # ever fails, the gate has started eating real findings.
+        ref, int = r
+        @test confirm(canary, ref, int; nstmts=500_000) === :stable
+        @test confirmed(v, canary, ref, int; nstmts=500_000).class === :value_divergence
+        @test isfinding(confirmed(v, canary, ref, int; nstmts=500_000))
+        @test confirmsrc(canary, fingerprint(v); nstmts=500_000)
+        @test confirmreport(canary, canary, fingerprint(v); nstmts=500_000) == canary
+
+        # The two failure branches, driven by handing the gate an outcome that a
+        # re-run of that side will not reproduce. (A program that is unstable on
+        # the interpreted side *only* is not constructible on demand; this tests
+        # the same code path with the same meaning — "the recorded outcome is not
+        # what that side does".)
+        fakeint = Outcome(int.status, int.excname, Any[:not_what_it_did], "", "")
+        @test confirm(canary, ref, fakeint; nstmts=500_000) === :nondet_interp
+        fakeref = Outcome(ref.status, ref.excname, Any[:not_what_it_did], "", "")
+        @test confirm(canary, fakeref, int; nstmts=500_000) === :nondet_ref
+    end
+
+    @testset "confirm-on-divergence discards a nondeterministic candidate" begin
+        # The canary the gate exists for: a program whose observations are not a
+        # function of the program. Without the gate this is a textbook
+        # value_divergence and would be deduped, shrunk and written to findings/
+        # as an interpreter bug. The first observation is deliberately stable, so
+        # the gate has to compare the *streams*, not just their first elements.
+        nondet = """
+        let
+            __obs__(:stable_prefix)
+            __obs__(rand())
+        end
+        """
+        r = run_both(nondet; nstmts=500_000)
+        @test r !== nothing
+        ref, int = r
+        v = classify(ref, int)
+        # what the harness *would* have reported before the gate existed
+        @test v.class === :value_divergence
+        @test v.dividx == 2
+        # what it reports now
+        @test confirm(nondet, ref, int; nstmts=500_000) === :nondet_ref
+        gated = confirmed(v, nondet, ref, int; nstmts=500_000)
+        @test gated.class === :nondet_discard
+        @test !isfinding(gated)          # never deduped, shrunk or reported
+        # and the post-shrink gate refuses it too, from source alone
+        @test !confirmsrc(nondet, fingerprint(v); nstmts=500_000)
+        @test confirmreport(nondet, nondet, fingerprint(v); nstmts=500_000) === nothing
+
+        # `nondet_discard` is a tracked discard, in the same family as `aborted`.
+        @test !isfinding(nondetverdict(:ref))
+        @test !isfinding(nondetverdict(:interp))
+        @test nondetverdict(:ref).class === :nondet_discard
+
+        # Outcome equality is over exactly the dimensions classify compares:
+        # status, exception name, and the observation stream including its length.
+        o(st, exc, obs...) = Outcome(st, exc, Any[obs...], "", "")
+        @test outcomeeq(o(:done, :none, 1, 2), o(:done, :none, 1, 2))
+        @test !outcomeeq(o(:done, :none, 1, 2), o(:done, :none, 1, 3))
+        @test !outcomeeq(o(:done, :none, 1, 2), o(:done, :none, 1))     # prefix ≠ equal
+        @test !outcomeeq(o(:done, :none, 1), o(:threw, :none, 1))
+        @test !outcomeeq(o(:threw, :DomainError), o(:threw, :BoundsError))
+        @test !outcomeeq(o(:done, :none, 1), o(:done, :none, 1.0))      # type-sensitive
+        # ... but never over message or backtrace text, which drift harmlessly.
+        @test outcomeeq(Outcome(:threw, :DomainError, Any[1], "msg a", "bt a"),
+                        Outcome(:threw, :DomainError, Any[1], "msg b", ""))
+
+        # The agree path must not pay for a re-run: an unparseable source would
+        # force a :nondet_ref discard if the gate ever ran on a non-finding.
+        @test confirmed(FuzzJI.agree(), "((( not julia", ref, int; nstmts=1).class === :agree
+    end
+
+    @testset "triage: exit-status attribution and verdicts" begin
+        T = Main.Triage
+        # Input handling: a findings repro.jl carries the program as `const SRC`,
+        # while a journal entry or a crashmin output *is* the program.
+        repro = """
+        include(joinpath(@__DIR__, "..", "..", "reprolib.jl"))
+        const SRC = "let\\n    __obs__(1)\\nend\\n"
+        reprorun(SRC; compiled=true)
+        """
+        @test T.extract_src(repro) == "let\n    __obs__(1)\nend\n"
+        @test T.extract_src("let\n    __obs__(1)\nend\n") === nothing
+        @test T.extract_src("this is (not parseable") === nothing
+
+        # Exit-status decoding, the whole basis of attribution. `timeout(1)`
+        # reports 128+N for a child killed by signal N and 124 on expiry; an
+        # uncaught Julia exception is exit 1 and is *not* a crash.
+        @test T.classifyexit(0, 0) == (:ok, 0)
+        @test T.classifyexit(1, 0) == (:error, 0)
+        @test T.classifyexit(124, 0) == (:timeout, 0)
+        @test T.classifyexit(139, 0) == (:crash, 11)
+        @test T.classifyexit(0, 6) == (:crash, 6)
+        @test T.classifyexit(2, 0) == (:crash, 0)
+
+        # Verdicts, on synthetic side results (the crash paths cost a whole
+        # crashing subprocess to produce for real, and the decision under test is
+        # the mapping, not the crashing).
+        sr(side, status; sig=0, err="") =
+            T.SideResult(side, status, 0, sig, 0.0, "", err, "1.0.0")
+        # A reference-side crash is a JULIA bug and must say so, whatever the
+        # interpreted side did.
+        @test occursin("JULIA bug", T.verdict(sr(:ref, :crash; sig=6), sr(:interp, :ok))[1])
+        @test occursin("JULIA bug", T.verdict(sr(:ref, :crash; sig=11), sr(:interp, :crash; sig=11))[1])
+        @test occursin("JuliaInterpreter", T.verdict(sr(:ref, :ok), sr(:interp, :crash; sig=11))[1])
+        @test occursin("INTERP-ONLY", T.verdict(sr(:ref, :ok), sr(:interp, :error))[1])
+        @test occursin("REF-ONLY", T.verdict(sr(:ref, :error), sr(:interp, :ok))[1])
+        @test occursin("BOTH SIDES THREW", T.verdict(sr(:ref, :error), sr(:interp, :error))[1])
+        @test occursin("BOTH SIDES COMPLETED", T.verdict(sr(:ref, :ok), sr(:interp, :ok))[1])
+        @test occursin("TIMEOUT", T.verdict(sr(:ref, :ok), sr(:interp, :timeout))[1])
+        # An interpreted-side throw is never attributed from the backtrace: the
+        # explanation has to say so, because every interpreted throw has
+        # JuliaInterpreter frames in it.
+        @test occursin("backtrace", T.verdict(sr(:ref, :ok), sr(:interp, :error))[2])
+
+        # One real round trip through the subprocess machinery, on a program that
+        # throws only under interpretation (interpreted frames are visible in
+        # stacktrace(); compiled ones are not — the same permanent difference the
+        # canary uses). Deliberately cheap: no crash, no newest-Julia re-run.
+        interponly = """
+        let
+            __obs__(1)
+            if any(fr -> occursin("interpret", String(fr.file)), stacktrace())
+                throw(DomainError(:interpreted_frames_visible))
+            end
+        end
+        """
+        rref = T.runside(:ref, interponly; timeoutsecs=120)
+        @test rref.status === :ok
+        rint = T.runside(:interp, interponly; timeoutsecs=120, project=joinpath(@__DIR__))
+        @test rint.status === :error
+        @test occursin("DomainError", T.headline(rint))
+        @test occursin("INTERP-ONLY", T.verdict(rref, rint)[1])
+        # ... and the reference side alone reports a program-level error as one.
+        @test T.runside(:ref, "error(\"boom\")"; timeoutsecs=120).status === :error
+
+        # The newest-Julia probe either finds a juliaup channel or reports that
+        # it cannot; it must never throw (triage runs on machines without juliaup).
+        rel = T.newest_julia("release")
+        @test rel === nothing || rel isa Cmd
+        rel === nothing || @test occursin(".", T.juliaversion(rel))
     end
 
     @testset "shrinker reduces while preserving the finding" begin
@@ -531,6 +678,9 @@ end
         r2 = run_both(render(shrunk); nstmts=2_000_000)
         v2 = classify(r2...)
         @test isfinding(v2) && fingerprint(v2) == fp
+        # ... and it must clear the post-shrink confirmation gate, which is what
+        # the drivers now call between `shrink` and `writefinding`.
+        @test confirmreport(render(prog), render(shrunk), fp; nstmts=2_000_000) == render(shrunk)
         @info "shrinker" before = nstatements(prog) after = nstatements(shrunk) src = render(shrunk)
     end
 

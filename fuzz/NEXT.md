@@ -8,7 +8,9 @@ file is the short version of *where things stand* and *what to pick up*.
 Last updated after merging two parallel sessions: the one that added the
 stepping, eval_code and corpus axes plus the campaign tooling, and the one
 that produced the determinism analysis and the generation-generality
-proposals now folded into the ranked list below.
+proposals now folded into the ranked list below. Since then **item 1 has
+landed**: the confirm-on-divergence gate and `fuzz/triage.jl`. Item 2
+(semantic coverage) is now the top of the list.
 
 ---
 
@@ -26,7 +28,8 @@ before.
 
 Supporting tools: `metrics.jl` (what the generator actually produces, without
 executing), `longrun.sh` (sharded restart-looping campaigns), `crashmin.jl`
-(minimize a program that kills the process), `diag_stuck.jl` (why a stepping
+(minimize a program that kills the process), `triage.jl` (which side broke, and
+does it still break on the newest Julia), `diag_stuck.jl` (why a stepping
 walk is stuck), `preserve-findings.sh` (force-commit findings, since
 `findings/` is gitignored).
 
@@ -52,31 +55,47 @@ plus the reflection-prober design in item 4). The ordering logic is
 unchanged — expected yield per engineering-hour, with oracle strength and new
 surfaces ahead of raw input volume.
 
-### 1. Finding-intake hardening
+### 1. Finding-intake hardening — **done**, except the rr step
 
 Small, first, and bought with time already lost. Three gates between "the
 harness noticed something" and "a human looks at it":
 
-- **Version-aware triage of reference-side crashes.** A crash on the
-  **reference** side (compiled Julia) is a *Julia* bug, not a
-  JuliaInterpreter bug — classify and route it separately, different verdict
-  class, different directory. And before reporting one, re-run it under the
-  newest installed Julia (`juliaup` makes `julia +1.12 file.jl` a
-  one-liner); if it passes there, say so in the report. The whole
-  codegen-crash episode — journal replay, minimization, C-Reduce, a
-  delegated reduction agent — was work on a bug fixed a release earlier, and
-  one version check up front would have answered it.
-- **Confirm-on-divergence** (`determinism.md` §6). A finding is currently
-  reported after one reference run and one interpreted run. Instead: on
-  divergence, rerun the reference; if it disagrees with *itself*, classify
-  `nondet_discard` (tracked next to `aborted`, never reported); otherwise
-  rerun the interpreted side, and discard likewise if unstable. Costs
+- **Version-aware triage of reference-side crashes** — **done**:
+  `fuzz/triage.jl`. A crash on the **reference** side (compiled Julia) is a
+  *Julia* bug, not a JuliaInterpreter bug. Point the script at a
+  `findings/<dir>/`, a `repro.jl` or any candidate `.jl` and it runs each side
+  alone in its own `julia` under a timeout, attributing by exit status (signal
+  death / unusual exit = crash, exit 1 = uncaught exception, exit 0 = clean)
+  rather than by reading a backtrace; then, if the reference side is what
+  broke, re-runs *that* side under the newest installed Julia (`julia
+  +release`) and says whether it still reproduces. Verdict goes to stdout and,
+  for a findings directory, to `triage.md` beside the repro. On the
+  already-known codegen crash it answers the whole question in under two
+  seconds: reference crashes with SIGABRT on 1.11.9, clean on 1.12.6, fixed
+  upstream. That episode — journal replay, minimization, C-Reduce, a delegated
+  reduction agent — was work on a bug fixed a release earlier, and this is the
+  one command that would have said so.
+  The **routing** half is deliberately not done: reference-side crashes still
+  land in the same `findings/` bucket, because the harness cannot classify a
+  crash it did not survive. Triage is what separates them, after the fact.
+- **Confirm-on-divergence** (`determinism.md` §6) — **done**:
+  `confirm`/`confirmed`/`confirmsrc`/`confirmreport` in `classify.jl`, used by
+  both the native and the supposition engine, in both `:rec` and `:cmp` modes.
+  On divergence the reference is re-run and compared against itself (status,
+  exception name, observation stream elementwise + length); disagreement is
+  `nondet_discard`, tracked next to `aborted`, never deduped/shrunk/reported.
+  If the reference is stable the interpreted side gets the same treatment.
+  After shrinking, whatever is about to be written is confirmed once more, with
+  a fallback to the pre-shrink program and a discard if neither holds. Costs
   nothing on the agree path, stabilizes shrinking, and turns every future
   nondeterminism mistake — grammar, prelude, or corpus — into a tracked
-  discard instead of a false finding. Prerequisite for item 5.
+  discard instead of a false finding. The selftest's nondeterminism canary (a
+  program observing `rand()`) is a textbook `value_divergence` that the gate
+  discards. Prerequisite for item 5, now satisfied.
 - **rr for intermittent repros.** When a `findings/` repro crashes
   only sometimes, capture it under `julia --bug-report=rr` (rr support is
-  first-class in Julia) before any hand minimization.
+  first-class in Julia) before any hand minimization. **Still to do** — the one
+  part of this item not built.
 
 ### 2. Semantic coverage of the interpreter (P2 in `yield-analysis.md`)
 
@@ -140,8 +159,9 @@ report into a to-do list the generator can act on.
 
 ### 5. Determinism unlocks, the cheap half (`determinism.md` §9)
 
-Item 1's confirm-on-divergence gate is the safety net for all three; in
-order:
+Item 1's confirm-on-divergence gate is the safety net for all three, and it is
+now in place — a determinism mistake in any of these lands as a tracked
+`nondet_discard`, not as a false finding. In order:
 
 - **Explicit RNG + content-keyed containers.** `__RNG__ = Xoshiro(seed)` in
   the prelude, with `rand`/`randn`/`shuffle!` rules drawing from it — both
@@ -187,8 +207,9 @@ is trying to answer.
 ### 7. A nightly CI job
 
 Time-boxed, uploads `findings/` as artifacts, exits 2 on news. Mentioned in
-the roadmap, never built. Worth building as soon as item 1 lands — unattended
-runs are only as useful as the trustworthiness of what they report.
+the roadmap, never built. Item 1 has landed, which was the precondition —
+unattended runs are only as useful as the trustworthiness of what they report,
+and what they report is now confirmed before it is written.
 
 ### 8. Throughput
 
@@ -268,7 +289,8 @@ any yield number. The specific traps, all of which cost real time:
   `(framecode, pc)` unchanged repeatedly *while returning a normal pc*.
 
 **Check whether a finding is already fixed upstream before minimizing it.**
-See item 1.
+`julia --project=fuzz fuzz/triage.jl <finding>` is now that check, and it also
+tells you which side broke. Run it first, always. See item 1.
 
 **Verify a new axis actually exercises something.** A clean run and a run that
 silently tests nothing look identical in the stats. Both new axes were checked
@@ -281,7 +303,7 @@ explicitly: eval_code performs ~1076 checks across 56 distinct variables per
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # 108 assertions, ~40s
+julia --project=fuzz fuzz/run.jl --selftest              # 160 assertions, ~45s
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/run.jl --engine step --n 2000
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 1000
@@ -289,6 +311,20 @@ julia --project=fuzz fuzz/run.jl --engine corpus --n 1000
 ./fuzz/longrun.sh 21600                                  # all axes, sharded, 6h
 ./fuzz/preserve-findings.sh                              # commit findings/ (gitignored)
 ```
+
+**Triage anything that lands in `findings/` before you work on it:**
+
+```sh
+julia --project=fuzz fuzz/triage.jl fuzz/findings/<dir>/     # writes triage.md there too
+julia --project=fuzz fuzz/triage.jl fuzz/journal/current.jl  # or a bare candidate
+```
+
+It attributes the failure to a side by running each one alone in its own
+`julia` (exit status, not backtrace contents), and re-runs a broken *reference*
+side under `julia +release` so "already fixed upstream" is answered before
+anyone minimizes anything. Flags: `--timeout SECS`, `--mode rec|cmp` (override
+the mode recovered from the repro), `--channel CHAN` (juliaup channel to check
+against, default `release`), `--nowrite` (don't write `triage.md`).
 
 Useful flags: `--big` (larger programs), `--fresh` (ignore existing findings
 when seeding dedup — otherwise a reported bucket masks new ones),
