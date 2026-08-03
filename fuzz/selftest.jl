@@ -378,11 +378,13 @@ end
         # process, so a denylist regression shows up here as a crashed
         # selftest rather than as a mysteriously truncated campaign.
         #
-        # The seed range is fixed and known clean; a wider sweep lives in the
-        # restart-looping soak (fuzz/DESIGN.md, builtins dictionary), because
-        # generated `@atomic` structs can still hit the known Julia 1.11
-        # llvm-alloc-opt abort (findings/julia-codegen-abort-allocopt), which
-        # is a reference-side Julia bug and kills any in-process batch.
+        # The seed range is fixed and verified clean. It is deliberately small:
+        # a wider sweep belongs in a restart-looping campaign (longrun.sh, plus
+        # the crash-safe journal), because generated `@atomic` structs can hit
+        # the known Julia 1.11 llvm-alloc-opt abort
+        # (findings/julia-codegen-abort-allocopt) — a reference-side *Julia*
+        # bug, which kills any in-process batch no matter how good the
+        # denylist is.
         nbadgate = 0; nran = 0; ndiverge = 0
         for seed in 1:50
             src = render(FuzzJI.genprogram_policy(Xoshiro(seed), Cfg(), :builtins))

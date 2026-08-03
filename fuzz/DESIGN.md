@@ -216,7 +216,17 @@ interpreter special-cases" cannot drift from the interpreter's:
 `fuzz/metrics.jl` reports enumerated / allowed / denylisted counts, the recipe
 inventory, and probe density plus distinct-callable coverage under the
 `builtins` policy — the numbers that say whether a grammar change silently
-starved the prober.
+starved the prober (157 of 210 callables reached across 500 programs).
+
+Calibrating a denylist entry is not a code-reading exercise: every reason
+above was *measured*, by executing probe-heavy candidates in a **subprocess**
+with the journal armed and reading back the candidate that was running when
+the process died — the same restart-loop-plus-journal discipline `longrun.sh`
+uses for campaigns. Do that before widening the target set, never in-process:
+the failure mode being hunted is precisely the one that takes the worker down
+with it. In the 1.5k-candidate soak that closed this work, the only remaining
+process deaths were the known 1.11 `llvm-alloc-opt` abort, which is a
+reference-side Julia bug reachable from `@atomic` structs alone.
 
 Generation is a pure function of its randomness source, consumed through the
 `AbstractRNG` interface. Two engines drive it (`--engine`):
