@@ -299,21 +299,42 @@ any yield number. The specific traps, all of which cost real time:
 See item 1.
 
 **Verify a new axis actually exercises something.** A clean run and a run that
-silently tests nothing look identical in the stats. Both new axes were checked
+silently tests nothing look identical in the stats. Every axis was checked
 explicitly: eval_code performs ~1076 checks across 56 distinct variables per
 20 programs; corpus executes ~50% of cases and reports `ran` next to
 `discarded_junk` precisely so a collapse to zero is visible.
+
+**The cheapest way to prove an oracle has teeth is to break the SUT on
+purpose.** The split axis reported nothing on its first several thousand cases,
+which is indistinguishable from an oracle that cannot fail. So: copy the
+interpreted-side driver, have the copy *skip one `ExprSplitter` fragment*, and
+re-classify. 86% of those mutants are caught (66% as `split_missing_effect`,
+20% as an internal error); the 14% that pass are fragments whose omission has
+no observable effect — comments, empty modules, the docstring binding, which
+is excluded as compiler-internal. Fifteen minutes of work, and it converts
+"clean run" from a worry into a measurement. The mutant driver lives outside
+the repo (it is a probe, not a feature), but the technique transfers to every
+axis here.
+
+**Normalization gaps hide in the *rare* observation branches.** `__fjnorm__`
+had scrubbed module identity everywhere except `x isa Type`, where it used
+`string(T)` — which is module-qualified, so a type the program defined read as
+`Main.FJ95.ZT` against `Main.FJ96.ZT`. Four axes never hit it because they
+never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
+16 false divergences in 5000 cases. When adding a template that observes a new
+*kind* of value, check the normalizer's branch for it first.
 
 ---
 
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # 108 assertions, ~40s
+julia --project=fuzz fuzz/run.jl --selftest              # 154 assertions, ~40s
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/run.jl --engine step --n 2000
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 1000
 julia --project=fuzz fuzz/run.jl --engine corpus --n 1000
+julia --project=fuzz fuzz/run.jl --engine split --n 5000  # ~19 cases/s
 ./fuzz/longrun.sh 21600                                  # all axes, sharded, 6h
 ./fuzz/preserve-findings.sh                              # commit findings/ (gitignored)
 ```

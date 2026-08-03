@@ -29,6 +29,7 @@ julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recurs
 julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 2000      # eval_code at paused frames
 julia --project=fuzz fuzz/run.jl --engine corpus --n 5000        # real Julia source, spliced
+julia --project=fuzz fuzz/run.jl --engine split --n 5000          # adversarial toplevel forms (ExprSplitter)
 julia --project=fuzz fuzz/run.jl --engine native --n 5000 --big --fresh  # larger programs, re-report known buckets
 julia --project=fuzz fuzz/metrics.jl --n 500                    # what the generator actually produces
 ```
@@ -445,7 +446,12 @@ two-engine oracle.
 
 Excluded from the grammar: I/O, `eval`/`include`, `ccall`/pointers/`unsafe_*`,
 tasks/threads (see roadmap), timing, `objectid`, method redefinition.
-Normalized away: module names, closure/struct type identity, function values.
+Normalized away: module names, closure/struct type identity, function values,
+and the *module prefix of a type name* — `string(T)` is module-qualified, so a
+type the program defined reads as `Main.FJ95.ZT` on one side and `Main.FJ96.ZT`
+on the other; `__fjnorm__` strips its own module's prefix and keeps the rest
+(type parameters included). The split axis produced 16 such false divergences
+in 5000 cases before that was fixed.
 Handled: RNG (both sides could seed identically; the grammar currently
 doesn't call `rand`), stack depth (fueled recursion keeps it shallow;
 `StackOverflowError` asymmetries would classify as `exception_divergence`
@@ -470,9 +476,12 @@ and belong in `SUPPRESSIONS` if hit).
 - **M3.5 — corpus axis** (done): `--engine corpus` runs and splices real Julia
   source, with an oracle that compares failure mode only so nondeterministic
   code is usable.
+- **M3.6 — ExprSplitter axis** (done): `--engine split` feeds `construct.jl`
+  adversarial toplevel forms from a template-combinator generator, with a
+  module-tree effect oracle on top of the failure-mode one.
 - Still open, in priority order: semantic coverage (above), version-aware
-  triage of reference-side crashes, shrinking for the three newer axes, an
-  `ExprSplitter` axis, throughput, EMI, a nightly CI job. Structured
+  triage of reference-side crashes, shrinking for the four newer axes,
+  throughput, EMI, a nightly CI job. Structured
   concurrency (`@sync`/`@async` with observations only from the root task) and
   a **pluggable lowerer** — the lowering step as an injectable function, so a
   JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
