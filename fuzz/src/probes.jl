@@ -107,6 +107,14 @@ function enumerate_probes()
                 "arity is not pinned down by the compiler's tfunc tables, and a wrong operand count to an intrinsic aborts the process inside codegen — withheld rather than guessed."))
             return
         end
+        # An intrinsic whose operand *kinds* we cannot name is equally
+        # unprobeable: a float operation handed a same-width integer corrupts
+        # the heap silently (see intrinsic_shape_known).
+        if kind === :intrinsic && !intrinsic_shape_known(n)
+            push!(denied, (spelling, n,
+                "operand kinds are not derivable from the name, and a float intrinsic handed a same-width integer corrupts the heap without raising — withheld rather than guessed."))
+            return
+        end
         push!(out, ProbeTarget(n, spelling, kind, lo, hi, known,
                                b !== nothing, b === nothing ? "" : b.reason))
     end
@@ -791,6 +799,19 @@ function intrinsic_args(ctx::Ctx, t::ProbeTarget)
     return nothing
 end
 
+# Does `intrinsic_args` know what this intrinsic's operands look like? An
+# intrinsic whose operand kinds we cannot name must not be probed at all: the
+# generic argument pool would eventually hand a float operation an integer of
+# the same width, which the runtime does not check and which corrupts the heap
+# (see probeargs). Kept in sync with the branches of `intrinsic_args`.
+function intrinsic_shape_known(name::Symbol)
+    name in CAST_INTRINSICS && return true
+    (name === :have_fma || name === :atomic_fence) && return true
+    n = String(name)
+    return endswith(n, "_int") || endswith(n, "_float") || endswith(n, "_llvm") ||
+           n == "fpiseq"
+end
+
 # ---------------------------------------------------------------------------
 # Fixed templates: curated probes that are not a plain `callee(args...)` call,
 # migrated verbatim from the old BUILTIN_PROBES dictionary.
@@ -857,14 +878,20 @@ function probeargs(ctx::Ctx, t::ProbeTarget; forcerecipe::Bool=false)::Vector{Ex
     # arbitrary arguments — that is the whole point of the ban.
     t.reciponly && return Ex[]
     if t.kind === :intrinsic
-        # The width-relational casts must *always* take a shaped argument list:
-        # the generic pool contains both type literals and floats, and a pair
-        # that violates the width relation is a compile-time error on the
-        # reference side (uncatchable by the program's own `try`).
-        if t.name in CAST_INTRINSICS || rand(rng) < 0.6
-            a = intrinsic_args(ctx, t)
-            a === nothing || return a
-        end
+        # Intrinsics *always* take a shaped argument list — never the generic
+        # pool. Two independent reasons, both measured:
+        #   - a width-relation violation in a cast is a compile-time error on
+        #     the reference side, outside the program's own `try`;
+        #   - a float intrinsic handed a same-width *integer* silently corrupts
+        #     the heap (`Core.Intrinsics.ceil_llvm(3)` runs, returns, and the
+        #     process dies at the next GC with "GC error (probable
+        #     corruption)"). Mismatched *widths* are checked and raise; a
+        #     mismatched *kind* of the same width is not.
+        # Enumeration withholds any intrinsic without a known shape, so this
+        # never falls through for an allowed target.
+        a = intrinsic_args(ctx, t)
+        a === nothing || return a
+        return Ex[]
     end
     return Ex[probearg(ctx) for _ in 1:probearity(ctx, t)]
 end

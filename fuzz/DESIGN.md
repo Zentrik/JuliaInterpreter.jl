@@ -431,6 +431,16 @@ shrinker to reduce it while preserving the fingerprint.
   intrinsic #2 add_int: wrong number of arguments", exit 139 — on the
   reference side, before the interpreter is ever reached. So the prober's
   arity sweep is exact for intrinsics and malformed only for builtins.
+- **A float intrinsic handed a same-width integer corrupts the heap.**
+  `Core.Intrinsics.ceil_llvm(3)` (and `floor_llvm`, `rint_llvm`, `trunc_llvm`,
+  `sqrt_llvm`, `abs_float`, `neg_float`, `add_float`, …) *runs*, returns a
+  value on both engines, and then the process dies at the next GC with "GC
+  error (probable corruption)". Mismatched operand *widths* are checked and
+  raise a catchable error; a mismatched *kind* of the same width is not. This
+  is the reason intrinsic arguments are always shaped by name
+  (`intrinsic_args`) and never drawn from the generic pool, and the reason an
+  intrinsic whose operand kinds are not derivable from its name is withheld
+  from the target list rather than probed.
 - **Width-relational casts fail at *compile* time, outside the guard.**
   `fptrunc`/`fpext`/`trunc_int`/`sext_int`/`zext_int` check their operand
   widths during compilation when the types are statically known, and that

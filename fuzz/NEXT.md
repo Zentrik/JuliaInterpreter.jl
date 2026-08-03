@@ -30,13 +30,24 @@ executing), `longrun.sh` (sharded restart-looping campaigns), `crashmin.jl`
 walk is stuck), `preserve-findings.sh` (force-commit findings, since
 `findings/` is gitignored).
 
-**Results so far: no JuliaInterpreter bug.** Campaigns of hundreds to a few
-thousand cases per axis ran clean. What the work did produce:
+**Results so far: one small JuliaInterpreter bug.** Campaigns of hundreds to a
+few thousand cases per axis ran clean; the one interpreter finding came from
+the builtins prober (item 4), not from the campaigns. What the work produced:
 
-- four generator bugs and four harness bugs, several of which were silently
+- `findings/interp-invoke-arity-exception/`: `Core.invoke` with fewer than two
+  arguments raises `BoundsError` from inside the interpreter's own `invoke`
+  rewrite where compiled Julia raises `ArgumentError` (and `ErrorException`
+  vs. `TypeError` for a non-type second argument). Low severity — wrong
+  exception type on a malformed call — but a real divergence, and reachable
+  from code a user can write;
+- five generator bugs and four harness bugs, several of which were silently
   destroying yield (see the lessons below);
 - one genuine Julia compiler crash, which turned out to be a known 1.11
-  regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`).
+  regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`),
+  plus two further *reference-side* Julia defects the prober's soak turned up
+  and the denylist now steers around: wrong-arity intrinsic calls abort inside
+  codegen, and a float intrinsic handed a same-width integer
+  (`Core.Intrinsics.ceil_llvm(3)`) corrupts the heap without raising.
 
 Treat "no interpreter bug yet" as an open question, not a conclusion. The
 axes have not run at the scale where they would be expected to produce
