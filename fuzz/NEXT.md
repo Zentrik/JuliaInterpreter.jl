@@ -38,22 +38,47 @@ than an inline campaign can afford), `diag_stuck.jl` (why a stepping walk is
 stuck), `preserve-findings.sh` (force-commit findings, since `findings/` is
 gitignored).
 
-**Results so far: two JuliaInterpreter bugs.**
+**Results so far: four JuliaInterpreter bugs, all fixed.** A common thread:
+every one is in the interpreter's *hand-reimplemented builtin/exception paths*
+— exactly the seam the literature predicts an interpreter diverges from the
+reference — and three of the four are "wrong exception type on a malformed or
+edge call".
 
-- **Fixed**: the differential axis in `cmp` mode (compiled mode) diverged on
-  `rethrow()`, `rethrow(exc)` and `current_exceptions()` inside an
-  interpreted `catch` — the interception that answers them from the frame's
-  modelled exception stack sat on the generic `evaluate_call!`, which
-  `NonRecursiveInterpreter` overrode with a `native_call` bypass. Now hoisted
-  into `intercept_call`, shared by both interpreters, with regression tests;
-  eight-line reproducer in `findings/cmp-exception_divergence-61051b0f/`.
-- **Fixed**: `findings/interp-invoke-arity-exception/` — `Core.invoke` with
-  fewer than two arguments raised `BoundsError` from inside the interpreter's
-  own `invoke` rewrite where compiled Julia raises `ArgumentError` (and
-  `ErrorException` vs. `TypeError` for a non-type second argument). Low
-  severity — wrong exception type on a malformed call — but a real
-  divergence, found by the builtins prober (item 4). Now defers malformed
-  invokes to native `invoke`, with a regression test.
+- **Fixed**: `cmp` mode diverged on `rethrow()`/`rethrow(exc)`/
+  `current_exceptions()` inside an interpreted `catch` — the interception that
+  answers them from the frame's modelled exception stack sat on the generic
+  `evaluate_call!`, which `NonRecursiveInterpreter` overrode with a
+  `native_call` bypass. Hoisted into `intercept_call`, shared by both
+  interpreters. `findings/cmp-exception_divergence-61051b0f/`.
+- **Fixed**: `Core.invoke` with fewer than two arguments raised `BoundsError`
+  from the interpreter's own `invoke` rewrite where compiled Julia raises
+  `ArgumentError` (and `ErrorException` vs. `TypeError` for a non-type second
+  argument). Defers malformed invokes to native. `findings/interp-invoke-arity-exception/`.
+- **Fixed**: `Core.invokelatest()` with no function argument raised
+  `BoundsError` (1.12, where it is a builtin) — the expand path indexed an
+  empty args vector. Defers the empty case to native.
+- **Fixed** (large-scale campaign, three-way-confirmed):
+  `Core._call_latest(:b)` / `Base.invokelatest(:b)` — a non-callable Symbol
+  first argument — raised `UndefVarError` under `RecursiveInterpreter` where
+  compiled Julia, Compiled mode, *and Julia's own built-in interpreter* all
+  raise `MethodError`. The expand path put the evaluated first-argument value
+  bare in function position, where a Symbol was re-read as a name. QuoteNode-
+  wrap the callee. `findings/value_divergence-142a17f7/` (minimized to 25
+  lines via `ddmin_source`; the seed no longer re-derives it because the
+  generator changed mid-campaign).
+
+Plus a debugger crash found by the stepping axis (`more_calls_on_current_line`
+dereferencing a `nothing` from `whereis`, `findings/step-step_only_throw-88d4b5b2/`,
+fixed) and a harness robustness fix (an `evalcode`-shard segfault building an
+untyped `Dict` over frame locals — Julia's `lookup_typevalue`, not an
+interpreter bug — closed by forcing `Dict{Symbol,Any}`).
+
+The first large-scale campaign (Julia 1.12, three-way oracle, ~100 batches
+across six axes over 3h) surfaced the fourth bug and populated the
+`findings/julia/` stream with three compiled-vs-built-in-interpreter
+exception-phase divergences (class-U within Julia itself, low priority). The
+three-way oracle earned its keep: it distinguished the genuine
+`RecursiveInterpreter` bug from class-U noise automatically.
 
 Everything else the work produced:
 
