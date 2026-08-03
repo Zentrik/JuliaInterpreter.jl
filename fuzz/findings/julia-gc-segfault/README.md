@@ -132,6 +132,25 @@ ruled out without a debug+asserts build (`GC_ASSERT_PARENT_VALIDITY`, as used in
 #59483 to print the corrupt parent/child object types — the single most useful
 next diagnostic, and runnable here without `rr`).
 
+## -O1 avoids it (optimizer-dependent) — measured 2026-08-03
+
+Strong evidence the crash is **optimizer-induced**, consistent with the
+#60651 root cause (LICM materialising an `undef` GC root — and LICM is an
+`-O2`/`-O3` pass):
+
+- **`-O2`** (the default): the `misc` (evalcode/split) shard died with the
+  `gc-stock.c` SIGSEGV **3 times across ~25 batches**, the first within the
+  opening handful.
+- **`-O1`**: the same shard ran **22 batches with 0 deaths** (campaign
+  `SEED_BASE=1785779695`), and no shard produced a `gc-stock.c` death.
+
+This is not a perfectly controlled A/B (different seeds), but the mechanism is
+exact — `-O1` does not run LICM — so it is the expected result and it holds.
+For the upstream report this pins the crash to codegen/optimization rather
+than the collector proper, and gives a clean mitigation (run at `-O1`) and a
+sharper repro recipe: **run the aggregate reproducer at `-O2`** (`JULIA_OPT=2
+./fuzz/longrun.sh`), which is where it reproduces; `-O1` will not show it.
+
 ## For the upstream report
 
 - Attach all three `crashed/*.txt` backtraces (crash 1 first — it is the
