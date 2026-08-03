@@ -303,6 +303,11 @@ const PROBE_ORDERINGS = String[
 ]
 
 psrc(s::AbstractString) = Ex(:src, AnyT(), String(s))
+# A reference to something the *program* defines (a struct type, a generated
+# function). Rendered like `psrc` would render it, but as a `:var` node, so
+# shrinking can repair it: when the definition is removed, `repairex` replaces
+# the reference with an inert default instead of leaving an UndefVarError.
+nameref(n::Symbol) = Ex(:var, AnyT(), n)
 
 # One probe argument: an in-scope generated value (structs, vectors, closures,
 # tuples, symbols — whatever the program happens to hold), a freshly generated
@@ -416,7 +421,7 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
         function (ctx)
             isempty(ctx.structs) && return Ex[psrc("Tuple{Int,String}"), psrc("2")]
             s = pick(ctx.rng, ctx.structs)
-            return Ex[psrc(String(s.name)), psrc(string(rand(ctx.rng, 1:length(s.fieldnames))))]
+            return Ex[nameref(s.name), psrc(string(rand(ctx.rng, 1:length(s.fieldnames))))]
         end,
     ],
     :isdefined => Function[
@@ -482,7 +487,7 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
         function (ctx)
             isempty(ctx.structs) && return Ex[psrc("Ref"), psrc("Int")]
             s = pick(ctx.rng, ctx.structs)
-            return Ex[psrc(String(s.name))]
+            return Ex[nameref(s.name)]
         end,
     ],
     :invoke => Function[
@@ -499,7 +504,7 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
             f = pick(ctx.rng, cands)
             sig = f.sigs[1]
             tt = "Tuple{" * join([typename(s::ConcT) for s in sig], ",") * "}"
-            return Ex[psrc(String(f.name)), psrc(tt), Ex[genleaf(ctx, s) for s in sig]...]
+            return Ex[nameref(f.name), psrc(tt), Ex[genleaf(ctx, s) for s in sig]...]
         end,
     ],
     :invokelatest => Function[
@@ -510,7 +515,7 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
             isempty(ctx.fns) && return Ex[psrc("+"), genleaf(ctx, IntT), genleaf(ctx, IntT)]
             f = pick(ctx.rng, ctx.fns)
             sig = f.sigs[1]
-            return Ex[psrc(String(f.name)), Ex[genleaf(ctx, s isa AnyT ? IntT : s) for s in sig]...]
+            return Ex[nameref(f.name), Ex[genleaf(ctx, s isa AnyT ? IntT : s) for s in sig]...]
         end,
     ],
     # The atomics field family: hand-written per-arity dispatch in
@@ -608,7 +613,7 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
         function (ctx)
             isempty(ctx.fns) && return Ex[psrc("+"), psrc("1"), psrc("2")]
             f = pick(ctx.rng, ctx.fns)
-            return Ex[psrc(String(f.name)), Ex[probearg(ctx) for _ in f.sigs[1]]...]
+            return Ex[nameref(f.name), Ex[probearg(ctx) for _ in f.sigs[1]]...]
         end,
     ],
     # Valid settings only. An *unknown* setting is rejected by codegen but
