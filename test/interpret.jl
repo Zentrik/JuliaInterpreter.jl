@@ -1756,3 +1756,26 @@ end
     @test typeof(err_interp) === typeof(err_native)
     @test sprint(showerror, err_interp) == sprint(showerror, err_native)
 end
+
+# callable used as the iterate callback of `Core._apply_iterate` (must be defined
+# at top level; used by the testset below)
+struct ApplyIterateCallable end
+(::ApplyIterateCallable)(x...) = Base.iterate(x...)
+
+@testset "_apply_iterate with custom callbacks and wrong arity" begin
+    my_iterate(x...) = Base.iterate(x...)
+    applyit(itr, f, t) = Core._apply_iterate(itr, f, t)
+    # non-standard iterate callbacks work natively; the interpreter used to throw
+    # ErrorException (custom Function) or TypeError (callable non-Function)
+    @test (@interpret applyit(my_iterate, +, (1, 2))) === applyit(my_iterate, +, (1, 2)) === 3
+    @test (@interpret applyit(ApplyIterateCallable(), +, (1, 2))) === 3
+    # too few arguments raises the native ArgumentError, not a BoundsError
+    apply_va(a...) = Core._apply_iterate(a...)
+    for badargs in ((), (Base.iterate,))
+        err_native = try apply_va(badargs...); nothing catch err; err end
+        err_interp = try @interpret apply_va(badargs...); nothing catch err; err end
+        @test err_native isa ArgumentError
+        @test typeof(err_interp) === typeof(err_native)
+        @test err_interp.msg == err_native.msg
+    end
+end

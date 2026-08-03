@@ -103,12 +103,14 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Some{Any}(Core._abstracttype(getargs(interp, args, frame)...))
     elseif f === Core._apply_iterate
         argswrapped = getargs(interp, args, frame)
-        if !expand
+        aw1 = isempty(argswrapped) ? nothing : argswrapped[1]
+        if !expand || length(argswrapped) < 2 ||
+            !(aw1 === Core.iterate || aw1 === Core.Compiler.iterate || aw1 === Base.iterate)
+            # Defer to the native builtin: it raises the native ArgumentError for too
+            # few arguments, and it is the only way to drive a non-standard iterate
+            # callback (`append_any` below hard-codes `iterate`)
             return Some{Any}(invoke_in_world(frame.world, Core._apply_iterate, argswrapped...))
         end
-        aw1 = argswrapped[1]::Function
-        aw1 === Core.iterate || aw1 === Core.Compiler.iterate || aw1 === Base.iterate ||
-            @invokelatest error("cannot handle `_apply_iterate` with non iterate as first argument, got ", aw1, ", ", typeof(aw1))
         new_expr = Expr(:call, argswrapped[2])
         popfirst!(argswrapped) # pop the iterate
         popfirst!(argswrapped) # pop the function
