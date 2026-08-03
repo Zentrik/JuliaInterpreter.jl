@@ -33,8 +33,9 @@ executing), `coverage.jl` (what a campaign actually *reaches* inside
 and functions; report in `coverage-report.md`), `longrun.sh` (sharded
 restart-looping campaigns), `crashmin.jl` (minimize a program that kills the
 process), `triage.jl` (which side broke, and does it still break on the
-newest Julia), `diag_stuck.jl` (why a stepping walk is stuck),
-`preserve-findings.sh` (force-commit findings, since `findings/` is
+newest Julia), `reshrink.jl` (re-shrink a finding from its seed far harder
+than an inline campaign can afford), `diag_stuck.jl` (why a stepping walk is
+stuck), `preserve-findings.sh` (force-commit findings, since `findings/` is
 gitignored).
 
 **Results so far: two JuliaInterpreter bugs.**
