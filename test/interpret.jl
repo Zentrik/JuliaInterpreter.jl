@@ -1818,3 +1818,14 @@ end
         @test typeof(err_interp) === typeof(err_native)
     end
 end
+
+@testset "non-Bool condition TypeError matches native fields" begin
+    nonbool_cond(x) = Base.inferencebarrier(x) ? 1 : 2
+    err_native = try nonbool_cond(1); nothing catch err; err end
+    err_interp = try @interpret nonbool_cond(1); nothing catch err; err end
+    @test err_native isa TypeError
+    @test err_interp isa TypeError
+    @test err_interp.func === err_native.func
+    @test err_interp.context == err_native.context
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+end

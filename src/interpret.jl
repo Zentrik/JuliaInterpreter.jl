@@ -867,7 +867,9 @@ function step_expr!(interp::Interpreter, frame::Frame, @nospecialize(node), isto
         elseif isa(node, GotoIfNot)
             arg = lookup(interp, frame, node.cond)
             if !isa(arg, Bool)
-                throw(TypeError(nameof(frame), "if", Bool, arg))
+                # native codegen raises TypeError(:if, "", Bool, arg) for a
+                # dynamically non-Bool condition (jl_type_error("if", ...))
+                throw(TypeError(:if, "", Bool, arg))
             end
             if !arg
                 @assert is_leaf(frame)
