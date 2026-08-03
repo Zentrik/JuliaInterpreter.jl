@@ -225,6 +225,8 @@ const PROBE_BANS = ProbeBan[
     # Verified on 1.11.9: `Core.apply_type(Array, Int, typemax(Int))` and
     # `Core.apply_type(NTuple, typemax(Int), Int)` segfault the runtime, and
     # typemax(Int) is in both the literal menu and the generated-Int menu.
+    ProbeBan(:apply_type, :arbitrary, "materializes a type from its arguments: a huge Int in a dimension/count slot segfaults the runtime (verified: apply_type(Array, Int, typemax(Int))). Recipes give it vetted constructor/parameter combinations, including the wrong-arity and wrong-type ones the old dictionary carried."),
+
     # -- inference blows up on statically-known-bad arguments ---------------
     # Measured on 1.11.9: `modifyglobal!(Symbol, s, s, :b)` — a *type* in the
     # module slot — makes inference of the Pair-shaped return type raise
@@ -248,8 +250,6 @@ const PROBE_BANS = ProbeBan[
     # the interpreter's guard is unreachable from real code — probing it would
     # manufacture the same known divergence in every campaign instead of news.
     ProbeBan(:_apply_iterate, :arbitrary, "compiled Julia ignores a non-`iterate` first argument and applies the second; the interpreter deliberately errors on it (src/builtins.jl). Unreachable from lowered code, so an arbitrary first argument is a permanent known divergence, not a finding. Recipes always pass `Base.iterate`."),
-
-    ProbeBan(:apply_type, :arbitrary, "materializes a type from its arguments: a huge Int in a dimension/count slot segfaults the runtime (verified: apply_type(Array, Int, typemax(Int))). Recipes give it vetted constructor/parameter combinations, including the wrong-arity and wrong-type ones the old dictionary carried."),
 ]
 
 banmatches(b::ProbeBan, name::Symbol) =
