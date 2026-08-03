@@ -460,15 +460,11 @@ against, default `release`), `--nowrite` (don't write `triage.md`).
 Useful flags: `--big` (larger programs), `--fresh` (ignore existing findings
 when seeding dedup — otherwise a reported bucket masks new ones),
 `--policy NAME` on `metrics.jl` (measure one generation policy in isolation),
-<<<<<<< HEAD
 `--journaldir` (required when running shards concurrently), `--noshrink` /
 `--shrinkruns N` / `--shrinksecs S` (skip or re-budget minimization; findings
-are shrunk on every axis by default).
-=======
-`--journaldir` (required when running shards concurrently), `--keep` +
-`--reuse` on `coverage.jl` (re-report from the `.cov` files a previous run
-left behind, without re-running the campaign).
->>>>>>> worktree-agent-a0222a76b16352ee3
+are shrunk on every axis by default), `--keep` + `--reuse` on `coverage.jl`
+(re-report from the `.cov` files a previous run left behind, without
+re-running the campaign).
 
 Run the selftest after any generator change. It is not a formality: it caught
 a generator bug this session that had raised smoke divergences from ≤5 to 13.
