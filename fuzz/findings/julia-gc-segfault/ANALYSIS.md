@@ -265,6 +265,39 @@ unboxed-data patterns (doubles/small ints ⇒ type confusion) from
 uninitialized junk, and is the single strongest piece of evidence we can
 attach short of an `rr` trace.
 
+### Crash 7 — the official binary reproduces crash 4's exact signature
+
+After the stock-binary control was restarted under a timeout-wrapped loop
+(its first attempt had silently wedged in a stuck stepping walk for >1.5 h,
+so its earlier "clean" run was not a real negative), the **official juliaup
+1.12.6 binary** crashed within ~9 minutes with **exactly the crash-4
+signature** (`crashed/crash7-egal-leafcache-stockbinary.txt`):
+`compare_svec` ← `jl_egal_` ← `ijl_eqtable_get` ← `lookup_leafcache` ←
+`ml_matches` ← `ijl_gf_invoke_lookup_worlds` ← `whichtt`.
+
+Consequences:
+
+- **The rebuild-artifact caveat is eliminated.** The same fault at the
+  same instruction on Julia's official binary and on the from-source
+  build.
+- **The method-table leafcache is the dominant repeat offender**: 2 of 7
+  crashes at this exact instruction, 2 more with the triggering
+  allocation inside the same `prepare_call` lookup path.
+- si_code here is **1 (SEGV_MAPERR)** — a canonical but unmapped address —
+  unlike the non-canonical (128) group. This matters because the
+  stays-mapped argument in the crash-5/6 section **only covers pool
+  pages**: objects over ~2 KB (large `svec`s, big `Memory` buffers) are
+  **malloc'd big objects, freed at sweep**, and freed malloc arenas can
+  be trimmed/unmapped. A dangling reference to a swept *big* object is
+  therefore back on the table for the SEGV_MAPERR crashes (2, 3, 7),
+  while the non-canonical group (1, 4, 5, 6) still requires garbage bits
+  (type confusion / uninitialized slot / OOB scribble).
+
+So the evidence now supports **two observable corruption flavors** — slots
+holding never-were-pointers bit patterns, and (possibly) references to
+swept big objects — concentrated around the gf.c dispatch-cache machinery
+under module + method + world churn.
+
 ### Interim conclusion
 
 Four distinct fault sites — GC mark of an object array, pool allocator
