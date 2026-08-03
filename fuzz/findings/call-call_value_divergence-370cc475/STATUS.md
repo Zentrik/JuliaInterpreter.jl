@@ -1,39 +1,42 @@
-# Status: UNDER TRIAGE — call-axis exception-TYPE divergence (fork: real vs harness)
+# Status: RESOLVED — NOT an interpreter bug (interpreter is CORRECT; native codegen is the unstable/UB side)
 
-Found by the `call` axis on the `-O1` campaign (2026-08-03).
-`reprocall(SRC, 7067809865547766385)` reproduces:
-`f16/1: native=(:__thrown, :UndefVarError) interp=(:__thrown, :ArgumentError)`.
+Triaged + verified 2026-08-03.
 
-Both sides throw; the **exception type** differs. `f16`'s body:
+## What it actually is
 
-```julia
-function f16(va17...)
-    v18 = S1((@atomic (sv10).fld4))          # S1, sv10 both defined at toplevel
-    v20 = Float64[... for c19 in 1:2 if ...]
-    return (try Core._svec_ref(Base.compilerbarrier(:const, g6)) catch __e; (:__thrown, nameof(typeof(__e))) end)
-end
-```
+`f16`'s return runs `Core._svec_ref(compilerbarrier(:const, g6))` — a
+`Core.Builtin` requiring 2 args `(SimpleVector, index)` called with **1**. The
+divergence: `native=(:__thrown, :UndefVarError) interp=(:__thrown, :ArgumentError)`.
 
-`g6` and `sv10` are both assigned at toplevel (`g6 = :c`, `sv10 = S3(...)`), so
-neither is an obviously-undefined read. The native `UndefVarError` is therefore
-not from a plainly-missing global — its source (a field/type resolution, `S1`
-vs `S3` mismatch, or `Core._svec_ref` internals) needs to be pinned.
+The **interpreter is the correct party**: it throws a clean, stable
+`ArgumentError: _svec_ref: too few arguments (expected 2)` in every context.
 
-## The fork (do NOT report as confirmed until settled)
+The **native side's exception is optimization-context-dependent** for this
+statically-arity-wrong builtin call. The triage bot observed native throw
+`UndefVarError` / `BoundsError` / `ArgumentError` across different call sites, and
+reported a corrupted exception object whose `showerror` **segfaulted** in one
+compiled context (concrete-eval UB under `-O1`).
 
-1. **Real interpreter bug**: the interpreter reaches a different throw site than
-   native for the same call — e.g. it does not raise `UndefVarError` where
-   native does and instead proceeds into `Core._svec_ref` (→ `ArgumentError`).
-   That would be a genuine divergence worth a minimal repro + fix.
-2. **Call-axis harness artifact**: like `700181ab`/`8a9f8dee`, the direct
-   `enter_call` invocation leaves the module in a state (unreset program
-   globals, world-age of `latesttargets`) where the interpreter's call sees
-   different global definedness than the native call.
+## Verification
 
-Decisive next step: minimize to the single throwing expression and check
-whether a plain undefined-global read (or `Core._svec_ref` with a bad arg)
-diverges between `@interpret` and native in isolation. If it reproduces
-stand-alone → (1); if only under the call-axis harness → (2).
+I could NOT reproduce the corrupted-exception/segfault in simple contexts: at top
+level AND inside a `@noinline` function at `-O1`, native throws a clean
+`ArgumentError` and `showerror` works (subprocess exit 0), agreeing with the
+interpreter. The dramatic native UB only appears in specific optimization
+contexts (matching the bot's per-call-site table). Either way, the interpreter is
+stable and correct; the native exception is the variable/broken side.
 
-This is the 3rd call-axis candidate; all three so far lean harness — a data
-point for the "downweight less-useful avenues" review.
+## Disposition
+
+- **No `src/` change.** The interpreter already produces the right, stable error.
+- **Possible upstream Julia bug** (low priority): a too-few-arguments
+  `Core.Builtin` call, under compilation/concrete-eval at `-O1`, can produce a
+  context-dependent or corrupted exception object (type tag ≠ message; a
+  `showerror` segfault was observed by the triage bot). If a clean minimal repro
+  can be pinned it is worth `findings/julia/`. Not reproducible in the simple
+  contexts tried here.
+- **Harness:** same gap as `8a9f8dee` — the call axis treats compiled native as
+  ground truth with no three-way adjudication, so native-side compiler
+  UB/instability surfaces as a "finding." Add three-way (JI-vs-C) adjudication,
+  or treat a native exception that is `showerror`-unshowable / type-unstable as an
+  uncertified native-UB case rather than a finding.
