@@ -27,17 +27,29 @@ executing), `longrun.sh` (sharded restart-looping campaigns), `crashmin.jl`
 walk is stuck), `preserve-findings.sh` (force-commit findings, since
 `findings/` is gitignored).
 
-**Results so far: no JuliaInterpreter bug.** Campaigns of hundreds to a few
-thousand cases per axis ran clean. What the work did produce:
+**Results so far: one JuliaInterpreter bug, found and fixed.**
 
-- four generator bugs and four harness bugs, several of which were silently
-  destroying yield (see the lessons below);
+`rethrow()` inside a `catch` block failed under `NonRecursiveInterpreter` with
+*"rethrow() not allowed outside a catch block"*, where compiled Julia and
+`RecursiveInterpreter` both rethrow correctly. Reproduces on 1.11.9 and
+1.12.6. Cause: interpreted catch handlers never populate the task's native
+exception stack — frames model active exceptions themselves — so
+`evaluate_call!` intercepts `Base.rethrow` and answers from that model, but
+compiled mode's method went straight to `native_call` and skipped the
+interception. `Base.current_exceptions` had the same hole. Fixed in
+`evaluate_stateful_call!`, shared by both interpreters (commit `7cb0715`).
+
+The campaign that found it also produced:
+
+- four generator bugs and five harness bugs, several silently destroying yield
+  (see the lessons below);
 - one genuine Julia compiler crash, which turned out to be a known 1.11
-  regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`).
+  regression already fixed in 1.12
+  (`findings/julia-codegen-abort-allocopt/`).
 
-Treat "no interpreter bug yet" as an open question, not a conclusion. The
-axes have not run at the scale where they would be expected to produce
-anything — the literature's numbers are 10^8 and up, these runs are 10^3–10^4.
+One interpreter bug in ~10^4 cases is a real result but a thin one, and the
+axes still have not run at the scale where they would be expected to produce
+much — the literature's numbers are 10^8 and up.
 
 ---
 
@@ -60,6 +72,24 @@ still reproduces on current Julia. Both matter:
 The whole codegen-crash episode — journal replay, minimization, C-Reduce, a
 delegated reduction agent — was work on a bug fixed a release earlier, and one
 version check up front would have answered it.
+
+### 1b. Compare exception payloads, not just type names
+
+Cheap, and the `rethrow` bug is the argument for it. That bug broke *every*
+`rethrow()` in compiled mode, but the oracle only saw the cases whose original
+exception was not an `ErrorException` — because the interpreter's own failure
+mode is `ErrorException: rethrow() not allowed outside a catch block`, and
+`classify` compares exception *type names* only. The `error("boom")` variant
+reads as agreement. The fuzzer found this despite the oracle, not because of
+it.
+
+Messages were excluded deliberately (they drift across Julia versions), which
+is right, but the current rule throws away too much. Compare the fields that
+are contract, not prose: `MethodError.f` and `.args`, `BoundsError.a`/`.i`,
+`UndefVarError.var`, `TypeError.func`/`.expected`/`.got`,
+`ArgumentError`/`ErrorException` message text behind a flag. Expect a wave of
+recalibration when this lands — several currently-agreeing cases will start
+diverging, and the first ones will be harness artifacts as usual.
 
 ### 2. Semantic coverage of the interpreter (P2 in `yield-analysis.md`)
 
