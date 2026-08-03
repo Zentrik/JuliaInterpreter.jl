@@ -17,7 +17,9 @@ function __fjnorm__(x)
     elseif x isa Function
         return :__fn__
     elseif x isa Type
-        return Symbol(string(x))
+        # module-qualified names differ between the two fresh modules; strip
+        # this module's own prefix (see SETUP_SRC in fuzz/src/render.jl)
+        return Symbol(replace(string(x), string(@__MODULE__, ".") => ""))
     else
         return Symbol(nameof(typeof(x)))
     end

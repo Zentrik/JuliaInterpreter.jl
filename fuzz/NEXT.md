@@ -14,7 +14,7 @@ proposals now folded into the ranked list below.
 
 ## Where things stand
 
-Four axes exist. Three of them cover surfaces that had no systematic testing
+Five axes exist. Four of them cover surfaces that had no systematic testing
 before.
 
 | engine | what it tests | oracle |
@@ -23,6 +23,7 @@ before.
 | `step` | `debug_command` walks — `commands.jl`, `breakpoints.jl` | stepping terminates, raises nothing plain interpretation doesn't, and reaches the same observations |
 | `evalcode` | `eval_code` at paused frames — `utils.jl` | reads match `locals(frame)`; writes round-trip and don't disturb other locals |
 | `corpus` | real Julia source, spliced — `construct.jl`, macro-heavy paths | differential on *failure mode only* (never on values) |
+| `split` | adversarial toplevel forms — `ExprSplitter` in `construct.jl` | differential vs. `Core.eval` on failure mode, observation stream, **and the resulting module tree** |
 
 Supporting tools: `metrics.jl` (what the generator actually produces, without
 executing), `longrun.sh` (sharded restart-looping campaigns), `crashmin.jl`
@@ -102,16 +103,19 @@ touches: statement heads, which builtin arms in `builtins.jl`, which
 
 Do stage one before stage two. It is cheap and it de-risks the rest.
 
-### 3. Shrinking for the step, evalcode and corpus axes
+### 3. Shrinking for the step, evalcode, corpus and split axes
 
-These three write findings **unshrunk** — `writefinding` is handed the same
+These four write findings **unshrunk** — `writefinding` is handed the same
 source twice. So the first real finding on the axes with the best
 bug-density argument arrives as a 60-line program with no minimization.
 
 The differential axis's IR shrinker (`shrink.jl`) does not transfer directly:
 it re-runs `run_both` and compares fingerprints. Each new axis needs its
 property threaded through instead — for `step`, "the same command walk still
-diverges/gets stuck"; for `evalcode`, "the same check still fails". Note the
+diverges/gets stuck"; for `evalcode`, "the same check still fails"; for
+`split`, "the same fingerprint still comes back", which is a pure
+source-text-in/verdict-out predicate and the easiest of the four to wire up.
+Note the
 RNG stream matters for `step` (see `diag_stuck.jl`): the walk continues the
 same RNG the generator used, so a shrunk program must be replayed the same
 way or the command sequence changes.
@@ -169,18 +173,42 @@ order:
   stress. Curated deterministic `ccall`s (`strlen`/`memcmp`/libm on
   generated values) for the `:foreigncall` conversion path ride along.
 
-### 6. An `ExprSplitter` axis (P3 item 13)
+### 6. An `ExprSplitter` axis (P3 item 13) — **done**
 
-`construct.jl` has the densest fix history in the package (9 commits) and is
-still only exercised incidentally. A dedicated axis would feed it adversarial
-toplevel forms directly: nested `module` blocks, `baremodule`, bare `begin`
-blocks, toplevel macros that expand to multiple statements, `const` and
-global declarations in odd positions, scope blocks that cannot be split.
-Oracle: the sequence of `(mod, frag)` pairs is consistent with what
-`Core.eval` does with the same source, and no internal error.
+`--engine split`, `fuzz/src/splitfuzz.jl`; see DESIGN.md's section for the
+shape of it. A template-combinator generator (not the IR grammar) emits
+adversarial toplevel forms — nested `module`/`baremodule`, unsplittable
+`begin`/`let`/`try` blocks, toplevel macros expanding to `:block`,
+`Expr(:toplevel, ...)`, a bare `global`, or a whole `module`, docstrings
+(including a module docstring interpolating a binding its own body defines),
+`const`/`global`/typed-global in odd positions, `;`-separated toplevel lines,
+cross-module references, `export`/`public`/`using .M`, name shadowing in
+nested modules, and empty/comment-only sections. The oracle is differential
+against `Core.eval` on three things: failure mode, observation stream, and the
+**module tree** — every name defined in the root module and recursively in the
+submodules the program created, values normalized `__fjnorm__`-style. That
+third one is the point: these programs mostly define rather than compute, so a
+definition the interpreted path silently skipped is invisible to an
+observation-stream oracle.
 
-Ordering between items 4–6 is soft. This one has the strongest pure
-bug-density argument (fix history); item 5 has the strongest
+Calibration: ~9500 cases run clean (no findings, 0 discards, ~19 cases/s,
+mean 12 fragments and 11 compared names per case). A mutation test — drop one
+`ExprSplitter` fragment on the interpreted side — is caught 86% of the time
+(66% `split_missing_effect`, 20% `split_internal_error`), which is what says
+the oracle has teeth rather than the axis being vacuous. Two legitimate
+divergences were found and designed out of the generator rather than
+suppressed; one more (module creation runs *one fragment ahead*, so a module
+after a throwing statement exists on the interpreted side only) is why module
+state is not compared on the throwing path. All three are documented at their
+constants in `splitfuzz.jl`.
+
+Not done for this axis: shrinking (writes `original == shrunk`, see item 3),
+Compiled-mode (`NonRecursiveInterpreter`) runs, and `Base.__toplevel__` as the
+parent module — `find_or_create_module`'s package-resolution arm
+(`find_toplevel_module_id`, `Base.loaded_modules`) is only reachable from
+there and is still untested by any axis.
+
+Ordering between items 4–5 is soft. Item 5 has the strongest
 breadth-of-tested-code argument. A session should pick by which question it
 is trying to answer.
 

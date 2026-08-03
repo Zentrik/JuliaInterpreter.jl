@@ -21,9 +21,11 @@ include("driver.jl")
 include("stepfuzz.jl")
 include("evalcodefuzz.jl")
 include("corpus.jl")
+include("splitfuzz.jl")
 include("supposition.jl")
 
 export campaign, supposition_campaign, step_campaign, evalcode_campaign, corpus_campaign,
-       genprogram, render, run_both, classify, shrink, Cfg, ProgramGen
+       split_campaign, genprogram, gensplit, render, run_both, classify, shrink, Cfg,
+       SplitCfg, ProgramGen
 
 end
