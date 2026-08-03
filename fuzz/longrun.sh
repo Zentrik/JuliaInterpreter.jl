@@ -17,10 +17,20 @@
 # *share* findings/, so the dedup set is global: a divergence one shard already
 # reported does not get re-reported by the other three.
 #
-# Default shards cover all six axes. The large-program variant of the
-# differential axis (native-big) is available by name but not in the default
-# set — yield-analysis.md's conclusion is that program size is the weaker
-# lever, and the slot is better spent on the enter_call axis (new surface).
+# Default shards are weighted by demonstrated yield per hour, not one-per-axis
+# (see evaluation-2026-08-03.md and mutantbench-report.md):
+#   - step gets TWO shards: it is the one axis with ground-truth validation
+#     (rediscovered the whereis-nothing crash at n=300 in the mutant pilot,
+#     plus one real crash found historically), and the breakpoint driver just
+#     opened breakpoints.jl (13% -> 80% line coverage).
+#   - native keeps one: 4 of 5 historical findings, mostly via the prober.
+#   - call gets one: brand-new public-API surface, unvalidated but high prior.
+#   - corpus keeps one: uniquely reaches 12 builtin arms no generated axis hits.
+#   - split and evalcode SHARE one shard (alternating batches): ~14k clean
+#     split cases at calibration, evalcode has 0 findings and — per the mutant
+#     curation — no clean historical mutant to validate against, so neither
+#     earns a full core until one produces.
+# native-big remains available by name (program size is the weaker lever).
 # With four cores, six shards is a slight oversubscription on purpose — the
 # corpus shard spends real time in Core.eval compiling fragments, so it does
 # not hold a core the whole time.
@@ -40,7 +50,7 @@ DURATION="${1:-3600}"
 shift || true
 SHARDS=("$@")
 if [ ${#SHARDS[@]} -eq 0 ]; then
-    SHARDS=(native step corpus evalcode split call)
+    SHARDS=(native step step2 call corpus misc)
 fi
 
 LOGDIR="fuzz/longrun"
@@ -48,28 +58,37 @@ mkdir -p "$LOGDIR"
 DEADLINE=$(( $(date +%s) + DURATION ))
 
 # Per-batch case counts, chosen so a batch is minutes rather than hours: the
-# loop can only react to the deadline between batches.
+# loop can only react to the deadline between batches. $2 is the batch number,
+# used by the alternating misc shard.
 batch_args() {
     case "$1" in
         native)     echo "--engine native --n 4000 --modes both" ;;
         native-big) echo "--engine native --n 1500 --modes both --big" ;;
-        step)       echo "--engine step --n 1500" ;;
+        step|step2) echo "--engine step --n 1500" ;;
         evalcode)   echo "--engine evalcode --n 1200" ;;
         corpus)     echo "--engine corpus --n 800 --maxsplice 4" ;;
         split)      echo "--engine split --n 3000" ;;
         call)       echo "--engine call --n 1500" ;;
+        misc)       # split and evalcode alternate on one core (downweighted)
+                    if [ $(( ${2:-1} % 2 )) -eq 1 ]; then
+                        echo "--engine split --n 3000"
+                    else
+                        echo "--engine evalcode --n 1200"
+                    fi ;;
         *) echo "unknown shard $1" >&2; return 1 ;;
     esac
 }
 
 run_shard() {
     local name="$1" seed="$2" args log jdir batch=0
-    args="$(batch_args "$name")" || return 1
+    batch_args "$name" 1 >/dev/null || return 1
     log="$LOGDIR/$name.log"
     jdir="fuzz/journal-$name"
     : > "$log"
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         batch=$((batch + 1))
+        # Re-derived per batch: the misc shard alternates engines.
+        args="$(batch_args "$name" "$batch")"
         # The journal holds the candidate that was executing, but only until the
         # next one overwrites it — so a batch that died leaves its reproducer in
         # current.jl and the *next* batch immediately destroys it. Set it aside
@@ -95,7 +114,9 @@ echo "longrun: ${#SHARDS[@]} shards for ${DURATION}s -> $LOGDIR/"
 i=0
 for s in "${SHARDS[@]}"; do
     i=$((i + 1))
-    run_shard "$s" $(( i * 1000000 )) &
+    # 10^8 apart: shards advance 100000 per batch, so the old 10^6 spacing made
+    # shard i re-explore shard i+1's seed range after ten batches.
+    run_shard "$s" $(( i * 100000000 )) &
 done
 wait
 echo "longrun: complete"
