@@ -11,8 +11,15 @@
 # It works on source text rather than the generator's IR, because a crashing
 # candidate arrives as a journal file — the program that was executing when the
 # worker died — and by then the IR that produced it is gone with the process.
-# Line-oriented delta debugging is enough for that: generated programs are one
-# statement per line, so deleting lines is close to deleting statements.
+#
+# The search itself is `FuzzJI.ddmin_source` (src/shrink.jl), the same
+# statement-level delta debugger the corpus axis uses; only the property differs
+# ("the subprocess died by signal" instead of "the finding survived"). Statement
+# granularity beats the line granularity this script used to have: a multi-line
+# `function` or `for` is one deletion candidate rather than a run of lines that
+# only sometimes cuts on a statement boundary. A candidate that does not parse
+# has no statements to delete, so the original line-based loop is kept as the
+# fallback for that case.
 
 const USAGE = "usage: julia --project=fuzz fuzz/crashmin.jl CANDIDATE.jl [--out FILE] [--timeout SECS]"
 
@@ -76,15 +83,16 @@ if !crashes(original; timeoutsecs)
 end
 println("yes")
 
-# Line-granularity delta debugging: delete progressively smaller runs of lines,
-# keeping any deletion that still crashes. Standard ddmin shape — start coarse,
-# halve the chunk size when a pass stops helping.
+# Line-granularity delta debugging, kept as the fallback for a candidate that
+# does not parse (statement-level minimization has nothing to work with then).
+# Standard ddmin shape — start coarse, halve the chunk size when a pass stops
+# helping.
 #
 # In a function, not at toplevel: a `while` body at toplevel is a soft scope, so
 # assigning to `lines`/`chunk` there silently creates locals and the loop reads
 # an undefined variable on its first iteration. (The generator had the same bug
 # in its own emitted `while` loops; it is an easy one to write twice.)
-function ddmin(original::AbstractString; timeoutsecs::Int)
+function ddmin_lines(original::AbstractString; timeoutsecs::Int)
     lines = split(original, '\n')
     chunk = max(1, length(lines) ÷ 2)
     ntests = 0
@@ -108,7 +116,18 @@ function ddmin(original::AbstractString; timeoutsecs::Int)
     return join(lines, '\n'), ntests
 end
 
-minimized, ntests = ddmin(original; timeoutsecs)
+include(joinpath(@__DIR__, "src", "FuzzJI.jl"))
+
+minimized, ntests = if FuzzJI.toplevel_statements(original) === nothing
+    println("candidate does not parse — falling back to line-granularity ddmin")
+    ddmin_lines(original; timeoutsecs)
+else
+    # No wall-clock cap: unlike a campaign, this script has one job and the user
+    # is waiting for the answer, not for the next case.
+    budget = FuzzJI.ShrinkBudget(; maxruns=typemax(Int), seconds=Inf)
+    out = FuzzJI.ddmin_source(original, src -> crashes(src; timeoutsecs); budget)
+    (out, budget.runs)
+end
 write(outfile, minimized)
 println()
 println("minimized $(count(==('\n'), original)) -> $(count(==('\n'), minimized)) lines in $ntests subprocess runs")
