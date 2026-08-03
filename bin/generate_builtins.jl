@@ -359,14 +359,20 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
             # for the `Core.eval` below, since lowering requires cglobal syntax.
             call_expr.args[1] = GlobalRef(Base, :cglobal)
             args2 = args[2]
-            call_expr.args[2] = isa(args2, QuoteNode) ? args2 : lookup(interp, frame, args2)
+            # Looked-up Symbol (or Expr) values must be re-quoted before splicing them
+            # into the evaluated expression: spliced bare, lowering would treat a Symbol
+            # naming the C global as an identifier in the frame's module.
+            args2v = isa(args2, QuoteNode) ? args2 : lookup(interp, frame, args2)
+            call_expr.args[2] = isa(args2v, Union{Symbol,Expr}) ? QuoteNode(args2v) : args2v
             return Some{Any}(Core.eval(moduleof(frame), call_expr))
         elseif nargs == 2
             call_expr = copy(call_expr)
             call_expr.args[1] = GlobalRef(Base, :cglobal)
             args2 = args[2]
-            call_expr.args[2] = isa(args2, QuoteNode) ? args2 : lookup(interp, frame, args2)
-            call_expr.args[3] = lookup(interp, frame, args[3])
+            args2v = isa(args2, QuoteNode) ? args2 : lookup(interp, frame, args2)
+            call_expr.args[2] = isa(args2v, Union{Symbol,Expr}) ? QuoteNode(args2v) : args2v
+            args3v = lookup(interp, frame, args[3])
+            call_expr.args[3] = isa(args3v, Union{Symbol,Expr}) ? QuoteNode(args3v) : args3v
             return Some{Any}(Core.eval(moduleof(frame), call_expr))
         end
 """)

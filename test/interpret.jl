@@ -1742,3 +1742,17 @@ end
     @eval oc_from_raw_expr() = $ocex
     @test (@interpret Main.oc_from_raw_expr())() == 1
 end
+
+@testset "cglobal with a runtime Symbol argument" begin
+    cglobal_sym1(s) = cglobal(s)
+    cglobal_sym2(s) = cglobal(s, Cint)
+    # a Symbol arriving through a slot must name the C global, not a Julia binding
+    @test (@interpret cglobal_sym1(:jl_n_threads)) === cglobal_sym1(:jl_n_threads)
+    @test (@interpret cglobal_sym2(:jl_n_threads)) === cglobal_sym2(:jl_n_threads)
+    # a nonexistent symbol raises the native error, not UndefVarError
+    err_native = try cglobal_sym1(:not_a_real_c_symbol_xyz); nothing catch err; err end
+    err_interp = try @interpret cglobal_sym1(:not_a_real_c_symbol_xyz); nothing catch err; err end
+    @test err_native isa ErrorException
+    @test typeof(err_interp) === typeof(err_native)
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+end
