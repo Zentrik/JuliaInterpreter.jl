@@ -95,7 +95,9 @@ harness noticed something" and "a human looks at it":
 `fuzz/coverage-report.md`. **Stage two is still open** and is what to pick up
 here.
 
-Stage one did not need the `CoverageInterp <: Interpreter` sketched below.
+Stage one did not need the `CoverageInterp <: Interpreter` this item
+originally called for (an interpreter subtype recording statement heads,
+builtin arms, `evaluate_call!` paths and `localmethtable` dispatch).
 Julia's own `--code-coverage=@<repo>/src`, gathered from campaign
 subprocesses, answers the same question with *zero* instrumentation of the
 interpreter and a ~1.3× time tax: `coverage.jl` spawns the shards, parses the
