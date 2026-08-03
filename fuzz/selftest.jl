@@ -520,6 +520,54 @@ end
         @test rngstreams > 0      # some __RNG__ programs ran clean and matched
     end
 
+    @testset "freshmodule prelude matches SETUP_SRC" begin
+        # freshmodule binds shared helper *instances* instead of re-evaluating
+        # SETUP_SRC per module (execute.jl, NEXT.md item 8) — SETUP_SRC stays
+        # the specification (ji.jl evaluates it verbatim, reprolib mirrors it).
+        # This pins the behavioral equivalence the substitution claims: a
+        # module built the old way and a freshmodule() must agree helper by
+        # helper, on every branch of __fjnorm__.
+        verbatim = Module(:FJVerbatim)
+        for st in Meta.parseall(FuzzJI.SETUP_SRC).args
+            st isa LineNumberNode && continue
+            Core.eval(verbatim, st)
+        end
+        fresh = FuzzJI.freshmodule()
+        for m in (verbatim, fresh)   # a program-defined type, for the prefix strip
+            Core.eval(m, :(struct ZQ; x::Int64; end))
+        end
+        battery(m) = Any[1, 1.5, "s", :sym, 'c', nothing, (1, (2.0, "x")),
+                         Any[1, :a, [2]], Dict{Int64,String}(2 => "b", 1 => "a"),
+                         Set{Int64}([3, 1]), sin, Vector{Int64},
+                         Base.invokelatest(getglobal, m, :ZQ),
+                         Base.invokelatest(Core.eval, m, :(ZQ(7))),
+                         (1 => :two), (a = 1, b = :z), Core.svec(1, "2")]
+        vnorm = Base.invokelatest(getglobal, verbatim, :__fjnorm__)
+        fnorm = Base.invokelatest(getglobal, fresh, :__fjnorm__)
+        for (a, b) in zip(battery(verbatim), battery(fresh))
+            va, vb = Base.invokelatest(vnorm, a), Base.invokelatest(fnorm, b)
+            @test isequal(va, vb) && typeof(va) === typeof(vb)
+        end
+        # the type-name strip must remove exactly the module's own prefix
+        @test Base.invokelatest(fnorm, Base.invokelatest(getglobal, fresh, :ZQ)) === :ZQ
+        # __obs__ returns nothing and pushes the normalized value onto __OBS__
+        vobs = Base.invokelatest(getglobal, verbatim, :__obs__)
+        fobs = Base.invokelatest(getglobal, fresh, :__obs__)
+        @test Base.invokelatest(vobs, (1, :a)) === Base.invokelatest(fobs, (1, :a)) === nothing
+        @test isequal(FuzzJI.getobs(verbatim), FuzzJI.getobs(fresh))
+        # __vtime__ is the same monotone counter, backed by __VTIME__
+        vt = Base.invokelatest(getglobal, verbatim, :__vtime__)
+        ft = Base.invokelatest(getglobal, fresh, :__vtime__)
+        @test Base.invokelatest(vt) == Base.invokelatest(ft) == 1
+        @test Base.invokelatest(vt) == Base.invokelatest(ft) == 2
+        @test Base.invokelatest(getglobal, fresh, :__VTIME__)[] == 2
+        # both helpers are Functions (isa Function checks see the same thing)
+        @test vnorm isa Function && fnorm isa Function && fobs isa Function
+        # `using Random` still holds in the fresh module (`const __RNG__ =
+        # Xoshiro(seed)` in rendered programs resolves against it)
+        @test Base.invokelatest(Core.eval, fresh, :(Xoshiro(1) isa Xoshiro))
+    end
+
     @testset "compiled-mode (NonRecursiveInterpreter) smoke" begin
         ndiverge = 0
         for seed in 1:40
