@@ -313,6 +313,11 @@ function evaluate_call!(interp::NonRecursiveInterpreter, frame::Frame, call_expr
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
 function evaluate_call!(::NonRecursiveInterpreter, frame::Frame, fargs::Vector{Any}, ::Bool)
+    # Even in compiled mode, calls that read interpreter state have to be
+    # answered from that state rather than run natively — see
+    # `evaluate_stateful_call!`.
+    ret = evaluate_stateful_call!(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     return native_call(fargs, frame)
 end
 
@@ -326,10 +331,24 @@ function evaluate_call!(interp::Interpreter, frame::Frame, call_expr::Expr, ente
     fargs = collect_args(interp, frame, call_expr)
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
-function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
-    if fargs[1] === Core.eval
-        return Core.eval(fargs[2], fargs[3])  # not a builtin, but worth treating specially
-    elseif fargs[1] === Base.rethrow
+# Calls whose result depends on *interpreter* state rather than on the callee's
+# code. Their native implementations read the task's exception stack, which
+# interpreted handlers never populate — the interpreter models the active
+# exceptions per frame instead — so running them natively gives an answer about
+# the wrong stack. That is independent of whether callees execute natively, so
+# both interpreters must intercept them; `NonRecursiveInterpreter` skipping this
+# is what made a plain
+#
+#     try; throw(ArgumentError("x")); catch; rethrow(); end
+#
+# fail under compiled mode with "rethrow() not allowed outside a catch block",
+# while the same code run compiled, or under `RecursiveInterpreter`, rethrows
+# the ArgumentError.
+#
+# Returns `Some{Any}(result)`, or `nothing` when the call is not one of these.
+# `rethrow` never returns normally.
+function evaluate_stateful_call!(frame::Frame, fargs::Vector{Any})
+    if fargs[1] === Base.rethrow
         if length(fargs) > 1
             exc = fargs[2]
             # `rethrow(exc)` replaces the exception currently being handled; find it in
@@ -380,8 +399,17 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         for exs in blocks, exc in exs
             push!(stack, (exception = exc, backtrace = bt))
         end
-        return Base.ExceptionStack(stack)
+        return Some{Any}(Base.ExceptionStack(stack))
     end
+    return nothing
+end
+
+function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
+    if fargs[1] === Core.eval
+        return Core.eval(fargs[2], fargs[3])  # not a builtin, but worth treating specially
+    end
+    ret = evaluate_stateful_call!(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     if fargs[1] === Core.invoke # invoke needs special handling
         argtypes = fargs[3]
         fargs_pruned = [fargs[2]; fargs[4:end]]

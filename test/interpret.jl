@@ -1763,3 +1763,62 @@ end
     @eval oc_from_raw_expr() = $ocex
     @test (@interpret Main.oc_from_raw_expr())() == 1
 end
+
+@testset "rethrow in compiled mode" begin
+    # `rethrow()` reads the exception currently being handled. Interpreted catch
+    # handlers never put it on the task's native exception stack — the frames
+    # model it themselves — so the interpreter has to answer the call from that
+    # model. `NonRecursiveInterpreter` used to go straight to a native call,
+    # which read an empty stack and raised "rethrow() not allowed outside a
+    # catch block" for code that compiled Julia and `RecursiveInterpreter` both
+    # handled fine. Found by differential fuzzing (FuzzJI).
+    src = """
+    try
+        throw(ArgumentError("x"))
+    catch
+        rethrow()
+    end
+    """
+    function run_toplevel(interp, src)
+        m = Module(:RethrowTest)
+        for (mod, frag) in ExprSplitter(m, Meta.parseall(src))
+            JuliaInterpreter.finish_and_return!(interp, Frame(mod, frag), true)
+        end
+    end
+    for interp in (RecursiveInterpreter(), NonRecursiveInterpreter())
+        @test_throws ArgumentError run_toplevel(interp, src)
+    end
+
+    # The same through a callee, which is where compiled mode actually differs:
+    # the call runs natively, so the exception never passes through interpreted
+    # code at all before the handler rethrows it.
+    onlyint(x::Int) = x
+    src2 = """
+    try
+        Main.onlyint("nope")
+    catch
+        rethrow()
+    end
+    """
+    @eval Main onlyint(x::Int) = x
+    for interp in (RecursiveInterpreter(), NonRecursiveInterpreter())
+        @test_throws MethodError run_toplevel(interp, src2)
+    end
+
+    # `current_exceptions` reads the same state and is intercepted alongside it.
+    src3 = """
+    try
+        throw(ArgumentError("y"))
+    catch
+        length(current_exceptions())
+    end
+    """
+    for interp in (RecursiveInterpreter(), NonRecursiveInterpreter())
+        m = Module(:CurExcTest)
+        local ret = nothing
+        for (mod, frag) in ExprSplitter(m, Meta.parseall(src3))
+            ret = JuliaInterpreter.finish_and_return!(interp, Frame(mod, frag), true)
+        end
+        @test ret == 1
+    end
+end
