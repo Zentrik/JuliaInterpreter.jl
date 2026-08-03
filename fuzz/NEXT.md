@@ -164,6 +164,15 @@ divergences also surfaced (`_apply_iterate` with a non-`iterate` first
 argument, `compilerbarrier` with an unknown setting) — both unreachable from
 lowered code, both now confined to recipes.
 
+Closing evidence: 1500 probe-heavy candidates (native engine, `builtins`
+policy, both interpreter modes) through a restart-looping subprocess soak with
+the journal armed. Three process deaths, all reference-side Julia defects with
+no probe involved — two known `llvm-alloc-opt` aborts and one delayed
+`gc_mark_obj8` segfault that did not reproduce on replay; two divergences,
+both the `invoke` finding above. Generation stayed valid by construction
+throughout: 0 parse/lowering failures in 800 seeds × 7 policies, and 0 gate
+discards across the soak.
+
 One pre-existing generator bug fell out of this: the mutating-closure rule
 decremented `rtscopes` without incrementing it, so everything generated after
 a mutating closure believed it was at module toplevel. `while` fuel

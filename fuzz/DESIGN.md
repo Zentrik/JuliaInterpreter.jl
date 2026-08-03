@@ -228,9 +228,17 @@ with the journal armed and reading back the candidate that was running when
 the process died — the same restart-loop-plus-journal discipline `longrun.sh`
 uses for campaigns. Do that before widening the target set, never in-process:
 the failure mode being hunted is precisely the one that takes the worker down
-with it. In the 1.5k-candidate soak that closed this work, the only remaining
-process deaths were the known 1.11 `llvm-alloc-opt` abort, which is a
-reference-side Julia bug reachable from `@atomic` structs alone.
+with it. In the 1.5k-candidate soak that closed this work, the three remaining
+process deaths were all reference-side *Julia* defects reachable from
+`@atomic` struct code with no probe involved: two aborts in the known 1.11
+`llvm-alloc-opt` pass (`findings/julia-codegen-abort-allocopt`, reproduced on
+the pre-prober checkout as well) and one segfault inside `gc_mark_obj8` during
+a collection, which did not reproduce when the same 718-candidate range was
+replayed in a fresh process — delayed, nondeterministic heap corruption of the
+same family. Probe-attributable deaths (SIGILL from a `Type` in a module slot,
+segfaults from empty-argument `_call_latest`/`_apply_pure`, heap corruption
+from float intrinsics with integer operands) were all found and closed by this
+same loop.
 
 Generation is a pure function of its randomness source, consumed through the
 `AbstractRNG` interface. Two engines drive it (`--engine`):
