@@ -46,12 +46,13 @@ gitignored).
   `NonRecursiveInterpreter` overrode with a `native_call` bypass. Now hoisted
   into `intercept_call`, shared by both interpreters, with regression tests;
   eight-line reproducer in `findings/cmp-exception_divergence-61051b0f/`.
-- **Filed**: `findings/interp-invoke-arity-exception/` — `Core.invoke` with
-  fewer than two arguments raises `BoundsError` from inside the interpreter's
+- **Fixed**: `findings/interp-invoke-arity-exception/` — `Core.invoke` with
+  fewer than two arguments raised `BoundsError` from inside the interpreter's
   own `invoke` rewrite where compiled Julia raises `ArgumentError` (and
   `ErrorException` vs. `TypeError` for a non-type second argument). Low
   severity — wrong exception type on a malformed call — but a real
-  divergence, found by the builtins prober (item 4).
+  divergence, found by the builtins prober (item 4). Now defers malformed
+  invokes to native `invoke`, with a regression test.
 
 Everything else the work produced:
 

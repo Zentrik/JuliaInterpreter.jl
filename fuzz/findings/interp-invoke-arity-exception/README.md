@@ -1,5 +1,10 @@
 # `invoke` with malformed arguments raises the wrong exception type
 
+**Status: FIXED** — `evaluate_call!` now defers a too-short or non-type
+`Core.invoke` to native `invoke` so the same ArgumentError/TypeError is
+raised (src/interpret.jl); regression test in test/interpret.jl ("malformed
+invoke raises the native error"). `repro.jl` now reports NO DIVERGENCE.
+
 **Class:** `value_divergence` (guarded-exception observation), fingerprint
 `value_divergence-b26e4559`. **Side:** JuliaInterpreter. **Severity:** low —
 the exception *type* is wrong, no wrong values and no crash. **Found by:** the

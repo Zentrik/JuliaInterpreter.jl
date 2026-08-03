@@ -1554,6 +1554,19 @@ end
     end
 end
 
+@testset "malformed invoke raises the native error" begin
+    # A malformed Core.invoke must raise the same exception native invoke does,
+    # not a BoundsError from the interpreter's own invoke rewrite indexing a
+    # missing argument, nor an ErrorException from signature_type on a non-type.
+    too_few() = Core.invoke(abs)
+    nontype() = Core.invoke(abs, 1, 2)
+    @test_throws ArgumentError finish_and_return!(JuliaInterpreter.enter_call(too_few))
+    @test_throws TypeError finish_and_return!(JuliaInterpreter.enter_call(nontype))
+    # well-formed invoke is unaffected
+    wellformed() = Core.invoke(abs, Tuple{Int}, -3)
+    @test finish_and_return!(JuliaInterpreter.enter_call(wellformed)) == 3
+end
+
 @testset "invoke selects its method in the frame world" begin
     @eval module InvokeWorld
     function target end

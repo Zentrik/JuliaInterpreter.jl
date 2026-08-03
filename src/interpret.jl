@@ -396,7 +396,15 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
     ret = intercept_call(frame, fargs)
     isa(ret, Some{Any}) && return ret.value
     if fargs[1] === Core.invoke # invoke needs special handling
+        # A malformed `invoke` — too few arguments, or a second argument that is
+        # not a type/Method/CodeInstance — must raise the same error native
+        # `invoke` does (ArgumentError / TypeError), not a BoundsError from
+        # indexing `fargs[3]` or an ErrorException from `signature_type`. Defer,
+        # matching the "let native invoke raise it" pattern used below.
+        length(fargs) < 3 && return invoke(fargs[2:end]...)
         argtypes = fargs[3]
+        (argtypes isa Type || argtypes isa Method || argtypes isa Core.CodeInstance) ||
+            return invoke(fargs[2:end]...)
         fargs_pruned = [fargs[2]; fargs[4:end]]
         sig = Tuple{mapany(_Typeof, fargs_pruned)...}
         if isa(argtypes, Method)
