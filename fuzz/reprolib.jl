@@ -7,8 +7,9 @@ using JuliaInterpreter
 using Random
 
 # Mirrors SETUP_SRC in fuzz/src/render.jl (kept in sync by hand so a repro stays
-# standalone). Includes the determinism-unlock prelude: `using Random` (for a
-# generated program's `const __RNG__ = Xoshiro(...)`), the `__vtime__` virtual
+# standalone). Includes the determinism-unlock prelude: `using Random` (for
+# previously written findings' `const __RNG__ = Xoshiro(...)`; new programs
+# carry their own inline PRNG in the rendered text), the `__vtime__` virtual
 # clock, and Dict/Set normalization.
 const REPRO_SETUP = raw"""
 using Random
@@ -269,7 +270,11 @@ end
 # purpose: a repro must run with nothing but JuliaInterpreter).
 
 const REPRO_SKIP = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fjnorm__,
-                                :__VTIME__, :__vtime__, :__RNG__])
+                                :__VTIME__, :__vtime__, :__RNG__,
+                                # inline-PRNG header (render.jl `rngheader`); identical on
+                                # both sides by construction (__RNG__ kept for old repros)
+                                :__LCG__, :__randu__, :__randint__, :__randrange__,
+                                :__randbool__, :__randfloat__])
 
 function repro_scrubname(@nospecialize(x))
     n = try

@@ -621,7 +621,12 @@ const SPLIT_SKIP_NAMES = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fj
                                       # determinism-unlock prelude bindings (SETUP_SRC);
                                       # identical on both sides, so never a divergence, but
                                       # excluded to keep modstate focused on program state.
-                                      :__VTIME__, :__vtime__, :__RNG__])
+                                      :__VTIME__, :__vtime__, :__RNG__,
+                                      # inline-PRNG header bindings (render.jl `rngheader`),
+                                      # likewise identical on both sides (__RNG__ kept for
+                                      # old repros)
+                                      :__LCG__, :__randu__, :__randint__, :__randrange__,
+                                      :__randbool__, :__randfloat__])
 
 # Identity-scrubbed name of a function or type. Anonymous functions and closure
 # types are named `#3#4` with counters that depend on how many were created in

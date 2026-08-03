@@ -122,7 +122,8 @@ mutable struct Ctx
     policy::Symbol                  # generation policy skewing the weights
     rtscopes::Int                   # enclosing constructs that introduce a *runtime* scope
                                     # (for/while/let/try bodies) — `if` does not count
-    rngseed::Int                    # literal seed for `const __RNG__ = Xoshiro(rngseed)`;
+    rngseed::Int                    # literal seed for the inline-PRNG header (`const __LCG__ =
+                                    # Ref{UInt64}(seed)` + helpers, render.jl `rngheader`);
                                     # emitted only when the `:rng` feature is on (rngavail)
 end
 
@@ -148,7 +149,7 @@ end
 # Rules not in SWARMABLE are always on.
 swarmon(ctx::Ctx, rule::Symbol) = !ctx.cfg.swarm || rule in ctx.enabled || !(rule in SWARMABLE)
 
-# Is the explicit-RNG feature available? Gates both the `__RNG__` declaration
+# Is the explicit-RNG feature available? Gates both the inline-PRNG header
 # (render.jl, via Program.rngseed) and every rand-drawing rule.
 rngavail(ctx::Ctx) = swarmon(ctx, :rng)
 

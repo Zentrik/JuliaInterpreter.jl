@@ -292,14 +292,18 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         return Ex(s.atomicmask[i] ? :aprop : :prop, s.fieldsums[i], s.fieldnames[i],
                   [Ex(:var, v.sum, v.name)])
     elseif kind === :rngint
-        # rand(__RNG__, Int) or rand(__RNG__, 1:n) — the bounded form is handy as
-        # a guarded index or a small loop-shaped count.
-        src = rand(rng) < 0.5 ? "rand(__RNG__, Int)" : "rand(__RNG__, 1:$(rand(rng, 2:9)))"
+        # __randint__() (full-width) or __randrange__(1, n) — the bounded form is
+        # handy as a guarded index or a small loop-shaped count. Inline PRNG
+        # helpers rendered into the program (render.jl `rngheader`), not Base
+        # `rand`: a Base Random draw costs thousands of interpreted statements
+        # under RecursiveInterpreter and exhausted the statement budget in 100%
+        # of __RNG__ programs.
+        src = rand(rng) < 0.5 ? "__randint__()" : "__randrange__(1, $(rand(rng, 2:9)))"
         return Ex(:rng, IntT, src)
     elseif kind === :rngfloat
-        return Ex(:rng, FloatT, rand(rng) < 0.5 ? "rand(__RNG__)" : "randn(__RNG__)")
+        return Ex(:rng, FloatT, "__randfloat__()")
     elseif kind === :rngbool
-        return Ex(:rng, BoolT, "rand(__RNG__, Bool)")
+        return Ex(:rng, BoolT, "__randbool__()")
     elseif kind === :vtime
         return Ex(:vtime, IntT, nothing)
     elseif kind === :dictget
@@ -617,9 +621,10 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         hi = ctx.cfg.maxloop
         # A rand-derived trip count where a literal bound sits today — data
         # dependence without breaking termination (bounded by maxloop). Both
-        # sides draw the same count from __RNG__, so iteration stays in lockstep.
+        # sides draw the same count from the inline PRNG, so iteration stays in
+        # lockstep.
         userng = rngavail(ctx) && rand(rng) < 0.35
-        meta = userng ? (ivar, hi, "rand(__RNG__, 0:$hi)") : (ivar, rand(rng, 0:hi))
+        meta = userng ? (ivar, hi, "__randrange__(0, $hi)") : (ivar, rand(rng, 0:hi))
         ctx.loopdepth += 1
         body = genblock(ctx, blockdepth; extra=[VInfo(ivar, IntT)])
         ctx.loopdepth -= 1
@@ -1031,8 +1036,9 @@ function genprogram(ctx::Ctx)::Program
     end
     ctx.rtscopes -= 1
     popscope!(ctx)
-    # Emit `const __RNG__ = Xoshiro(rngseed)` only when the explicit-RNG feature
-    # is on for this program (rngavail); otherwise no rand rule could fire and
-    # the declaration would be dead.
+    # Emit the inline-PRNG header (`const __LCG__ = ...` + draw helpers,
+    # render.jl `rngheader`) only when the explicit-RNG feature is on for this
+    # program (rngavail); otherwise no rand rule could fire and the
+    # declarations would be dead.
     return Program(pre, fundefs, mid, body, rngavail(ctx) ? ctx.rngseed : nothing)
 end
