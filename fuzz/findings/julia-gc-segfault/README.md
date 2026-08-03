@@ -1,16 +1,20 @@
 # Transient GC segfault — a Julia bug, not a JuliaInterpreter bug
 
-**Status: RESOLVED — identified as upstream JuliaLang/julia
-[#62524](https://github.com/JuliaLang/julia/issues/62524)** (open there;
-partially-initialized boxed tuples at `-O2`, 1.12-only, no 1.12.x fix yet).
-See `ANALYSIS.md` for the full follow-up investigation: source-level crash
-mapping, core-dump forensics, the `-O1`/`-O2` × `--heap-size-hint=64M`
-confirmation matrix, and the JuliaInterpreter-version control that
-exonerates the interpreter. Mitigation for campaigns: run shards with
-`-O1` (free — this workload is interpretation-bound). The document below
-is the original triage, kept as written; its "Attribution" reasoning
-stands, though the cumulative-heap-state framing is superseded — the
-corruption window is per-allocation, merely *observed* stochastically.
+**Status: root-caused to an upstream Julia 1.12 codegen/runtime
+memory-safety bug — same class as
+[#62524](https://github.com/JuliaLang/julia/issues/62524) (GC root lost
+across a safepoint), but NOT confined to `-O2`: it reproduces at `-O1`
+(the vulnerable compiled code ships in the -O2-built sysimage).** Core
+dumps on the official binary show wild unaligned writes of the
+harness's 7-byte probe string into live `Tuple{...}` DataTypes — see
+`ANALYSIS.md` (investigation, two corrected verdicts, confirmation
+runs) and `core-forensics.md`. A pinned JuliaInterpreter v0.11.4
+campaign crashes identically: not an interpreter bug. `-O1` is a rate
+reducer only (roughly minutes → hours between deaths); campaigns must
+keep the restart loop. Upstream next step: comment on #62524 with both
+cores' forensics. The document below is the original triage, kept as
+written; its upstream attribution stands, though its cumulative-heap
+framing and its #59483/LICM hypothesis are superseded.
 
 ## Summary
 

@@ -42,19 +42,21 @@ ca8: 72 6f 62 65 | 5a 7f 00 00    "robe", then high bytes of a stale pointer
   symbol reads `"#5#6"` (an anonymous-closure-related name); a healthy
   sibling's corresponding field chains to `"Type"`.
 
-## Interpretation (in light of JuliaLang/julia#62524)
+## Interpretation — final (after the -O1 core)
 
-Initially read as a wild 7-byte `memcpy` over a live object. The correct
-reading, per #62524's mechanism, is the reverse: this is a **freshly
-allocated object that reached a GC safepoint with some fields never
-stored** (rooted-before-init boxed value under `-O2` DSE). The
-"corrupt" bytes are simply the **previous contents of the recycled pool
-cell** showing through the uninitialized fields — remnants of one of the
-thousands of tiny `"fjprobe"` Strings (7 chars + NUL fits an osize-16
-cell) and of older pointers, layered by successive cell reuse. The
-valid-looking fields around them are the fields that *were* initialized
-before the GC hit.
-
-This single dump therefore physically exhibits the #62524 failure mode
-on the official binary: uninitialized reference slots containing
-recycled-cell garbage, scanned by the marker as if they were pointers.
+Two readings were entertained in sequence: (1) a wild 7-byte `memcpy`
+over a live object; (2) — adopted to fit #62524 — a freshly allocated
+object reaching a safepoint with uninitialized fields exposing
+recycled-cell residue. **Reading (1) is correct.** The -O1 core
+(crash 11) settled it: its victim is a fully-initialized, live
+`Tuple{...}` DataType (typename `"Tuple"`) whose `instance` field was
+legitimately NULL and `layout` valid, with an 8-byte `"fjprobe\0"`
+written at the unaligned boundary between them — and
+`jl_new_uninitialized_datatype` NULLs all pointer fields with no
+safepoint gap, so partially-initialized DataTypes cannot exist. Both
+cores show the same thing: **bulk string-payload writes through a wild
+or stale destination pointer, landing at unaligned offsets inside live
+type objects** in recycled DataType pool pages. Reproducing at `-O1`
+places the buggy compiled writer in the sysimage (always built -O2) or
+the C runtime — Base's buffered string/IO write paths are the standing
+suspects. See ANALYSIS.md "CORRECTION" section.

@@ -367,7 +367,66 @@ alongside the branch-source loops:
 - crashes **persist** on 0.11.4 → pre-existing bug (older recycling, or
   genuinely upstream Julia); next split is disabling recycling entirely.
 
-## VERDICT: upstream JuliaLang/julia issue #62524
+## CORRECTION (later the same day): it crashes at -O1 too — the #62524
+## verdict below was overconfident
+
+After the verdict below was written, a crash **at `-O1`** was reported
+from campaign use. Reproduced here in ~90 minutes of accelerated soak
+(`-O1 --heap-size-hint=64M`, official binary; `crashed/crash11-…`), with
+a core dump. The forensics rewrite the story once more:
+
+- The victim is again a pool object marked with DataType descriptors —
+  and this time fully identifiable: a **live, fully-initialized
+  `Tuple{...}` type object** (typename chain reads `"Tuple"`) — an
+  argument-tuple DataType of the kind method lookup mints by the
+  thousand. Its `instance` field was legitimately `NULL` and `layout`
+  valid; an **8-byte bulk write of `"fjprobe\0"` at the unaligned
+  address `0x…cf6`** clobbered the boundary between the two fields.
+- With that lens, the -O2 core (crash 8, `core-forensics.md`) reads the
+  same way: valid fields around a 7-byte unaligned `"fjprobe"` write.
+  The "uninitialized fields exposing recycled-cell residue" reading in
+  `core-forensics.md` — adopted to fit #62524 — is **wrong**: `jl_new_uninitialized_datatype`
+  NULLs every pointer field with no safepoint in between, so live
+  DataTypes cannot carry junk fields by construction. These are **wild
+  unaligned string-payload writes into live objects**.
+- Since it reproduces at `-O1`, the corrupting writer is **not
+  runtime-JIT-compiled code** (pkgimage caches are opt_level-keyed —
+  verified — so package code really was -O1). The writer lives in the
+  **sysimage** (Base/stdlib, always compiled -O2 at julia build time)
+  or the C runtime. The string/IOBuffer bulk-write paths
+  (`unsafe_write` memcpy of exactly the payload bytes, with `repr`'s
+  quote bytes landing elsewhere via the separate single-byte path) are
+  the standing suspects: a stale destination — an IOBuffer data
+  `Memory` swept mid-operation because compiled Base code dropped its
+  GC root across a safepoint — would produce exactly these unaligned
+  text fragments in recycled DataType pool pages.
+
+Bottom line, revised:
+
+- **Still a Julia bug, not JuliaInterpreter** (the v0.11.4 control and
+  every audit stand; the probe string is an innocent payload carried by
+  Base's own compiled write paths).
+- **Same bug class as #62524** — 1.12-codegen losing a GC root — but
+  **not its MWE**, and crucially **not confined to `-O2` user code**:
+  the vulnerable compiled code ships inside the -O2-built sysimage, so
+  the runtime `-O1` flag only reduces exposure (fewer vulnerable
+  JIT-compiled frames), it does not remove it. Observed rates: minutes
+  at -O2 + 64M heap; ~90 min at -O1 + 64M; ~22 clean 8-min batches at
+  -O1 with default heap before the reported campaign crash.
+- **Mitigation guidance corrected**: `-O1` is a rate reducer, not a
+  fix. Campaigns must keep the restart loop; treat any gc-stock.c death
+  as this bug. The only real fixes are upstream.
+- **For upstream**: comment on #62524 with both cores' forensics (the
+  wild unaligned `"fjprobe"` writes into live Tuple-type DataTypes, at
+  -O1 and -O2, official binary), noting it may be the same root cause
+  surfacing via sysimage-compiled Base code rather than the MWE's
+  JIT-compiled function — or a sibling bug in the same #55767/#56847
+  era. The next discriminating experiment (not run here): change the
+  probe payload to a long distinctive string and confirm the corrupt
+  bytes track it — pinning the writer to the `repr`/`string` path; then
+  an `rr` trace of that write is the definitive artifact.
+
+## Superseded verdict (kept for the record): upstream JuliaLang/julia issue #62524
 
 A refreshed upstream sweep (prompted mid-investigation) surfaced
 **[#62524] "Segfault in `gc_mark_obj8` from partially initialized boxed
