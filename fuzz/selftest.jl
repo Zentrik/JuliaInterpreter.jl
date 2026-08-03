@@ -118,26 +118,34 @@ end
 
     @testset "builtin prober: no denylisted callee is ever rendered" begin
         # Render probe-heavy programs across many seeds and check that not one
-        # denied name appears in call position. Matching is anchored on
-        # `name(` preceded by a non-identifier character, so an allowed
-        # `checked_sdiv_int(...)` cannot be mistaken for a banned
-        # `sdiv_int(...)` (substring matching gets this exactly wrong).
-        pats = [(String(n), Regex("(?<![A-Za-z0-9_.])" * String(n) * "\\("))
+        # denied name appears in call position. Matching excludes an
+        # identifier character before the name — so an allowed
+        # `checked_sdiv_int(...)` is not mistaken for a banned `sdiv_int(...)`,
+        # which is exactly what substring matching gets wrong — but *allows* a
+        # `.`, so a qualified `Core.Intrinsics.sdiv_int(...)` is still caught.
+        pats = [(String(n), Regex("(?<![A-Za-z0-9_])" * String(n) * "\\("))
                 for n in unique(n for (_, n, _) in FuzzJI.PROBE_DENIED)]
+        # The pattern must behave: banned name qualified => hit, allowed name
+        # that merely contains a banned one => miss.
+        divre = last(first(p for p in pats if first(p) == "sdiv_int"))
+        @test occursin(divre, "x = Core.Intrinsics.sdiv_int(1, 0)")
+        @test !occursin(divre, "x = Core.Intrinsics.checked_sdiv_int(1, 0)")
         offenders = String[]
-        nprobes = 0
+        nguards = 0
         for seed in 1:300
             prog = FuzzJI.genprogram_policy(Xoshiro(seed), Cfg(), :builtins)
             src = render(prog)
-            nprobes += count(_ -> true, eachmatch(r"catch __e", src))
+            nguards += count(_ -> true, eachmatch(r"catch __e", src))
             for (name, re) in pats
                 occursin(re, src) && push!(offenders, "seed $seed: $name")
             end
         end
         isempty(offenders) || @error "denylisted callee rendered" offenders
         @test isempty(offenders)
-        # The check is only meaningful if probes were actually generated.
-        @test nprobes > 300
+        # The check is only meaningful if guarded probes were actually
+        # generated (guarded indexing/division share the wrapper, so this is a
+        # floor, not a probe count — metrics.jl reports the exact density).
+        @test nguards > 300
     end
 
     @testset "comparator classifies synthetic outcomes" begin
