@@ -11,6 +11,7 @@ using Random: Xoshiro, AbstractRNG
 include("typesum.jl")
 include("ir.jl")
 include("env.jl")
+include("probes.jl")
 include("rules.jl")
 include("render.jl")
 include("execute.jl")

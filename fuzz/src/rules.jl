@@ -70,110 +70,14 @@ function randstring_src(ctx::Ctx)
     return String([pick(ctx.rng, alphabet) for _ in 1:n])
 end
 
-# Builtins / intrinsics edge-case dictionary. Each entry renders verbatim
-# source (an `:src` Ex) whose result is Any and always wrapped in a `:guard`,
-# so both the value case and the exception-type case are first-class oracle
-# data. These deliberately probe wrong arities, odd-but-lowerable argument
-# types, and Core/reflection builtins that JuliaInterpreter special-cases —
-# the historically bug-rich surface (src/builtins.jl).
-const BUILTIN_PROBES = String[
-    # getfield / setfield! / fieldative
-    "getfield((1, 2, 3), 2)",
-    "getfield((1, 2), 4)",
-    "getfield(1, :x)",
-    "nfields(1)",
-    "nfields((1, 2, 3))",
-    "fieldtype(Tuple{Int,String}, 1)",
-    "fieldtype(Int, 1)",
-    "isdefined(Main, :nonexistent_sym_zzz)",
-    "getfield((a=1, b=2), :b)",
-    "getfield((a=1, b=2), :c)",
-    # type / apply_type
-    "Core.apply_type(Array, Int, 1)",
-    "Core.apply_type(Val)",
-    "typeof(typeof(1))",
-    "Core.apply_type(Tuple, Int, Vararg{Int})",
-    "isa(1, Union{Int,String})",
-    "1 isa DataType",
-    # tuple / ntuple / splat builtins
-    "ntuple(identity, 3)",
-    "ntuple(identity, 0)",
-    "tuple()",
-    "Core.tuple(1, 2, 3)",
-    "Core._apply_iterate(Base.iterate, +, (1, 2), (3, 4))",
-    # arithmetic / conversion intrinsics.
-    # NOTE: raw Core.Intrinsics division (sdiv_int/udiv_int/srem_int) is
-    # deliberately absent — those map to a bare machine divide with no
-    # DivideError check, so a zero divisor is an uncatchable CPU trap (SIGFPE)
-    # that would kill the in-process worker rather than surface as a finding.
-    # Both sides would trap identically anyway. Use the guarded `÷`/`%` rules
-    # (:intdiv, :guarddiv) to probe division-by-zero semantics instead.
-    "Core.Intrinsics.add_int(3, 4)",
-    "Core.Intrinsics.checked_sadd_int(typemax(Int), 1)",
-    "Core.Intrinsics.mul_int(6, 7)",
-    "Core.Intrinsics.flipsign_int(3, -1)",
-    "Core.Intrinsics.ctlz_int(0)",
-    "Core.Intrinsics.not_int(true)",
-    "Core.Intrinsics.copysign_float(1.5, -0.0)",
-    "Core.Intrinsics.abs_float(-0.0)",
-    "Core.bitcast(Float64, 0)",
-    "Core.bitcast(Float64, Int64(4607182418800017408))",
-    "reinterpret(Float64, Int64(0))",
-    "Base.add_int(1, 2)",
-    "Int8(300)",
-    "trunc(Int8, 300.0)",
-    # NOTE: in-range only — out-of-range unsafe_trunc is an *unspecified value*
-    # (LLVM poison under compilation, runtime intrinsic under interpretation),
-    # so an out-of-range probe would be a nondeterministic false positive.
-    "unsafe_trunc(Int8, 100.0)",
-    # equality / identity / ordering builtins
-    "===(1, 1.0)",
-    "Core.ifelse(true, 1, 2)",
-    "Core.ifelse(1, 2, 3)",
-    "objectid(nothing) isa UInt",
-    "Core.sizeof(Int)",
-    "Core.sizeof(1)",
-    # arrays low-level
-    "Core.arraysize([1,2,3], 1)",
-    "Base.arrayref(true, [1,2,3], 4)",
-    "Core.svec(1, 2, 3)",
-    "getindex((1, 2, 3))",
-    # Memory (1.11+; on older Julia both sides throw UndefVarError — symmetric)
-    "length(Memory{Int}(undef, 3))",
-    "let m = Memory{Int}(undef, 2); m[1] = 5; m[1] end",
-    # atomics field family: hand-written per-arity dispatch in src/builtins.jl,
-    # so probe every arity, wrong arities, and ordering violations
-    "Core.swapfield!(Ref(3), :x, 7)",
-    "Core.swapfield!(Ref(3), :x, 7, :sequentially_consistent)",
-    "Core.swapfield!(Ref(3), :x)",
-    "first(Core.modifyfield!(Ref(2), :x, +, 5))",
-    "Core.modifyfield!(Ref(2), :x, +)",
-    "Core.replacefield!(Ref(1), :x, 1, 9)",
-    "Core.replacefield!(Ref(1), :x, 2, 9)",
-    "Core.replacefield!(Ref(1), :x, 1, 9, :sequentially_consistent, :sequentially_consistent)",
-    "Core.setfieldonce!(Ref(1), :x, 5)",
-    "setfield!(Ref(1), :x, 2, :sequentially_consistent)",
-    "getfield(Ref(1), :x, :sequentially_consistent)",
-    # invoke / invokelatest: dedicated call paths in the interpreter
-    "invoke(abs, Tuple{Int}, -3)",
-    "invoke(+, Tuple{Int,Int}, 2, 3)",
-    "invoke(abs, Tuple{Float64}, -3)",
-    "Base.invokelatest(*, 6, 7)",
-    # opaque closures: lower to :new_opaque_closure, a dedicated interpreter path
-    "(Base.Experimental.@opaque x -> x + 1)(41)",
-    "(Base.Experimental.@opaque (a, b) -> a * b)(6, 7)",
-    # globals reflection
-    "Core.getglobal(Base, :pi)",
-    "Core.getglobal(Base, :definitely_not_a_name_xyz)",
-    "isdefined(Base, :pi, :sequentially_consistent)",
-    # misc barriers / asserts
-    "Base.donotdelete(1)",
-    "Base.inferencebarrier(3) + 1",
-    "Base.compilerbarrier(:const, 1)",
-    "Base.compilerbarrier(:type, 1)",
-    "typeassert(1, Int)",
-    "typeassert(1, String)",
-]
+# The builtins/intrinsics probe rule lives in probes.jl: `genprobe(ctx)`
+# enumerates every Core.Builtin and Core.Intrinsics function by reflection
+# (the same enumeration bin/generate_builtins.jl uses to *write*
+# src/builtins.jl), sweeps arities, and draws arguments from this generator —
+# in-scope structs, vectors, closures and symbols mixed with adversarial
+# literals — behind a safety denylist. What used to be 76 verbatim strings is
+# now three curated tables (PROBE_BANS / PROBE_RECIPES / FIXED_PROBES) over a
+# version-relative target list.
 
 function genex_inner(ctx::Ctx, want::TySum)::Ex
     rng = ctx.rng
@@ -324,7 +228,9 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         end
         return Ex(:kwcall, f.ret, (f.name, chosen), args)
     elseif kind === :builtin
-        return Ex(:guard, AnyT(), nothing, [Ex(:src, AnyT(), pick(rng, BUILTIN_PROBES))])
+        # Reflection-driven prober (probes.jl): enumerated callable, arity
+        # sweep, arguments from this generator, always guarded.
+        return genprobe(ctx)
     elseif kind === :badcall
         f = pick(rng, ctx.fns)
         sig = pick(rng, f.sigs)
@@ -369,6 +275,14 @@ function genclosure(ctx::Ctx, want::FnT)::Ex
         # (p, ...) -> (cap = cap <op> p′; cap)   where p′ is a param of cap's summary
         cap = pick(rng, caps)
         pushscope!(ctx)
+        # A closure body is a runtime scope, so count it — this branch used to
+        # only *decrement*, leaving `rtscopes` one lower than reality for the
+        # rest of the program. Everything generated afterwards then believed it
+        # was at module toplevel: `while` fuel decrements rendered as
+        # `global fuel -= 1` for a `let`-local counter, which is a lowering
+        # error, and the parse gate silently discarded ~4% of all candidates
+        # (measured 17/400 at the default policy, 22/400 under :builtins).
+        ctx.rtscopes += 1
         for (p, s) in zip(params, want.psums)
             declare!(ctx, VInfo(p, s))
         end
