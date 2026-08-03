@@ -1,16 +1,24 @@
-# Status: candidate real JuliaInterpreter bug — needs root-cause triage
+# Status: FIXED (real JuliaInterpreter bug, campaign-found, three-way-confirmed)
 
-MethodError (compiled) vs UndefVarError (RecursiveInterpreter) at obs[11],
-seed from the 1.12 large-scale campaign. Adjudicated GENUINE by the three-way
-oracle during the campaign: run_ji (Julia's built-in interpreter) did not match
-JuliaInterpreter, so JuliaInterpreter is the outlier (both Julia engines agree,
-the interpreter diverges) — a name/method-resolution difference, not class-U.
-The parallel session (claude/julia-fuzzing-strategy-bmh692) independently saw
-the same MethodError-vs-UndefVarError class, which corroborates it.
+Minimal reproducer (`minimal.jl`): `Core._call_latest(:b)` — and equally
+`Base.invokelatest(:b)` — a non-callable Symbol as the first argument.
 
-Standalone `repro.jl` confirmation was inconclusive under campaign CPU
-contention: reprorun executes unbudgeted under RecursiveInterpreter and this
-program (recursive multi-method fr3/fr4/fr7, sets, closures) did not finish in
-400s (SIGTERM, not a crash). Re-run without a running campaign, or triage with
-reshrink.jl to minimize first:
-  julia --project=fuzz fuzz/reshrink.jl --seed <seed from meta.md> --mode rec
+- compiled Julia: MethodError (a Symbol is not callable)
+- Compiled mode (NonRecursiveInterpreter): MethodError (agrees)
+- Julia's built-in interpreter (--compile=min): MethodError (agrees)
+- RecursiveInterpreter: **UndefVarError** ← the outlier
+
+The three-way oracle confirmed this is a JuliaInterpreter bug (not class-U):
+compiled, cmp, and Julia's own built-in interpreter all agree on MethodError;
+only RecursiveInterpreter diverged. The parallel session independently saw the
+same MethodError-vs-UndefVarError class.
+
+Root cause: `_call_latest`/`invokelatest` in the expand path built
+`Expr(:call, args[1])` with the *evaluated first-argument value* placed bare in
+function position. A value that looks like an AST name — a Symbol — was then
+re-interpreted as a variable reference and threw UndefVarError, where the native
+builtin calls the value and raises MethodError. Fixed by QuoteNode-wrapping the
+callee (src/builtins.jl), like the other arguments already were. Regression
+tests in test/interpret.jl. Original (unshrunk) program in meta.md; `minimal.jl`
+is the 25-line delta-debugged form (the seed no longer re-derives it because the
+generator changed mid-campaign — the barrier merge shifted seed→program).

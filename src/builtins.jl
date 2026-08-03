@@ -333,7 +333,10 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         if !expand || isempty(args)
             return Some{Any}(Core.invokelatest(args...))
         end
-        new_expr = Expr(:call, args[1])
+        # QuoteNode the callee too (see _call_latest): a bare Symbol value in
+        # function position would be looked up as a name (UndefVarError) instead
+        # of called as a value (MethodError).
+        new_expr = Expr(:call, QuoteNode(args[1]))
         popfirst!(args)
         for x in args
             push!(new_expr.args, QuoteNode(x))
@@ -579,10 +582,14 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Some{Any}(Core._call_in_world(getargs(interp, args, frame)...))
     elseif @static (isdefinedglobal(Core, :_call_latest) && Core._call_latest isa Core.Builtin) && f === Core._call_latest
         args = getargs(interp, args, frame)
-        if !expand
+        if !expand || isempty(args)
             return Some{Any}(Core._call_latest(args...))
         end
-        new_expr = Expr(:call, args[1])
+        # QuoteNode the callee, like the arguments below: args[1] is an evaluated
+        # *value*, and a bare value in function position is re-interpreted as a
+        # name when it looks like one (a Symbol became an UndefVarError instead of
+        # the MethodError native `_call_latest` raises for a non-callable value).
+        new_expr = Expr(:call, QuoteNode(args[1]))
         popfirst!(args)
         for x in args
             push!(new_expr.args, QuoteNode(x))

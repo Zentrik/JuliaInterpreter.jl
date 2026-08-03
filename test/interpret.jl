@@ -1576,6 +1576,18 @@ end
     @test_throws ArgumentError finish_and_return!(JuliaInterpreter.enter_call(no_fn))
     ok() = Base.invokelatest(*, 6, 7)
     @test finish_and_return!(JuliaInterpreter.enter_call(ok)) == 42
+    # A non-callable first argument (a Symbol) must raise a MethodError like the
+    # native call — the expand path put the evaluated value bare in function
+    # position, where a Symbol was re-read as a name and threw UndefVarError.
+    sym_il() = Base.invokelatest(:b)
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_il))
+end
+@static if isdefinedglobal(Core, :_call_latest) && Core._call_latest isa Core.Builtin
+@testset "malformed _call_latest raises the native error" begin
+    sym_cl() = Core._call_latest(:b)          # Symbol is not callable
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_cl))
+    ok_cl() = Core._call_latest(+, 2, 3)
+    @test finish_and_return!(JuliaInterpreter.enter_call(ok_cl)) == 5
 end
 end
 
