@@ -132,4 +132,86 @@ the delayed wild-pointer fault into an at-corruption-time diagnosis.
 
 ## Results
 
-(filled in as the experiments complete)
+### Crash 4 (new, this session): mutator-side fault in the method-table leafcache
+
+The `evalcode` shard under the `GC_ASSERT_PARENT_VALIDITY` build died with a
+**new, fourth signature** after only ~10 minutes / 107M allocations / 29 GCs
+(`crashed/crash4-egal-leafcache-assertbuild.txt`):
+
+```
+compare_svec        builtins.c:90
+jl_egal__unboxed_ / jl_egal_
+jl_table_peek_bp    iddict.c:128
+ijl_eqtable_get     iddict.c:157
+lookup_leafcache    gf.c:1492
+ml_matches          gf.c:4659
+ijl_gf_invoke_lookup_worlds  gf.c:4250
+findsup             Compiler/src/methodtable.jl
+whichtt             src/utils.jl:39      (JuliaInterpreter method lookup)
+prepare_call → get_call_framecode → evaluate_call! (deep interpreted stack)
+```
+
+This is **not an allocation or collection site**: the mutator faulted while
+`jl_egal`-comparing an `svec` inside the **method table's leaf cache**
+(`mt->leafcache`, an eqtable owned entirely by the runtime). A live runtime
+cache held a dangling pointer — the same corruption class as crash 1's wild
+array element, observed from the other side (a read through the stale entry
+instead of the collector marking it).
+
+Two important inferences:
+
+1. **The mark-time assert did not fire first.** At the last GC (#29) every
+   marked edge passed the child-tag validity check. So the dangling
+   reference either (a) was written into the cache *after* the last
+   collection while pointing at an object that GC had already freed — the
+   classic **missed-write-barrier** pattern (old table, young value: the
+   value dies at a young collection while the unbarriered old table still
+   points at it, and the page is later madvised away), or (b) the entry's
+   target page was returned to the OS between the mark and the read. Either
+   way the corruption is *invisible to a mark-phase tag check* and only an
+   at-write or at-free diagnostic (rr, or a GC_VERIFY build) can catch it.
+2. **The workload hypothesis sharpens.** The faulting structure is a
+   *method-table cache*, and this axis is exactly the workload that churns
+   them: thousands of short-lived anonymous modules, each defining fresh
+   generic functions and methods (invalidation + leafcache population),
+   with lookups issued through `jl_gf_invoke_lookup_worlds` at
+   frame-pinned worlds. Corruption localized to gf.c's caches under
+   module/method churn is a much more specific upstream lead than
+   "sustained allocation".
+
+Caveats kept honest: this binary is a from-source rebuild (same v1.12.6
+tarball, same flags plus the define), so a build-environment difference
+can't be fully excluded; and one fast crash after a clean 10-minute run is
+within the variance today's campaign showed (3 deaths concentrated in one
+of six shards). The restart loop (`assertloop.sh`) is accumulating more
+samples.
+
+### Control runs (stock juliaup 1.12.6 binary, same container, in progress)
+
+- `repro-pure.jl` (no JuliaInterpreter): 27,500+ iterations, ~2.3 GB RSS,
+  ~46 min — **no crash so far**. The pure-frontend stress as written does
+  not yet reproduce it; it lacks the generic-function/method-churn
+  component crash 4 points at, and should be extended accordingly
+  (define + call fresh generic functions per module, force invalidations,
+  drop modules) before concluding anything from its silence.
+- `evalcode` shard on the stock binary: 11,000+ candidates over ~50 min —
+  no crash yet in this session (today's campaign needed ~40 min *per
+  crashing shard* with five clean shards alongside, so this is within
+  expectation; the shard keeps running).
+
+### Interim conclusion
+
+Four distinct fault sites — GC mark of an object array, pool allocator
+freelist walk (×2), and now an egal compare inside the method-table
+leafcache — across two Julia versions (1.11.9, 1.12.6), two binaries
+(official juliaup build and a from-source rebuild), and both GC-side and
+mutator-side observers. All are reads/writes through **runtime-owned**
+structures; none implicate interpreter-managed data. The evidence
+continues to support a Julia runtime/GC memory-safety bug (most plausibly
+a missed write barrier or lost root in the gf.c cache machinery under
+module + method churn), with JuliaInterpreter acting as an unusually
+effective stressor. Next diagnostics, in order of value: an `rr` recording
+on hardware that allows it; a `WITH_GC_VERIFY=1` build (catches the missed
+barrier at the corrupting write, at heavy slowdown); extending
+`repro-pure.jl` with generic-function churn to sever the JuliaInterpreter
+dependency entirely.

@@ -1,0 +1,84 @@
+
+[31531] signal 11 (128): Segmentation fault
+in expression starting at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/fuzz/run.jl:183
+compare_svec at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/builtins.c:90
+jl_egal__unboxed_ at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/julia.h:1877 [inlined]
+jl_egal_ at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/julia.h:1887 [inlined]
+jl_table_peek_bp at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/iddict.c:128 [inlined]
+ijl_eqtable_get at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/iddict.c:157
+lookup_leafcache at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/gf.c:1492 [inlined]
+ml_matches at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/gf.c:4659
+ml_matches at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/gf.c:4607 [inlined]
+_gf_invoke_lookup at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/gf.c:4225 [inlined]
+ijl_gf_invoke_lookup_worlds at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/gf.c:4250
+_findsup at ./../usr/share/julia/Compiler/src/methodtable.jl:151 [inlined]
+findsup at ./../usr/share/julia/Compiler/src/methodtable.jl:133 [inlined]
+findsup_mt at ./../usr/share/julia/Compiler/src/reflection_interface.jl:57 [inlined]
+#whichtt#6 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/utils.jl:40 [inlined]
+whichtt at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/utils.jl:39 [inlined]
+#prepare_call#31 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/construct.jl:403
+prepare_call at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/construct.jl:375 [inlined]
+#get_call_framecode#44 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/localmethtable.jl:73
+get_call_framecode at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/localmethtable.jl:10 [inlined]
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:447
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:329
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:322
+eval_rhs at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:602
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:890
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:958
+finish! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:14
+finish_and_return! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:30
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:466
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:329
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:322
+eval_rhs at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:602
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:890
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:958
+finish! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:14
+finish_and_return! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:30
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:466
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:329
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:322
+eval_rhs at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:602
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:800
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:958
+finish! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:14
+finish_and_return! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:30
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:466
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:329
+evaluate_call! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:322
+eval_rhs at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:602
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:890
+step_expr! at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/interpret.jl:958 [inlined]
+#debug_command#62 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:660
+debug_command at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/src/commands.jl:639 [inlined]
+#evalcode_probe#571 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/fuzz/src/evalcodefuzz.jl:183
+evalcode_probe at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/fuzz/src/evalcodefuzz.jl:160 [inlined]
+#evalcode_campaign#576 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/fuzz/src/evalcodefuzz.jl:251
+evalcode_campaign at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt2/fuzz/src/evalcodefuzz.jl:225
+unknown function (ip: 0x7f5fd75569ef) at (unknown file)
+jl_apply at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/julia.h:2391 [inlined]
+do_call at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/interpreter.c:123
+eval_value at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/interpreter.c:243
+eval_stmt_value at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/interpreter.c:194 [inlined]
+eval_body at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/interpreter.c:707
+jl_interpret_toplevel_thunk at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/interpreter.c:898
+jl_toplevel_eval_flex at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/toplevel.c:1035
+jl_toplevel_eval_flex at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/toplevel.c:975
+ijl_toplevel_eval at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/toplevel.c:1047
+ijl_toplevel_eval_in at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/toplevel.c:1092
+eval at ./boot.jl:489
+include_string at ./loading.jl:2874
+_include at ./loading.jl:2934
+include at ./Base.jl:306
+exec_options at ./client.jl:317
+_start at ./client.jl:550
+jfptr__start_62203 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/usr/lib/julia/sys.so (unknown line)
+jl_apply at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/julia.h:2391 [inlined]
+true_main at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/jlapi.c:971
+jl_repl_entrypoint at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/src/jlapi.c:1139
+main at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/cli/loader_exe.c:58
+unknown function (ip: 0x7f5fee02a1c9) at /lib/x86_64-linux-gnu/libc.so.6
+__libc_start_main at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+_start at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/julia-1.12.6/usr/bin/julia (unknown line)
+Allocations: 107751240 (Pool: 107749999; Big: 1241); GC: 29
