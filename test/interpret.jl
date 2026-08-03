@@ -1829,3 +1829,21 @@ end
     @test err_interp.context == err_native.context
     @test sprint(showerror, err_interp) == sprint(showerror, err_native)
 end
+
+@testset "llvmcall with non-constant operands matches native" begin
+    ll_ir(ir) = Base.llvmcall(ir, Cvoid, Tuple{})
+    ll_rt(T) = Base.llvmcall("ret void", T, Tuple{})
+    ll_at(AT) = Base.llvmcall("%r = add i64 %0, %0\nret i64 %r", Int64, AT, 21)
+    # native codegen raises "error statically evaluating ..." when the statement
+    # executes; the interpreter used to throw UndefVarError at framecode-build time
+    for (f, arg) in ((ll_ir, "ret void"), (ll_rt, Cvoid), (ll_at, Tuple{Int64}))
+        err_native = try f(arg); nothing catch err; err end
+        err_interp = try @interpret f(arg); nothing catch err; err end
+        @test err_native isa ErrorException
+        @test typeof(err_interp) === typeof(err_native)
+        @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+    end
+    # a non-constant llvmcall that never executes must not break the enclosing method
+    ll_dead(ir, flag) = flag ? 1 : Base.llvmcall(ir, Cvoid, Tuple{})
+    @test (@interpret ll_dead("ret void", true)) === ll_dead("ret void", true) === 1
+end

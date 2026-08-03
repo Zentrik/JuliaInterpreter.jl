@@ -276,31 +276,82 @@ function build_compiled_llvmcall!(stmt::Expr, code::CodeInfo, idx::Int, evalmod:
         record_globalref_deps!(world_deps, world, stmt.args[i])
     end
     frame.pc = idxstart
-    if idxstart < idx
-        while true
-            pc = step_expr!(NonRecursiveInterpreter(), frame)
-            pc === idx && break
-            pc === nothing && error("this should never happen")
+    try
+        if idxstart < idx
+            while true
+                pc = step_expr!(NonRecursiveInterpreter(), frame)
+                pc === idx && break
+                pc === nothing && error("this should never happen")
+            end
+        end
+    catch
+        # A feeder statement could not be evaluated statically (e.g. it reads a
+        # method argument); the per-operand lookups below determine what is missing.
+    end
+    opvals = Any[nothing, nothing, nothing]  # llvmir, RetType, ArgType
+    opok = [false, false, false]
+    for i = 2:4
+        try
+            opvals[i-1] = lookup(frame, stmt.args[i])
+            opok[i-1] = true
+        catch
         end
     end
-    llvmir, RetType, ArgType = lookup(frame, stmt.args[2]), lookup(frame, stmt.args[3]), lookup(frame, stmt.args[4])::DataType
     args = stmt.args[5:end]
     argnames = Any[Symbol(:arg, i) for i = 1:length(args)]
-    cc_key = (llvmir, RetType, ArgType, evalmod)  # compiled call key
+    if all(opok) && opvals[3] isa DataType
+        llvmir, RetType, ArgType = opvals
+        cc_key = (llvmir, RetType, ArgType, evalmod)  # compiled call key
+        f = get(compiled_calls, cc_key, nothing)
+        if f === nothing
+            methname = gensym("compiled_llvmcall")
+            def = :(
+                function $methname($(argnames...))
+                    return $(Base.llvmcall)($llvmir, $RetType, $ArgType, $(argnames...))
+                end)
+            f = Core.eval(evalmod, def)
+            compiled_calls[cc_key] = f
+        end
+        stmt.args[1] = QuoteNode(f)
+        stmt.head = :call
+        deleteat!(stmt.args, 2:length(stmt.args))
+        append!(stmt.args, args)
+        return
+    end
+    # One of the operands is not statically evaluable (or the argument tuple is not a
+    # DataType). Native codegen only raises its "error statically evaluating ..."
+    # ErrorException when the statement executes, so build a wrapper that receives the
+    # unresolved operands as runtime parameters: its codegen reproduces exactly the
+    # native error (and an unreachable statement stays harmless).
+    dynsyms = Symbol[]
+    ops = Any[]
+    for k = 1:3
+        if opok[k]
+            opval = opvals[k]
+            push!(ops, isa(opval, Union{Symbol,Expr}) ? QuoteNode(opval) : opval)
+        else
+            s = Symbol(:dynop, k)
+            push!(dynsyms, s)
+            push!(ops, s)
+        end
+    end
+    cc_key = (:llvmcall_dynamic, (opok[1] ? opvals[1] : missing), (opok[2] ? opvals[2] : missing),
+              (opok[3] ? opvals[3] : missing), evalmod)
     f = get(compiled_calls, cc_key, nothing)
     if f === nothing
         methname = gensym("compiled_llvmcall")
         def = :(
-            function $methname($(argnames...))
-                return $(Base.llvmcall)($llvmir, $RetType, $ArgType, $(argnames...))
+            function $methname($(dynsyms...), $(argnames...))
+                return $(Base.llvmcall)($(ops...), $(argnames...))
             end)
         f = Core.eval(evalmod, def)
         compiled_calls[cc_key] = f
     end
-
+    dynrefs = Any[stmt.args[k+1] for k = 1:3 if !opok[k]]
     stmt.args[1] = QuoteNode(f)
     stmt.head = :call
     deleteat!(stmt.args, 2:length(stmt.args))
+    append!(stmt.args, dynrefs)
     append!(stmt.args, args)
 end
 
