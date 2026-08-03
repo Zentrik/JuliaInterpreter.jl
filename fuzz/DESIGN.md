@@ -31,13 +31,19 @@ julia --project=fuzz fuzz/run.jl --engine evalcode --n 2000      # eval_code at 
 julia --project=fuzz fuzz/run.jl --engine corpus --n 5000        # real Julia source, spliced
 julia --project=fuzz fuzz/run.jl --engine native --n 5000 --big --fresh  # larger programs, re-report known buckets
 julia --project=fuzz fuzz/metrics.jl --n 500                    # what the generator actually produces
+julia --project=fuzz fuzz/coverage.jl --n 400 --engine native,step,evalcode,corpus --modes rec,cmp
+                                                                # what a campaign actually reaches in src/
 ```
 
 Generator size is configurable from the CLI (`--big`, `--maxblockdepth`,
 `--maxblockstmts`, `--maxdepth`, `--maxloop`, `--bodystmts LO:HI`);
 `fuzz/metrics.jl` reports the resulting distribution without executing
 anything, which is the fast way to check whether a grammar change did what
-you meant. `--fresh` stops pre-seeding the dedup set from `findings/` (coarse
+you meant, and `fuzz/coverage.jl` reports what a campaign of those programs
+actually reaches inside `src/` (line coverage of the interpreter via julia's
+own `--code-coverage`, mapped onto `builtins.jl` dispatch arms and enclosing
+functions; writes `fuzz/coverage-report.md`) — which is the slower but more
+decisive check on the same question. `--fresh` stops pre-seeding the dedup set from `findings/` (coarse
 buckets otherwise let an already-reported finding mask new ones), `--patience
 K` keeps a Supposition campaign going for K consecutive empty rounds, and
 `--nosync` drops the per-candidate journal fsync for throughput.
