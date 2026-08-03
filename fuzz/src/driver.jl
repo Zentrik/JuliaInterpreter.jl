@@ -46,16 +46,27 @@ end
 # statements took effect on each side and discard when they diverge. Until that
 # lands, suppress the recognizable redefinition-mismatch messages so they do not
 # flood `findings/`; suppressed cases are still counted in `stats.suppressed`.
-function env_redefinition_mismatch(v::Verdict)::Bool
+# Definition-time binding/type errors are the recognizable symptoms: the same
+# environment mismatch shows up as a redefinition ("invalid redefinition of
+# constant Future"), a method-definition argument type that resolved to a
+# non-type ("invalid type for argument x in method definition", when a type like
+# `DateTime` is in scope on the reference side via import recovery but not on the
+# interpreted side), or an assignment to an imported binding. All are
+# environment artifacts, not interpreter bugs. This is message whack-a-mole by
+# nature — the durable fix is the corpus environment-equivalence gate — so keep
+# the list tight to definition-time binding/type errors and rely on the gate for
+# the rest.
+function env_binding_mismatch(v::Verdict)::Bool
     (v.class === :interp_only_throw || v.class === :exception_divergence) || return false
     d = v.detail
-    return occursin("invalid redefinition of constant", d) ||
-           occursin("redefinition of constant", d) ||
+    return occursin("redefinition of constant", d) ||
            occursin("cannot assign a value to imported", d) ||
-           (occursin("cannot declare", d) && occursin("constant", d))
+           (occursin("cannot declare", d) && occursin("constant", d)) ||
+           occursin("invalid type for argument", d) ||
+           occursin("invalid subtyping in definition", d)
 end
 
-const SUPPRESSIONS = Function[env_redefinition_mismatch]
+const SUPPRESSIONS = Function[env_binding_mismatch]
 
 suppressed(v::Verdict) = any(p -> p(v)::Bool, SUPPRESSIONS)
 
