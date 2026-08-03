@@ -21,7 +21,10 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
                       origsrc::String, shrunksrc::String; mode::Symbol=:rec)
     dir = joinpath(outdir, fp)
     mkpath(dir)
-    reprocall = mode === :cmp ? "reprorun(SRC; compiled=true)" : "reprorun(SRC)"
+    # The split axis's verdicts are mostly about the *module tree*, so its
+    # reproducer has to compare that too — `reprorun` only diffs observations.
+    reprocall = mode === :cmp   ? "reprorun(SRC; compiled=true)" :
+                mode === :split ? "reprosplit(SRC)" : "reprorun(SRC)"
     open(joinpath(dir, "repro.jl"), "w") do io
         print(io, """
         # FuzzJI reproducer — $(v.class) (interp mode: $mode)

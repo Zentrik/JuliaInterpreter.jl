@@ -7,6 +7,9 @@ using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                nstatements, Cfg, run_both, run_all, shrink, genprogram, render
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
+# The standalone reproducer library every findings/*/repro.jl includes. Loaded
+# here so the artifact a human triages is covered by the suite too.
+include(joinpath(@__DIR__, "reprolib.jl"))
 
 # The Supposition probes run at file scope, *outside* the testset below: a
 # deliberately failing `@check` inside a parent testset would record failures
@@ -678,6 +681,33 @@ end
                        for seed in 1:20]
         @test count(r -> r !== nothing && r[1].class === :aborted, fragstarved) >= 15
         @test !any(r -> r !== nothing && isfinding(r[1]), fragstarved)
+    end
+
+    @testset "ExprSplitter axis: the reproducer reproduces" begin
+        # `findings/*/repro.jl` is what a human actually runs, and for this axis
+        # it has to compare the module tree — `reprorun` only diffs observation
+        # streams, which is exactly what the main verdict class does *not* use.
+        # Quiet: the reproducer prints its report by design.
+        function quiet(f)
+            path, io = mktemp()
+            r = try
+                redirect_stdout(f, io)
+            finally
+                close(io)
+            end
+            return (r, read(path, String))
+        end
+        agreeing, _ = quiet(() -> reprosplit(FuzzJI.gensplit(Xoshiro(3))))
+        @test agreeing == false                      # nothing to reproduce
+        # A source where the two paths genuinely differ: `module` inside `begin`
+        # is not valid Julia, so `Core.eval` refuses it while `ExprSplitter`
+        # splits the block first and creates the module. Not an interpreter bug
+        # (which is why the generator never emits it) but a real, stable
+        # difference — the ideal fixture for "can the reproducer see one".
+        diverging, out = quiet(() -> reprosplit("begin\nmodule ZRB\nconst q = 7\nend\nend\n"))
+        @test diverging == true
+        @test occursin("DIVERGENCE REPRODUCED", out)
+        @test occursin("ZRB.q", out)                 # the missing binding is named
     end
 
     @testset "canary: pipeline detects a genuine known divergence" begin

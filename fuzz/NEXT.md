@@ -34,8 +34,9 @@ walk is stuck), `preserve-findings.sh` (force-commit findings, since
 **Results so far: no JuliaInterpreter bug.** Campaigns of hundreds to a few
 thousand cases per axis ran clean. What the work did produce:
 
-- four generator bugs and four harness bugs, several of which were silently
-  destroying yield (see the lessons below);
+- four generator bugs and five harness bugs, several of which were silently
+  destroying yield (see the lessons below) — the newest being `__fjnorm__`
+  observing a type by its *module-qualified* name, found by the split axis;
 - one genuine Julia compiler crash, which turned out to be a known 1.11
   regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`).
 
@@ -191,8 +192,9 @@ third one is the point: these programs mostly define rather than compute, so a
 definition the interpreted path silently skipped is invisible to an
 observation-stream oracle.
 
-Calibration: ~9500 cases run clean (no findings, 0 discards, ~19 cases/s,
-mean 12 fragments and 11 compared names per case). A mutation test — drop one
+Calibration: ~14 000 cases on the final generator run clean (8000 through the
+CLI plus 5000 offline, no findings, 0 discards, 0 aborts, ~20 cases/s, mean
+12 fragments and 11 compared names per case). A mutation test — drop one
 `ExprSplitter` fragment on the interpreted side — is caught 86% of the time
 (66% `split_missing_effect`, 20% `split_internal_error`), which is what says
 the oracle has teeth rather than the axis being vacuous. Two legitimate
@@ -329,7 +331,7 @@ never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # 154 assertions, ~40s
+julia --project=fuzz fuzz/run.jl --selftest              # 162 assertions, ~45s
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/run.jl --engine step --n 2000
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 1000
