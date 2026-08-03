@@ -32,37 +32,26 @@ end
 # Known, already-reported divergences go here so reruns surface only news.
 # Each entry is a predicate over Verdict.
 #
-# CAUTION — this list was originally framed as an "environment-mismatch" stopgap
-# for the corpus axis, on the assumption that these definition-time errors are
-# artifacts of the corpus prelude setup rather than interpreter bugs. That
-# premise turned out to be WRONG for the dominant member: "invalid redefinition
-# of constant Future" was a genuine JuliaInterpreter bug in
-# `find_or_create_module` (src/construct.jl) — it threw where native `Core.eval`
-# shadows a `using`-imported non-module binding with a fresh submodule. That bug
-# is now FIXED (with a test/toplevel.jl regression), so the redefinition message
-# is deliberately NO LONGER suppressed: if it recurs it is real news, not noise.
-#
-# The remaining entries below are UNVERIFIED. They are kept only as coarse
-# noise-control so a single recurring signature cannot flood `findings/`, and
-# must NOT be read as "confirmed not-a-bug". Each still needs its own root-cause
-# triage exactly like the redefinition one got — treat a hit as a lead, not a
-# dismissal. The corpus prelude is in fact applied identically to the reference
-# and interpreted runs (corpus.jl `corpus_run`), so the "environment differs"
-# story does not hold on its face; the true cause of each is an open question.
-# The durable path is per-signature triage (as done for redefinition), not a
-# blanket environment-equivalence gate.
-function env_binding_mismatch(v::Verdict)::Bool
-    (v.class === :interp_only_throw || v.class === :exception_divergence) || return false
-    d = v.detail
-    # NOTE: "redefinition of constant" intentionally removed — it was a real bug,
-    # now fixed in src/construct.jl. Leave it unsuppressed so a regression surfaces.
-    return occursin("cannot assign a value to imported", d) ||
-           (occursin("cannot declare", d) && occursin("constant", d)) ||
-           occursin("invalid type for argument", d) ||
-           occursin("invalid subtyping in definition", d)
-end
-
-const SUPPRESSIONS = Function[env_binding_mismatch]
+# HISTORY — this list once held an `env_binding_mismatch` "environment-mismatch"
+# suppression for corpus definition-time errors, on the assumption they were
+# artifacts of the corpus prelude setup rather than interpreter bugs. That whole
+# premise was FALSE. The corpus prelude is applied identically to the reference
+# and interpreted runs (corpus.jl `corpus_run`), so "the environment differs"
+# never held, and per-signature triage found real interpreter bugs:
+#   • "invalid redefinition of constant" — real bug in `find_or_create_module`
+#     (src/construct.jl); a `module` shadowing a `using`-import threw. FIXED.
+#   • "invalid type for argument" / "invalid subtyping in definition" — real bug
+#     in `evaluate_methoddef` (src/interpret.jl); a method def on a `using`-imported
+#     name created a fresh function that shadowed the import, so a later use of the
+#     name as a type saw a function. FIXED (one root cause; subtyping is downstream).
+#   • "cannot assign a value to imported" / "cannot declare … constant" — triaged
+#     and found to AGREE with native `Core.eval` (not reproducible as divergences).
+# So every member was either a real bug (now fixed, each with a test/toplevel.jl
+# regression) or a verified non-divergence. The suppression is therefore removed
+# entirely: any recurrence is genuine news — a regression of a fixed bug, or a new
+# divergence worth triaging. Add a predicate here only for a divergence that has
+# been *positively confirmed* already-reported, never as a triage shortcut.
+const SUPPRESSIONS = Function[]
 
 suppressed(v::Verdict) = any(p -> p(v)::Bool, SUPPRESSIONS)
 

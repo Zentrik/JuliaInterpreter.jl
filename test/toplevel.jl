@@ -160,6 +160,41 @@ end
     @test getglobal(ShadowHost, :Future) isa Module
 end
 
+# Host for the "method def on a using-imported binding" regression below: `AbsT`
+# and `ConcT` are non-owned bindings brought into `MethHost` by `using .MethOwner`,
+# the same shape as `using Dates` making `DateTime`/`Period` visible.
+module MethHost
+    module MethOwner
+        abstract type AbsT end
+        struct ConcT end
+        export AbsT, ConcT
+    end
+    using .MethOwner
+end
+
+@testset "method def on a using-imported binding extends, not shadows" begin
+    # Defining a method whose function name is a `using`-imported type must EXTEND
+    # that type (as native `Core.eval` does), not create a fresh function that
+    # shadows the import. Found by differential fuzzing: `evaluate_methoddef`
+    # (src/interpret.jl) previously ran `Core.eval(mod, Expr(:function, name))`
+    # unconditionally on 1.12, rebinding the name to a new function — so a later use
+    # of the name as a type (`x::ConcT`, `struct _ <: AbsT`) saw a function and threw
+    # `invalid type for argument` / `invalid subtyping in definition`.
+    @test getglobal(MethHost, :AbsT) isa Type
+    @test getglobal(MethHost, :ConcT) isa Type
+    ex = Expr(:toplevel,
+              :(AbsT(x) = 1),          # method on the imported abstract type
+              :(ConcT(x::Int) = x),    # method on the imported concrete type
+              :(struct Sub <: AbsT end),       # supertype must resolve to the abstract TYPE
+              :(annot(x::ConcT) = x))          # arg type must resolve to the concrete TYPE
+    for (m, e) in ExprSplitter(MethHost, ex)
+        JuliaInterpreter.finish_and_return!(Frame(m, e), true)
+    end
+    @test getglobal(MethHost, :ConcT) isa Type   # not shadowed into a function
+    @test getglobal(MethHost, :AbsT) isa Type
+    @test getglobal(MethHost, :Sub) <: getglobal(MethHost, :AbsT)
+end
+
 module Toplevel end
 module ToplevelDirect end
 

@@ -1822,3 +1822,19 @@ end
     @eval oc_from_raw_expr() = $ocex
     @test (@interpret Main.oc_from_raw_expr())() == 1
 end
+
+@testset "compilerbarrier setting validation" begin
+    # `Core.compilerbarrier(setting, x)` must validate `setting` like native Julia.
+    # The interpreter previously delegated to a compiled call where the optimizer
+    # elides the barrier, so an invalid setting was silently accepted (returned `x`)
+    # where native eval throws. Found by differential fuzzing. NB: a bare literal
+    # `@interpret Core.compilerbarrier(:b, 1)` bypasses the interpreter (and can
+    # SIGILL via a compiled `unreachable`), so route through an interpreted helper.
+    cbcall(s, x) = Core.compilerbarrier(s, x)
+    @test_throws ErrorException @interpret cbcall(:b, 1)
+    @test_throws ErrorException @interpret cbcall(:foo, 1)
+    @test_throws TypeError @interpret cbcall(1, 1)
+    @test (@interpret cbcall(:const, 1)) == 1
+    @test (@interpret cbcall(:type, (9, -100))) == (9, -100)
+    @test (@interpret cbcall(:conditional, 1)) == 1
+end

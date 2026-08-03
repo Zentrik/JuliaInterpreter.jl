@@ -506,7 +506,36 @@ function evaluate_methoddef(interp::Interpreter, frame::Frame, node::Expr)
         mod = f isa Symbol ? moduleof(frame) : f.mod
         name = f isa Symbol ? f : f.name
         if isbindingresolved_deprecated
-            f = Core.eval(mod, Expr(:function, name))
+            # Extend an already-defined binding (an owned function/type, or a
+            # `using`-imported non-owned one) instead of unconditionally creating a
+            # fresh function. `Core.eval(mod, Expr(:function, name))` on an imported
+            # name creates a NEW function that SHADOWS the import, where native
+            # `Core.eval` of the method definition extends the imported binding —
+            # so a later use of `name` as a type (e.g. `DateTime(dt::TimeType)=…`
+            # under `using Dates`, then `x::DateTime + …`) saw a function and threw
+            # `invalid type for argument` / `invalid subtyping in definition`. This
+            # mirrors the non-deprecated `else` branch below (minus the removed
+            # `Base.isbindingresolved` guard). Found by differential fuzzing.
+            local existing
+            if @invokelatest(isdefinedglobal(mod, name)) &&
+               (existing = @invokelatest getfield(mod, name)) isa Type
+                # The name resolves to a TYPE (possibly a `using`-imported one, e.g.
+                # `DateTime` under `using Dates`): a method definition adds a
+                # constructor, EXTENDING that type — exactly as native `Core.eval`
+                # does. The previous code ran `Core.eval(mod, Expr(:function, name))`
+                # here, which created a fresh function that SHADOWED the type, so a
+                # later use of the name as a type saw a function and threw
+                # `invalid type for argument` / `invalid subtyping in definition`.
+                f = existing
+            else
+                # Undefined name, a `using`-imported FUNCTION (native creates a fresh
+                # local generic function that shadows it — e.g. defining `sin(::Int)`
+                # in a module does NOT extend `Base.sin`), or a non-callable value
+                # (native errors). `Core.eval(Expr(:function, name))` reproduces all
+                # three, matching native — this is the original, unchanged behavior
+                # for every non-Type name.
+                f = Core.eval(mod, Expr(:function, name))
+            end
         else
             # TODO: This logic isn't fully correct, but it's been used for a long
             # time, so let's leave it for now.
