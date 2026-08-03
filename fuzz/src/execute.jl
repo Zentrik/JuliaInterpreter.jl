@@ -107,8 +107,6 @@ struct Outcome
     btstr::String       # interpreted-side backtrace, for triage (never compared)
 end
 
-const SETUP_EXPR = Meta.parseall(SETUP_SRC)
-
 # The harness's own load state, captured at load time. A corpus fragment is real
 # code and can mutate global load state (`LOAD_PATH`, the active project); the
 # corpus axis's next `freshmodule` then can't resolve `using Random` in SETUP
@@ -118,16 +116,90 @@ const SETUP_EXPR = Meta.parseall(SETUP_SRC)
 # touch load state.)
 const HARNESS_LOAD_PATH = copy(LOAD_PATH)
 
+# Shared implementations of the SETUP_SRC helpers (NEXT.md item 8).
+#
+# SETUP_SRC remains the *specification* of the per-module prelude — ji.jl
+# evaluates it verbatim in the JI subprocess and reprolib.jl mirrors it — but
+# evaluating it into every fresh module made the compiled engines re-JIT it per
+# candidate: each module got its own generic `__fjnorm__`/`__obs__`/`__vtime__`,
+# so the reference paid their compilation on every case, and worse, the
+# per-module `__fjnorm__` re-specialized on every *program-defined struct type*
+# it observed (fresh types per candidate, fresh methods per module — nothing
+# ever warm). Measured at ~35-40% of native-axis per-candidate cost.
+#
+# Instead the helpers are defined once here as callable structs parameterized by
+# the module's own observation vector, clock and name prefix, and `freshmodule`
+# binds *instances* under the same names. `@nospecialize` keeps `fjnorm` at one
+# compiled method total instead of one per observed type. Subtypes of `Function`
+# so `isa Function` checks (e.g. `__fjnorm__`'s own Function branch, the split
+# axis's `normstate`) see what SETUP_SRC's generic functions were.
+#
+# Behavioral equivalence with SETUP_SRC evaluated verbatim is asserted by the
+# selftest ("freshmodule prelude matches SETUP_SRC").
+function fjnorm(@nospecialize(x), prefix::String)
+    if x isa Union{Number, String, Symbol, Char, Nothing}
+        return x
+    elseif x isa Tuple
+        return map(el -> fjnorm(el, prefix), x)
+    elseif x isa AbstractArray
+        return Any[fjnorm(el, prefix) for el in x]
+    elseif x isa AbstractDict
+        # Content-keyed Dicts iterate identically across the two engines
+        # (determinism.md §4), but sorting by the normalized key makes the
+        # observation order-independent regardless — safe, and still full-content.
+        return (:__dict, sort!(Any[(fjnorm(k, prefix), fjnorm(v, prefix)) for (k, v) in x]; by = p -> string(p[1])))
+    elseif x isa AbstractSet
+        return (:__set, sort!(Any[fjnorm(el, prefix) for el in x]; by = string))
+    elseif x isa Function
+        return :__fn__
+    elseif x isa Type
+        # `string(T)` is module-qualified, and the two sides run in differently
+        # named fresh modules — strip this module's own prefix (see SETUP_SRC).
+        return Symbol(replace(string(x), prefix => ""))
+    elseif x isa Pair
+        return (:__pair, fjnorm(first(x), prefix), fjnorm(last(x), prefix))
+    elseif x isa NamedTuple
+        return (:__nt, keys(x), map(el -> fjnorm(el, prefix), Tuple(x)))
+    elseif x isa Core.SimpleVector
+        return (:__svec, map(el -> fjnorm(el, prefix), Tuple(x)))
+    else
+        return Symbol(nameof(typeof(x)))
+    end
+end
+
+struct FJNorm <: Function
+    prefix::String
+end
+(f::FJNorm)(@nospecialize(x)) = fjnorm(x, f.prefix)
+
+struct FJObs <: Function
+    obs::Vector{Any}
+    prefix::String
+end
+(f::FJObs)(@nospecialize(x)) = (push!(f.obs, fjnorm(x, f.prefix)); nothing)
+
+struct FJVTime <: Function
+    counter::Base.RefValue{Int}
+end
+(f::FJVTime)() = (f.counter[] += 1)
+
 let counter = Ref(0)
     global function freshmodule()
         if LOAD_PATH != HARNESS_LOAD_PATH
             copy!(LOAD_PATH, HARNESS_LOAD_PATH)
         end
         m = Module(Symbol("FJ", counter[] += 1))
-        for st in SETUP_EXPR.args
-            st isa LineNumberNode && continue
-            Core.eval(m, st)
-        end
+        # `string(m, ".")` here == `string(@__MODULE__, ".")` evaluated in m,
+        # which is what SETUP_SRC's `__fjnorm__` strips from type names.
+        prefix = string(m, ".")
+        obs = Any[]
+        vtime = Ref(0)
+        Core.eval(m, :(using Random))
+        Core.eval(m, :(const __OBS__ = $obs))
+        Core.eval(m, :(const __VTIME__ = $vtime))
+        Core.eval(m, :(const __vtime__ = $(FJVTime(vtime))))
+        Core.eval(m, :(const __fjnorm__ = $(FJNorm(prefix))))
+        Core.eval(m, :(const __obs__ = $(FJObs(obs, prefix))))
         return m
     end
 end
