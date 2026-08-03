@@ -28,24 +28,35 @@ before.
 | `split` | adversarial toplevel forms — `ExprSplitter` in `construct.jl` | differential vs. `Core.eval` on failure mode, observation stream, **and the resulting module tree** |
 
 Supporting tools: `metrics.jl` (what the generator actually produces, without
-executing), `longrun.sh` (sharded restart-looping campaigns), `crashmin.jl`
-(minimize a program that kills the process), `triage.jl` (which side broke, and
-does it still break on the newest Julia), `diag_stuck.jl` (why a stepping
-walk is stuck), `preserve-findings.sh` (force-commit findings, since
-`findings/` is gitignored).
+executing), `coverage.jl` (what a campaign actually *reaches* inside
+`src/` — line coverage of the interpreter, mapped onto builtin dispatch arms
+and functions; report in `coverage-report.md`), `longrun.sh` (sharded
+restart-looping campaigns), `crashmin.jl` (minimize a program that kills the
+process), `triage.jl` (which side broke, and does it still break on the
+newest Julia), `diag_stuck.jl` (why a stepping walk is stuck),
+`preserve-findings.sh` (force-commit findings, since `findings/` is
+gitignored).
 
-**Results so far: no JuliaInterpreter bug.** Campaigns of hundreds to a few
-thousand cases per axis ran clean. What the work did produce:
+**Results so far: one JuliaInterpreter bug, found late and cheaply.** The
+differential axis in `cmp` mode (compiled mode) diverges on `rethrow()`,
+`rethrow(exc)` and `current_exceptions()` inside an interpreted `catch`: the
+interception that answers them from the frame's modelled exception stack sits
+on the generic `evaluate_call!`, and `NonRecursiveInterpreter` overrides
+exactly that method with a `native_call` bypass. Eight-line reproducer and a
+fix sketch in `findings/cmp-exception_divergence-61051b0f/`. Everything else
+the work produced:
 
 - four generator bugs and five harness bugs, several of which were silently
   destroying yield (see the lessons below) — the newest being `__fjnorm__`
   observing a type by its *module-qualified* name, found by the split axis;
 - one genuine Julia compiler crash, which turned out to be a known 1.11
   regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`).
+  It still bites: it aborts the *process*, so a shard that hits it writes no
+  coverage data at all (`coverage.jl` reports such shards explicitly).
 
-Treat "no interpreter bug yet" as an open question, not a conclusion. The
-axes have not run at the scale where they would be expected to produce
-anything — the literature's numbers are 10^8 and up, these runs are 10^3–10^4.
+One bug in ~10^4 candidates is not a yield estimate. The axes have not run at
+the scale where they would be expected to produce much — the literature's
+numbers are 10^8 and up, these runs are 10^3–10^4.
 
 ---
 
@@ -101,27 +112,62 @@ harness noticed something" and "a human looks at it":
 
 ### 2. Semantic coverage of the interpreter (P2 in `yield-analysis.md`)
 
-The highest-value item, and still not started. It is the only thing that
-replaces guessing about grammar gaps with measurement.
+**Stage one: done** — `fuzz/coverage.jl`, with its output committed as
+`fuzz/coverage-report.md`. **Stage two is still open** and is what to pick up
+here.
 
-Build a `CoverageInterp <: Interpreter` that records what each candidate
-touches: statement heads, which builtin arms in `builtins.jl`, which
-`evaluate_call!` paths, whether dispatch went through `localmethtable`. Then:
+Stage one did not need the `CoverageInterp <: Interpreter` this item
+originally called for (an interpreter subtype recording statement heads,
+builtin arms, `evaluate_call!` paths and `localmethtable` dispatch).
+Julia's own `--code-coverage=@<repo>/src`, gathered from campaign
+subprocesses, answers the same question with *zero* instrumentation of the
+interpreter and a ~1.3× time tax: `coverage.jl` spawns the shards, parses the
+`.cov` files (one count-or-`-` column per source line — no Coverage.jl
+dependency), and maps never-executed lines back onto (a) every
+`f === <builtin>` arm of `maybe_evaluate_builtin`, (b) the enclosing
+definition of every other line, per file, per engine, and per interpreter
+mode. Re-run it after any grammar change: `metrics.jl` says what is
+*generated*, this says what is *reached*.
 
-- **Stage one, offline (a weekend).** Run 10^4 candidates, diff the hit-set
-  against the interpreter's reachable surface, and report every arm never hit.
-  Each is either a grammar gap or dead code, and either answer is useful. This
-  also becomes the regression check for grammar changes — `metrics.jl` shows
-  what is *generated*, this would show what is *reached*, which is the
-  question that actually matters. It also tells item 4 which dispatch arms
-  the prober needs to reach, and which of the still-open grammar gaps below
-  actually matter.
+What the committed run says (4000 candidate-runs, four axes, both modes,
+julia 1.11.9):
+
+- **15 of 65 live dispatch arms are never hit.** A further 19 arms in the file
+  are compiled out by `@static` on 1.11 and are not gaps at all — reading the
+  raw `.cov` without that check would overstate the miss rate by more than
+  double. The cold 15 cluster: `swapglobal!`/`modifyglobal!`/`replaceglobal!`/
+  `setglobalonce!`, the four `memoryref*` atomics, `atomic_pointermodify`,
+  `llvmcall`, `_compute_sparams`, `_equiv_typedef`, `_call_in_world_total`,
+  `_apply_pure`, and the `kwinvoke` tail (whose test line never even executes).
+  That is item 4's to-do list, and it is mostly *atomic and global mutation*
+  plus keyword `invoke` — not the syntax gaps the earlier waves guessed at.
+- **The `corpus` axis reaches 47 arms; `native` reaches 36**, and 12 arms are
+  reached *only* by spliced real code. What the generator is short of is
+  shapes, not volume — which is the argument for item 5's corpus
+  certification, from the other direction.
+- **`rec` reaches 6 arms `cmp` cannot**, `cmp` reaches none `rec` cannot: the
+  expected asymmetry (compiled mode runs calls natively), now measured.
+- **Line totals: 1903 of 2694 instrumented lines hit (70.6%), 137 of 320
+  definitions never hit.** The never-hit set is dominated by the *public
+  debugger API the harness bypasses* (`enter_call`, `interpret`, `breakpoint`,
+  `extract_args`) and by display code (`Base.show` methods, `print_framecode`),
+  not by interpretation paths: `interpret.jl` has only 6 never-hit definitions
+  of 44. `breakpoints.jl` is the weakest real surface at 13% of lines.
+- Of the still-open grammar gaps listed at the bottom of this file, the ones
+  with cold evidence behind them are **destructuring** (`is_indexed_iterate_call`,
+  `maybe_step_through_arg_destructuring!` never run), **`@generated`**
+  (`get_source` never run) and **keyword sorters**
+  (`maybe_step_through_kwprep!` never run); `do` blocks have no distinct
+  interpreter surface at all, so closing that gap buys inputs, not paths.
+
 - **Stage two.** Feed it back as corpus admission: keep a candidate whose
   choice sequence hit new coverage, mutate and splice from those. The
   Supposition `TCRNG` adapter already makes generation a pure function of a
-  choice sequence, so the substrate for this exists.
-
-Do stage one before stage two. It is cheap and it de-risks the rest.
+  choice sequence, so the substrate for this exists. Note what stage one
+  implies about the feedback signal: line coverage of `src/` saturates fast
+  (the second 2000 candidate-runs added two arms and 25 lines), so admission
+  wants a finer signal than "a new line" — arm × arity, or statement-head ×
+  context, which is where the `CoverageInterp` idea earns its keep after all.
 
 ### 3. ~~Shrinking for the step, evalcode and corpus axes~~ — **DONE**
 
@@ -304,8 +350,17 @@ side.)
 
 From earlier waves, never closed: destructuring, `do` blocks, `@generated`
 functions, parametric structs, inner constructors, defaults referencing
-earlier parameters. Item 2 would tell you which of these actually matter
-instead of guessing.
+earlier parameters.
+
+Item 2 now answers which of them matter, and the answer is in
+`coverage-report.md`'s last table rather than in this list: **destructuring**,
+**`@generated`** and **keyword sorters** each leave a specific interpreter
+function with zero executed lines, **`do` blocks** have no distinct
+interpreter surface to leave cold, and **parametric structs / inner
+constructors** are mostly already reached by other constructs (all the
+`Core._structtype`/`_typevar`/`apply_type` arms are hit) — so that one buys
+new inputs rather than new paths. Re-run `fuzz/coverage.jl` after closing any
+of them: the report is the regression check.
 
 ---
 
@@ -377,6 +432,9 @@ never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
 ```sh
 julia --project=fuzz fuzz/run.jl --selftest              # 253 assertions, ~75s
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
+julia --project=fuzz fuzz/coverage.jl --n 20             # what a campaign reaches (smoke)
+julia --project=fuzz fuzz/coverage.jl --n 400 --shards 2 \
+      --engine native,step,evalcode,corpus --modes rec,cmp --slowdown   # the real thing, ~30 min
 julia --project=fuzz fuzz/run.jl --engine step --n 2000
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 1000
 julia --project=fuzz fuzz/run.jl --engine corpus --n 1000
@@ -402,9 +460,15 @@ against, default `release`), `--nowrite` (don't write `triage.md`).
 Useful flags: `--big` (larger programs), `--fresh` (ignore existing findings
 when seeding dedup — otherwise a reported bucket masks new ones),
 `--policy NAME` on `metrics.jl` (measure one generation policy in isolation),
+<<<<<<< HEAD
 `--journaldir` (required when running shards concurrently), `--noshrink` /
 `--shrinkruns N` / `--shrinksecs S` (skip or re-budget minimization; findings
 are shrunk on every axis by default).
+=======
+`--journaldir` (required when running shards concurrently), `--keep` +
+`--reuse` on `coverage.jl` (re-report from the `.cov` files a previous run
+left behind, without re-running the campaign).
+>>>>>>> worktree-agent-a0222a76b16352ee3
 
 Run the selftest after any generator change. It is not a formality: it caught
 a generator bug this session that had raised smoke divergences from ≤5 to 13.
