@@ -387,17 +387,46 @@ end
         end
     end
 
-    @testset "determinism unlocks: __RNG__/Dict/Set/__vtime__ agree" begin
+    @testset "determinism unlocks: inline PRNG/Dict/Set/__vtime__ agree" begin
         # determinism.md §3/§4: explicit-RNG draws, content-keyed containers, and
         # the virtual clock are deterministic across the two engines. Each program
         # here must run, agree, AND observe something (an empty stream would agree
         # vacuously). A divergence is a real finding — triage before shipping.
         det = [
-        # (a) __RNG__: both sides seed from the same literal and execute the same
-        # Xoshiro transitions, so streams agree bit-for-bit — including a
-        # rand-derived loop bound, a rand-derived guarded index, and a
-        # rand-derived branch condition (data-dependent control flow).
-        "seeded RNG: streams agree bit-for-bit" => """
+        # (a) the inline PRNG (render.jl `rngheader`, what generated programs now
+        # carry): every draw helper, observed raw so agreement is bit-for-bit —
+        # including a rand-derived loop bound, a rand-derived guarded index, and
+        # a rand-derived branch condition (data-dependent control flow).
+        "inline PRNG: every helper agrees bit-for-bit" => FuzzJI.rngheader(20260803) * """
+        let
+            acc = 0
+            for i in 1:__randrange__(0, 4)
+                acc = acc + __randrange__(1, 10)
+            end
+            __obs__(acc)
+            v = [10, 20, 30]
+            __obs__(try v[__randrange__(1, 5)] catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(__randint__())
+            __obs__(__randbool__())
+            f = __randfloat__()
+            __obs__(f)
+            __obs__((0.0 <= f) && (f < 1.0))
+            r = __randrange__(1, 10)
+            __obs__((1 <= r) && (r <= 10))
+            if __randbool__()
+                __obs__(:branchA)
+            else
+                __obs__(:branchB)
+            end
+            __obs__(__LCG__[])
+        end
+        """,
+        # (a') the legacy explicit-RNG spelling, as previously written
+        # findings/repros contain it: `Xoshiro(seed)` still resolves against the
+        # prelude's `using Random` and still agrees (slow under rec — thousands
+        # of interpreted statements per draw, which is why generated programs
+        # no longer use it — but the 2M-statement budget here covers it).
+        "seeded Xoshiro (legacy repros): streams agree bit-for-bit" => """
         const __RNG__ = Xoshiro(20260803)
         let
             acc = 0
@@ -506,9 +535,9 @@ end
                     @warn "determinism-policy divergence (a real finding — triage it!)" seed mode v.class v.detail
                 end
             end
-            # (a) directly: a generated program that actually uses __RNG__ produces
-            # identical observation streams ref-vs-interp.
-            if occursin("__RNG__", src)
+            # (a) directly: a generated program that actually uses the inline
+            # PRNG produces identical observation streams ref-vs-interp.
+            if occursin("__LCG__", src)
                 rr = run_both(src; nstmts=500_000)
                 if rr !== nothing && rr[2].status === :done && rr[1].status === :done
                     isequal(rr[1].obs, rr[2].obs) && (rngstreams += 1)
@@ -517,7 +546,7 @@ end
         end
         @test ndiverge == 0
         @test nnondet == 0        # the gate should not even need to fire
-        @test rngstreams > 0      # some __RNG__ programs ran clean and matched
+        @test rngstreams > 0      # some inline-PRNG programs ran clean and matched
     end
 
     @testset "freshmodule prelude matches SETUP_SRC" begin
@@ -563,8 +592,9 @@ end
         @test Base.invokelatest(getglobal, fresh, :__VTIME__)[] == 2
         # both helpers are Functions (isa Function checks see the same thing)
         @test vnorm isa Function && fnorm isa Function && fobs isa Function
-        # `using Random` still holds in the fresh module (`const __RNG__ =
-        # Xoshiro(seed)` in rendered programs resolves against it)
+        # `using Random` still holds in the fresh module (previously written
+        # findings/repros contain `const __RNG__ = Xoshiro(seed)`, which
+        # resolves against it; new programs carry their own inline PRNG)
         @test Base.invokelatest(Core.eval, fresh, :(Xoshiro(1) isa Xoshiro))
     end
 
@@ -1022,7 +1052,7 @@ end
         # metrics.jl reports exact densities; this is the floor that catches a
         # grammar change silently starving one of the new features (which would
         # make the axis test nothing while still passing every agreement check).
-        hasrng(src)   = occursin("__RNG__", src)
+        hasrng(src)   = occursin("__LCG__", src)
         hasdict(src)  = occursin("Dict{", src) || occursin("Set{", src)
         hasvtime(src) = occursin("__vtime__", src)
         # Under the :determinism policy the new features must be common.

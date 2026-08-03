@@ -201,17 +201,22 @@ earlier waves designed out):
 Determinism-unlock grammar (`determinism.md` §3/§4; gated by the `:rng`/`:dict`/
 `:vtime` swarm features and a `:determinism` policy):
 
-- **explicit RNG.** `const __RNG__ = Xoshiro(seed)` is baked into the rendered
-  program as a *literal* seed (`Program.rngseed`, `render.jl`) — not a harness
-  global — so both engines seed identically and run the same pure-Julia Xoshiro
-  transitions, agreeing bit-for-bit (`SETUP_SRC` gains `using Random`). Rules
-  `rand(__RNG__, Int)`, `rand(__RNG__, 1:n)`, `rand(__RNG__, Bool)`,
-  `rand(__RNG__)`, `randn(__RNG__)` feed the Int/Float/Bool expression menus, so
-  rand-derived values reach guarded indices, `if`/`while` conditions, and a
-  rand-derived `for` trip count (`for i in 1:rand(__RNG__, 0:maxloop)`) —
-  data-dependent control flow the guarded rules previously lacked. Termination
-  stays by construction: rand supplies loop *counts* (capped at `maxloop`),
-  never while-fuel;
+- **explicit RNG.** An inline SplitMix64 PRNG — `const __LCG__ =
+  Ref{UInt64}(seed)` plus four draw helpers — is baked into the rendered
+  program with a *literal* seed (`Program.rngseed`, `render.jl` `rngheader`) —
+  not a harness global — so both engines seed identically and run the same
+  integer transitions, agreeing bit-for-bit, and programs stay fully
+  self-contained. (Originally `const __RNG__ = Xoshiro(seed)` + Base `rand`,
+  but each Base Random draw interprets thousands of statements under
+  RecursiveInterpreter — measured 100% statement-budget exhaustion at the
+  default 300k for `__RNG__`-bearing programs; `SETUP_SRC` keeps `using
+  Random` so old repros still run.) Rules `__randint__()`,
+  `__randrange__(1, n)`, `__randbool__()`, `__randfloat__()` feed the
+  Int/Float/Bool expression menus, so rand-derived values reach guarded
+  indices, `if`/`while` conditions, and a rand-derived `for` trip count
+  (`for i in 1:__randrange__(0, maxloop)`) — data-dependent control flow the
+  guarded rules previously lacked. Termination stays by construction: rand
+  supplies loop *counts* (capped at `maxloop`), never while-fuel;
 - **content-keyed `Dict`/`Set`** (new `DictT`/`SetT`/`CharT` summaries), keyed
   by the content-hashed whitelist — Int/String/Symbol/Char/Bool and tuples of
   those — whose `hash` is identical across the two engines, so iteration order
@@ -850,11 +855,13 @@ type the program defined reads as `Main.FJ95.ZT` on one side and `Main.FJ96.ZT`
 on the other; `__fjnorm__` strips its own module's prefix and keeps the rest
 (type parameters included). The split axis produced 16 such false divergences
 in 5000 cases before that was fixed.
-Handled: RNG — the grammar now calls `rand` through a per-program
-`const __RNG__ = Xoshiro(seed)` baked in as a literal, so both engines run the
-same Xoshiro transitions and agree bit-for-bit (`determinism.md` §3; the corpus
-axis seeds the task-local RNG instead, and certifies per-fragment before value
-comparison, §6); content-keyed `Dict`/`Set` and the `__vtime__` virtual clock
+Handled: RNG — the grammar draws from a per-program inline SplitMix64 PRNG
+(`const __LCG__ = Ref{UInt64}(seed)` + helpers, rendered into the program with
+the seed as a literal), so both engines run the same integer transitions and
+agree bit-for-bit at a few interpreted statements per draw (`determinism.md`
+§3; the corpus axis seeds the task-local RNG instead, and certifies
+per-fragment before value comparison, §6); content-keyed `Dict`/`Set` and the
+`__vtime__` virtual clock
 are likewise deterministic across the two engines. Stack depth: fueled recursion
 keeps it shallow; `StackOverflowError` asymmetries would classify as
 `exception_divergence` and belong in `SUPPRESSIONS` if hit.

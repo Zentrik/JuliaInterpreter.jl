@@ -350,10 +350,13 @@ nondeterminism false positives (0 `nondet_discard` attributable to the new
 rules). What shipped:
 
 - **Explicit RNG + content-keyed containers** — **done** (`determinism.md`
-  §3/§4). `const __RNG__ = Xoshiro(seed)` is baked into the rendered program as
-  a *literal* (`Program.rngseed`), identical on both engines, so `rand(__RNG__,
-  Int)` / `rand(__RNG__, 1:n)` / `rand(__RNG__, Bool)` / `rand(__RNG__)` /
-  `randn(__RNG__)` agree bit-for-bit. Wired into the Int/Float/Bool expression
+  §3/§4). An inline SplitMix64 PRNG (`const __LCG__ = Ref{UInt64}(seed)` +
+  draw helpers, `render.jl` `rngheader`) is baked into the rendered program
+  with a *literal* seed (`Program.rngseed`), identical on both engines, so
+  `__randint__()` / `__randrange__(lo, hi)` / `__randbool__()` /
+  `__randfloat__()` agree bit-for-bit at a few interpreted statements per draw
+  (originally Base `rand` on a `Xoshiro`; replaced after measuring 100%
+  statement-budget exhaustion in rec mode). Wired into the Int/Float/Bool expression
   menus and a rand-derived `for` trip count, so data-dependent control flow and
   indices are now generable (termination still by construction — rand never
   feeds while-fuel). `Dict`/`Set` keyed by the content-hashed whitelist

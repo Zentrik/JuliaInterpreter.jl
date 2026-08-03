@@ -29,7 +29,7 @@
 #   :aprop    meta = fieldname::Symbol                      kids = [obj]    # (@atomic (obj).field)
 #   :compr    meta = (ivar, n::Int, hasfilter::Bool)        kids = [bodyex] or [bodyex, cond]
 #   :kwcall   meta = (fname::Symbol, kwnames::Vector{Symbol}) kids = positional args, then kwarg values
-#   :rng      meta = call source::String                    kids = []   # rand(__RNG__, ...) / randn(__RNG__)
+#   :rng      meta = call source::String                    kids = []   # inline-PRNG draw: __randint__() / __randrange__(lo, hi) / __randbool__() / __randfloat__()
 #   :vtime    meta = nothing                                kids = []   # __vtime__() monotone counter
 #   :dictlit  meta = nothing (sum::DictT)                   kids = [k1,v1,k2,v2,...]  # Dict{K,V}(...)
 #   :setlit   meta = nothing (sum::SetT)                    kids = elts # Set{E}([...])
@@ -97,10 +97,11 @@ struct Program
     mid::Vector{St}       # extra toplevel statements (toplevel-frame surface)
     body::Vector{St}      # rendered inside a toplevel `let`
     # Per-program RNG seed, baked into the rendered program as the literal
-    # `const __RNG__ = Xoshiro(rngseed)`. It is a *literal* on both sides (not a
-    # harness global), so the two engines run the same Xoshiro transitions and
+    # `const __LCG__ = Ref{UInt64}(rngseed)` plus the inline SplitMix64 draw
+    # helpers (render.jl `rngheader`). It is a *literal* on both sides (not a
+    # harness global), so the two engines run the same integer transitions and
     # agree bit-for-bit (determinism.md §3). `nothing` means the program uses no
-    # explicit RNG and the declaration is omitted. Structural, not a statement:
+    # explicit RNG and the header is omitted. Structural, not a statement:
     # the shrinker never removes it, and `cloneprog` carries it through.
     rngseed::Union{Nothing,Int}
 end

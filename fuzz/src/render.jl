@@ -74,9 +74,10 @@ function render(e::Ex)::String
         end
         return spelling * "(" * join(parts, ", ") * ")"
     elseif k === :rng
-        # A draw from the program's own `__RNG__` (e.g. `rand(__RNG__, Int)`).
-        # The RNG object is seeded from a literal baked into both modules, so
-        # both engines execute the same Xoshiro transition and agree bit-for-bit.
+        # A draw from the program's own inline PRNG (e.g. `__randint__()`).
+        # The PRNG state is seeded from a literal baked into both modules, so
+        # both engines execute the same integer transitions and agree
+        # bit-for-bit (see `rngheader`).
         return e.meta::String
     elseif k === :vtime
         # Monotone virtual clock (SETUP_SRC). Deterministic because both sides
@@ -170,7 +171,7 @@ function render(st::St, io::IO, ind::Int)
         ivar, n = st.meta[1], st.meta[2]
         # A rand-derived trip count sits where a literal bound would (meta[3]);
         # it is capped at maxloop, so termination-by-construction is preserved —
-        # the loop draws its *count* from __RNG__, not its fuel. Both sides draw
+        # the loop draws its *count* from the inline PRNG, not its fuel. Both sides draw
         # the same value, so iteration counts stay in lockstep.
         boundsrc = length(st.meta) >= 3 ? st.meta[3]::String : string(n)
         println(io, pad, "for ", String(ivar), " in 1:", boundsrc)
@@ -325,12 +326,43 @@ function renderblock(sts::Vector{St}, io::IO, ind::Int)
     end
 end
 
+# The per-program inline PRNG (determinism.md §3): SplitMix64 state + draw
+# helpers, rendered into the program text itself with the seed as a literal.
+#
+# Why inline instead of `const __RNG__ = Xoshiro(seed)` + Base's `rand`: under
+# RecursiveInterpreter each `rand(__RNG__, ...)` call interprets Base's entire
+# Random machinery — thousands of statements per draw — and measured at the
+# default 300k statement budget, 100% of programs containing `__RNG__`
+# exhausted it (72/72; overall abort rate 70-72% vs ~1% before the RNG grammar
+# landed), so the rec axis effectively never tested the feature. These helpers
+# are a handful of integer/float intrinsics per draw, cost a few interpreted
+# statements, and keep every property that mattered: bit-identical values on
+# both engines, data-dependent control flow, seed baked as a literal.
+#
+# Why in the rendered program rather than SETUP_SRC: the state is per-*program*
+# (each candidate seeds its own stream), and rendering the four one-liners
+# alongside the const keeps programs fully self-contained — repros run
+# standalone, ji.jl and reprolib need no plumbing, and freshmodule()'s shared
+# compiled helpers (4cd92be) stay untouched. `SETUP_SRC` keeps `using Random`
+# so previously written findings/repros (`const __RNG__ = Xoshiro(seed)`)
+# still resolve.
+function rngheader(seed::Int)::String
+    return """
+    const __LCG__ = Ref{UInt64}($(repr(UInt64(seed))))
+    __randu__() = (__LCG__[] += 0x9e3779b97f4a7c15; z = __LCG__[]; z = xor(z, z >> 30) * 0xbf58476d1ce4e5b9; z = xor(z, z >> 27) * 0x94d049bb133111eb; xor(z, z >> 31))
+    __randint__() = __randu__() % Int64
+    __randrange__(lo::Int64, hi::Int64) = lo + (__randu__() % UInt64(hi - lo + 1)) % Int64
+    __randbool__() = __randu__() % Bool
+    __randfloat__() = Float64(__randu__() >> 11) * 0x1p-53
+    """
+end
+
 function render(prog::Program)::String
     io = IOBuffer()
-    # The per-program RNG, as a literal seed baked identically into both engines'
-    # source (determinism.md §3). `Xoshiro` resolves against SETUP_SRC's
-    # `using Random`, which every fresh module evaluates before the program runs.
-    prog.rngseed === nothing || println(io, "const __RNG__ = Xoshiro(", prog.rngseed, ")")
+    # The per-program PRNG, as a literal seed baked identically into both
+    # engines' source (determinism.md §3), helpers included — the program is
+    # self-contained.
+    prog.rngseed === nothing || print(io, rngheader(prog.rngseed))
     for st in prog.pre        # struct defs + module globals
         render(st, io, 0)
     end
@@ -350,7 +382,8 @@ end
 # normalizer scrubs anything module- or identity-dependent so observations
 # from the two modules are comparable with `isequal`.
 const SETUP_SRC = raw"""
-using Random
+using Random   # kept for previously written findings/repros (`Xoshiro(seed)`);
+               # new programs use the self-contained inline PRNG (`rngheader`)
 const __OBS__ = Any[]
 # Virtual monotone clock (determinism.md §3): deadline/elapsed-shaped control
 # flow (`while __vtime__() < N`) without a real clock. Deterministic because

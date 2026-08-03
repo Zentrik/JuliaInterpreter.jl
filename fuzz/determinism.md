@@ -184,17 +184,25 @@ patterns and see the same values". So interpose at the API the generated
 program calls, inside the prelude both sides already share (`SETUP_SRC`,
 `render.jl:275`), rather than at the syscall layer:
 
-- **`__RNG__ = Xoshiro(candidate_seed)`**, with grammar rules drawing
-  `rand(__RNG__, Int)`, `rand(__RNG__, 1:n)`, `randn(__RNG__)`,
-  `shuffle!(__RNG__, v)`, `rand(__RNG__, Bool)`. An explicit RNG object
-  rather than `Random.seed!` keeps the program hermetic from harness and
-  task-local RNG state. Both sides execute the same pure-Julia Xoshiro
-  transition code (its integer intrinsics run natively under interpretation
-  too), so the streams agree bit-for-bit — `DESIGN.md` already notes RNG is
-  "handled: both sides could seed identically"; this cashes that in.
-  Payoff beyond coverage of `rand` itself: *data-dependent* control flow and
-  indices — the guarded-indexing and loop rules finally see nonuniform
-  runtime values instead of literal bounds.
+- **An inline per-program PRNG** (`const __LCG__ = Ref{UInt64}(seed)` +
+  SplitMix64 draw helpers, rendered into the program text — `render.jl`
+  `rngheader`), with grammar rules drawing `__randint__()`,
+  `__randrange__(lo, hi)`, `__randbool__()`, `__randfloat__()`. An explicit
+  per-program PRNG rather than `Random.seed!` keeps the program hermetic
+  from harness and task-local RNG state; a *hand-rolled inline* PRNG rather
+  than `const __RNG__ = Xoshiro(seed)` + Base `rand` (the first-shipped
+  design) because under RecursiveInterpreter each Base Random draw
+  interprets thousands of statements — measured: 100% of `__RNG__`-bearing
+  programs exhausted the default 300k statement budget (72/72; 70-72%
+  overall abort rate), so the rec axis never actually tested the feature.
+  The helpers are a handful of integer/float intrinsics, which run natively
+  under interpretation too, so the streams agree bit-for-bit — `DESIGN.md`
+  already notes RNG is "handled: both sides could seed identically"; this
+  cashes that in. Payoff beyond coverage of the draws themselves:
+  *data-dependent* control flow and indices — the guarded-indexing and loop
+  rules finally see nonuniform runtime values instead of literal bounds.
+  (`SETUP_SRC` keeps `using Random` so old findings/repros with
+  `Xoshiro(seed)` still run.)
 - **`__vtime__()`**: a monotone counter in the prelude. Unlocks
   timeout-shaped code (`while __vtime__() < deadline`), deadline arithmetic,
   "elapsed" comparisons — control-flow idioms that currently cannot exist.
@@ -386,15 +394,19 @@ widening of this oracle.
    `confirm`/`confirmed`/`confirmsrc`/`confirmreport`, wired into `driver.jl`
    and `supposition.jl`; new tracked class `nondet_discard`, counted next to
    `aborted` in campaign stats). Safety net for everything below.
-2. **`__RNG__` + rand rules; `Dict`/`Set` with content-hashed keys** —
-   **done** (§3 RNG, §4). `const __RNG__ = Xoshiro(seed)` is baked into the
-   rendered program as a *literal* seed (`Program.rngseed`, `render.jl`), so
-   both engines run identical Xoshiro transitions and agree bit-for-bit;
-   `SETUP_SRC` gains `using Random`. Rules `rand(__RNG__, Int)` /
-   `rand(__RNG__, 1:n)` / `rand(__RNG__, Bool)` / `rand(__RNG__)` /
-   `randn(__RNG__)` feed the Int/Float/Bool expression menus, so rand-derived
+2. **Inline PRNG + rand rules; `Dict`/`Set` with content-hashed keys** —
+   **done** (§3 RNG, §4). The inline SplitMix64 header (`const __LCG__ =
+   Ref{UInt64}(seed)` + draw helpers) is baked into the rendered program with
+   a *literal* seed (`Program.rngseed`, `render.jl` `rngheader`), so both
+   engines run identical integer transitions and agree bit-for-bit. (First
+   shipped as `const __RNG__ = Xoshiro(seed)` + Base `rand`; replaced after
+   measuring that 100% of such programs exhausted the 300k statement budget
+   under RecursiveInterpreter — Base's Random machinery costs thousands of
+   interpreted statements per draw. `SETUP_SRC` keeps `using Random` for old
+   repros.) Rules `__randint__()` / `__randrange__(1, n)` / `__randbool__()` /
+   `__randfloat__()` feed the Int/Float/Bool expression menus, so rand-derived
    values flow into guarded indices, `if`/`while` conditions and a rand-derived
-   `for` trip count (`for i in 1:rand(__RNG__, 0:maxloop)`) — data-dependent
+   `for` trip count (`for i in 1:__randrange__(0, maxloop)`) — data-dependent
    control flow, termination still by construction (rand never feeds while-fuel).
    `Dict`/`Set` are keyed by the content-hashed whitelist (Int/String/Symbol/
    Char/Bool + tuples of those; new `DictT`/`SetT`/`CharT` summaries): rules for
