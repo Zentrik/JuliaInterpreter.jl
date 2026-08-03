@@ -18,14 +18,18 @@ const SUPPRESSIONS = Function[]
 suppressed(v::Verdict) = any(p -> p(v)::Bool, SUPPRESSIONS)
 
 function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
-                      origsrc::String, shrunksrc::String; mode::Symbol=:rec)
+                      origsrc::String, shrunksrc::String; mode::Symbol=:rec,
+                      walkseed::Union{Nothing,Int}=nothing)
     dir = joinpath(outdir, fp)
     mkpath(dir)
     reprocall = mode === :cmp ? "reprorun(SRC; compiled=true)" : "reprorun(SRC)"
+    # The stepping/eval_code/corpus axes drive their own walk from `walkseed`;
+    # without it the reported source alone does not describe the run.
+    walkline = walkseed === nothing ? "" : "\n# walk seed: $walkseed"
     open(joinpath(dir, "repro.jl"), "w") do io
         print(io, """
         # FuzzJI reproducer — $(v.class) (interp mode: $mode)
-        # seed: $seed
+        # seed: $seed$walkline
         # julia: $VERSION
         # detail: $(replace(v.detail, '\n' => ' '))
         # Run with: julia --project=<repo>/fuzz <this file>
@@ -38,7 +42,7 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
         print(io, """
         # $(v.class) ($fp)
 
-        - seed: `$seed`
+        - seed: `$seed`$(walkseed === nothing ? "" : "\n- walk seed: `$walkseed`")
         - interp mode: `$mode`
         - julia: `$VERSION`
         - divergent observation index: $(v.dividx)
@@ -73,7 +77,8 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                   outdir::String=joinpath(@__DIR__, "..", "findings"),
                   journaldir::String=joinpath(@__DIR__, "..", "journal"),
                   cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true,
-                  modes::Tuple=(:rec, :cmp), seeddisk::Bool=true, journalsync::Bool=true)
+                  modes::Tuple=(:rec, :cmp), seeddisk::Bool=true, journalsync::Bool=true,
+                  shrinkruns::Int=400, shrinksecs::Real=600.0)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
@@ -117,7 +122,10 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                         push!(seen, fp)
                         stats.findings += 1
                         @info "FINDING $(v.class)" mode seed fp detail = first(v.detail, 300)
-                        shrunk = doshrink ? shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode)) : prog
+                        shrunk = doshrink ?
+                            shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode),
+                                   budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)) :
+                            prog
                         dir = writefinding(outdir, fp, v, seed, src, render(shrunk); mode)
                         @info "  reported" dir nstatements_orig = nstatements(prog) nstatements_shrunk = nstatements(shrunk)
                     end

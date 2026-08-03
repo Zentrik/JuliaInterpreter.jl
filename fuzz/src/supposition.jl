@@ -63,7 +63,8 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
                               journaldir::String=joinpath(@__DIR__, "..", "journal"),
                               cfg::Cfg=Cfg(), doshrink::Bool=true,
                               modes::Tuple=(:rec, :cmp), patience::Int=1,
-                              seeddisk::Bool=true, journalsync::Bool=true)
+                              seeddisk::Bool=true, journalsync::Bool=true,
+                              shrinkruns::Int=400, shrinksecs::Real=600.0)
     seen = Set{String}()
     seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
@@ -122,7 +123,10 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
         push!(seen, fp)
         nfound += 1
         @info "FINDING (supposition)" round fp v.class mode detail = first(v.detail, 300)
-        shrunk = doshrink ? shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode)) : prog
+        shrunk = doshrink ?
+            shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode),
+                   budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)) :
+            prog
         dir = writefinding(outdir, fp, v, -1, render(prog), render(shrunk); mode)
         @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk)
     end
