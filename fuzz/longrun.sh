@@ -46,6 +46,23 @@ cd "$(dirname "$0")/.."
 # for a long run. See NEXT.md.
 JULIA_CMD="${JULIA_CMD:-julia}"
 
+# Optimization level for the campaign julia. Default -O1, for two reasons:
+#   1. Faster. The reference side JIT-compiles every generated program, so a
+#      compile-heavy differential fuzzer is throughput-bound on LLVM; -O1
+#      measured ~1.3x faster than the -O2 default.
+#   2. Works around the 1.12/1.13 GC-corruption crash. That bug (JuliaLang/julia
+#      #59483 / #60622, "fixed" by #60651) is codegen-induced: LICM — an -O2/-O3
+#      pass — can materialize an `undef` GC stack root that the collector then
+#      marks, segfaulting inside gc-stock.c. -O1 does not run that pass, so it
+#      sidesteps the crash; the restart loop is no longer paying for it.
+# The oracle stays valid: Julia guarantees semantic equivalence across -O
+# levels, so the interpreter must still match the -O1-compiled reference; and
+# fewer optimizations means fewer optimization-dependent class-U false positives.
+# Set JULIA_OPT=2 to restore the -O2 config (keeps the free Julia-codegen
+# fuzzing and reproduces the GC crash for the upstream report).
+JULIA_OPT="${JULIA_OPT:-1}"
+JULIA_CMD="$JULIA_CMD -O$JULIA_OPT"
+
 DURATION="${1:-3600}"
 shift || true
 SHARDS=("$@")

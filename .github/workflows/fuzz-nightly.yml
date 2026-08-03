@@ -30,7 +30,9 @@ jobs:
   fuzz:
     name: Fuzz Julia ${{ matrix.version }}
     runs-on: ubuntu-latest
-    continue-on-error: ${{ matrix.version == 'pre' }}
+    # Only the supported release lane (1.12) is required; the forward-looking
+    # lanes are advisory early warning, so their failures never fail the workflow.
+    continue-on-error: ${{ matrix.version != '1.12' }}
     # duration (default 3 h) + up to ~30 min of longrun batch overshoot
     # + setup/selftest/upload, comfortably under GitHub's 6 h job limit.
     timeout-minutes: 350
@@ -38,8 +40,10 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.12'   # required lane
-          - 'pre'    # early-warning lane on the upcoming Julia
+          - '1.12'      # required lane, the supported release
+          - 'pre'       # early warning: the upcoming release (RC/beta)
+          - 'nightly'   # earliest warning: Julia master, where a GC/codegen
+                        # regression or an interpreter break shows up first
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v2
