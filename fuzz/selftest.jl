@@ -191,6 +191,14 @@ end
         aborted(obs...) = Outcome(:aborted, :none, Any[obs...], "", "")
         @test classify(done(1, 2, 3), aborted(1)).class === :aborted
         @test classify(done(1, 2, 3), aborted(7)).class === :value_divergence
+        # An aborted run interrupted mid-push of its last observation leaves a
+        # trailing UNASSIGNED_OBS; trimabortedobs strips it so the abort boundary
+        # is not compared against the reference's completed value (was a whole
+        # class of false value_divergences). A *completed* run keeps the sentinel.
+        @test FuzzJI.trimabortedobs(Any[1, 2, FuzzJI.UNASSIGNED_OBS]) == Any[1, 2]
+        @test FuzzJI.trimabortedobs(Any[1, 2, 3]) == Any[1, 2, 3]
+        @test classify(done(1, 2, 3), aborted(1, 2)).class === :aborted   # post-trim shape
+        @test classify(done(1, 2, 3), done(1, 2, FuzzJI.UNASSIGNED_OBS)).class === :value_divergence
     end
 
     @testset "fingerprints distinguish unrelated value divergences" begin

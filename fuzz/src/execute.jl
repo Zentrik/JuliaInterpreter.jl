@@ -109,8 +109,20 @@ end
 
 const SETUP_EXPR = Meta.parseall(SETUP_SRC)
 
+# The harness's own load state, captured at load time. A corpus fragment is real
+# code and can mutate global load state (`LOAD_PATH`, the active project); the
+# corpus axis's next `freshmodule` then can't resolve `using Random` in SETUP
+# and the whole campaign dies with "Package Random not found". Restore the
+# known-good load path before each fresh module so no fragment's damage leaks
+# past the case that caused it. (Harmless for the generated axes, which never
+# touch load state.)
+const HARNESS_LOAD_PATH = copy(LOAD_PATH)
+
 let counter = Ref(0)
     global function freshmodule()
+        if LOAD_PATH != HARNESS_LOAD_PATH
+            copy!(LOAD_PATH, HARNESS_LOAD_PATH)
+        end
         m = Module(Symbol("FJ", counter[] += 1))
         for st in SETUP_EXPR.args
             st isa LineNumberNode && continue
@@ -143,6 +155,23 @@ function getobs(m::Module)
     return out
 end
 
+# An aborted run can be interrupted *mid-`push!`* of its last observation:
+# `__obs__` grows `__OBS__` and then stores, and the statement budget can hit
+# between the two, leaving a trailing unassigned slot. That slot is the abort
+# boundary, not a real observation — but the reference (which never aborts) has
+# a genuine value at that index, so comparing them reads as a `value_divergence`
+# where nothing diverged. Trim trailing sentinels from an aborted stream so the
+# oracle compares only completed observations. Only trailing ones, and only for
+# aborted runs: a *completed* run that left a slot unassigned (the classic
+# `push!`-grow-then-store interpreter bug) is a real divergence and is kept.
+function trimabortedobs(obs::Vector{Any})
+    n = length(obs)
+    while n > 0 && obs[n] === UNASSIGNED_OBS
+        n -= 1
+    end
+    return n == length(obs) ? obs : obs[1:n]
+end
+
 scrubexc(err) = nameof(typeof(err))
 
 shortstr(err) = first(sprint(showerror, err; context=:limit => true), 500)
@@ -168,14 +197,14 @@ function run_interp(ex::Expr; nstmts::Int, interp::Interpreter=RecursiveInterpre
             frame = Frame(mod, frag)
             while true
                 ret, budget = evaluate_limited!(interp, frame, budget, true)
-                ret isa Aborted && return Outcome(:aborted, :none, getobs(m), "", "")
+                ret isa Aborted && return Outcome(:aborted, :none, trimabortedobs(getobs(m)), "", "")
                 ret isa Some && break
                 @assert ret === nothing  # paused after a method definition; resume same frame
             end
         end
         return Outcome(:done, :none, getobs(m), "", "")
     catch err
-        err isa AbortException && return Outcome(:aborted, :none, getobs(m), "", "")
+        err isa AbortException && return Outcome(:aborted, :none, trimabortedobs(getobs(m)), "", "")
         bt = sprint(Base.show_backtrace, catch_backtrace(); context=:limit => true)
         return Outcome(:threw, scrubexc(err), getobs(m), shortstr(err), first(bt, 3000))
     end
