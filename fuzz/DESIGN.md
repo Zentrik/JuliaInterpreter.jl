@@ -123,11 +123,9 @@ Wave-2 grammar (programs are now four sections: module globals + struct
 definitions, function definitions, bare toplevel statements, and the `let`
 body):
 
-- a curated **builtins/intrinsics edge-case dictionary** (`BUILTIN_PROBES`):
-  ~45 verbatim probes of `getfield`/`apply_type`/`Core.Intrinsics.*`/
-  `_apply_iterate`/`compilerbarrier`/... with wrong arities and
-  odd-but-lowerable arguments, always guarded so the exception *type* is
-  oracle data — aimed directly at `src/builtins.jl`;
+- a **reflection-driven builtins/intrinsics prober** (`probes.jl`, see below),
+  always guarded so the exception *type* is oracle data — aimed directly at
+  `src/builtins.jl`;
 - **module globals**: created at toplevel and via bare-toplevel statements,
   read everywhere, written from local scopes via `global x = ...`;
 - **`struct`/`mutable struct` definitions**: construction, field reads,
@@ -165,16 +163,60 @@ earlier waves designed out):
   (`local x::T = v`);
 - **`@atomic` struct fields**: atomic get/set/`+=` lower to the
   ordering-carrying `getfield`/`setfield!`/`modifyfield!` builtin arities that
-  `src/builtins.jl` hand-dispatches. Probe dictionary extended with the whole
+  `src/builtins.jl` hand-dispatches. The prober carries recipes for the whole
   atomics field family (`swapfield!`/`modifyfield!`/`replacefield!`/
   `setfieldonce!`, right and wrong arities, ordering violations on non-atomic
-  fields), `invoke`/`invokelatest`, opaque closures (`:new_opaque_closure` is
-  a dedicated interpreter path), and `Memory` basics;
+  fields), for `invoke`/`invokelatest`, and fixed templates for opaque
+  closures (`:new_opaque_closure` is a dedicated interpreter path) and
+  `Memory` basics;
 - **`try`/`catch`/`else`** (distinct 1.8+ lowering); struct aliasing (mutation
   through one name observed through another); mixed Int/Float arithmetic
   (promotion); **wrong-typed guarded calls** into generated functions
   (MethodError construction / localmethtable misses, and errors thrown deep
   inside interpreted callees propagating through interpreted frames).
+
+### The builtins prober (`probes.jl`)
+
+`src/builtins.jl` is itself *generated*, by `bin/generate_builtins.jl`, which
+enumerates every `Core.Builtin` and every `Core.Intrinsics` function by
+reflection and emits one dispatch arm per callable. The prober consumes the
+same enumeration from the other side, so the fuzzer's notion of "what the
+interpreter special-cases" cannot drift from the interpreter's:
+
+- **Enumerate**, at harness load, every builtin-valued name in
+  `names(Core; all=true)`, every intrinsic in `names(Core.Intrinsics; all=true)`,
+  and the Base-level entry points that are builtins on some versions
+  (`invokelatest`, `invoke_in_world`, `isdefinedglobal`). Every lookup is
+  `isdefined`-guarded, so the target list is version-relative. Both spellings
+  of a callable are kept (`getfield` and `Core.getfield`) because they lower
+  differently — a direct `GlobalRef` versus a `getproperty` chain that puts an
+  SSA value in function position, two different routes into
+  `maybe_evaluate_builtin`. On 1.11.9 this is 269 spellings, 210 of them
+  probeable.
+- **Arity sweep** from the compiler's own `T_FFUNC_VAL`/`T_IFUNC` tables — the
+  same tables `generate_builtins.jl` uses to decide how many per-arity clauses
+  to emit — with off-by-one and outright malformed arities mixed in for
+  builtins.
+- **Arguments from the generator**: in-scope generated values (structs,
+  vectors, closures, tuples, symbols) mixed with adversarial literals, atomic
+  orderings, and type literals. Recipes (`PROBE_RECIPES`, ~120 argument shapes
+  over 43 builtins) give the high-value ones — `getfield`/`setfield!`/
+  `apply_type`/`fieldtype`/`isdefined`/`tuple`/`_apply_iterate`/`invoke`/
+  `invokelatest`/the atomics field family/the global-binding family —
+  *plausible* shapes some of the time, so probes exercise success paths and
+  not only the MethodError/TypeError arms. `FIXED_PROBES` keeps the curated
+  templates that are not a plain `callee(args...)` call (opaque closures,
+  `Memory` basics, `first(Core.modifyfield!(...))`).
+- **A safety denylist** (`PROBE_BANS`) with a reason string per entry, because
+  a bad probe does not produce a finding — it kills the worker or poisons the
+  oracle. `:all` entries are never rendered; `:arbitrary` entries are
+  reachable only through a vetted recipe. See "known false-positive and
+  worker-death classes" below for the measurements behind them.
+
+`fuzz/metrics.jl` reports enumerated / allowed / denylisted counts, the recipe
+inventory, and probe density plus distinct-callable coverage under the
+`builtins` policy — the numbers that say whether a grammar change silently
+starved the prober.
 
 Generation is a pure function of its randomness source, consumed through the
 `AbstractRNG` interface. Two engines drive it (`--engine`):
@@ -344,7 +386,7 @@ divergence (interpreter frames are visible in `stacktrace()` — a real,
 permanent difference) inside 50+ statements of noise and requires the
 shrinker to reduce it while preserving the fingerprint.
 
-## Known false-positive classes found and closed during shakedown
+## Known false-positive and worker-death classes found and closed
 
 - **`===` on Float operands (NaN payloads).** The fuzzer surfaced a
   `value_divergence` where `min(NaN, NaN) === (NaN + NaN)` evaluated to
@@ -357,15 +399,67 @@ shrinker to reduce it while preserving the fingerprint.
   Int/Sym/Str/Bool operands. Bare-float value observations remain fair, as
   `isequal` treats all NaNs as equal (only `===`/`reinterpret` expose
   payloads, and the sole `reinterpret` probe is on a fixed constant).
-- **`Core.Intrinsics.sdiv_int(_, 0)`.** Uncatchable SIGFPE that killed the
-  worker; both sides trap identically. Removed from the probe dictionary
-  (see the builtins section).
+- **`Core.Intrinsics.sdiv_int(_, 0)`.** Uncatchable trap that killed the
+  worker. Re-measured on 1.11.9 while building the prober: inside a compiled
+  toplevel `let` — the shape `render.jl` emits — the raw divides
+  (`sdiv_int`/`udiv_int`/`srem_int`/`urem_int`) die with SIGILL ("Unreachable
+  reached", exit 132) because codegen lowers the UB to `unreachable`. Denied
+  outright. The *checked* family (`checked_sdiv_int` and friends) was measured
+  too and does the opposite — DivideError even when compiled — so those stay,
+  and they are the intrinsic-level division probe the raw ones cannot be.
 - **Out-of-range `unsafe_trunc`.** The result is an *unspecified value*
   (LLVM poison under compilation vs. the runtime intrinsic under
   interpretation), so `unsafe_trunc(Int8, 300.0)` may legally differ across
-  the two engines. The probe now uses an in-range argument; the same rule
-  bars any future probe whose contract says "unspecified" (fptosi of NaN,
-  etc.).
+  the two engines. The probe uses an in-range argument; the same rule bars any
+  probe whose contract says "unspecified" — `fptosi`/`fptoui` are recipe-only
+  with in-range floats, and the fast-math intrinsics plus `muladd_float`
+  (reassociation and fma-contraction licenses) are denied.
+- **Wrong-arity *intrinsic* calls abort the process.** A builtin called with
+  the wrong number of arguments raises a catchable `ArgumentError`; an
+  *intrinsic* call site with the wrong operand count is a codegen error —
+  "Internal error: encountered unexpected error during compilation ...
+  intrinsic #2 add_int: wrong number of arguments", exit 139 — on the
+  reference side, before the interpreter is ever reached. So the prober's
+  arity sweep is exact for intrinsics and malformed only for builtins.
+- **Width-relational casts fail at *compile* time, outside the guard.**
+  `fptrunc`/`fpext`/`trunc_int`/`sext_int`/`zext_int` check their operand
+  widths during compilation when the types are statically known, and that
+  error is raised while the enclosing thunk is compiled — outside the
+  program's own `try`, so it escapes the guard and shows up as a bogus
+  `ref_only_throw`. Every cast shape the prober emits satisfies the relation.
+- **Runaway type materialization.** `Core.apply_type(Array, Int, typemax(Int))`
+  and `NTuple` with a huge count segfault the runtime, and `typemax(Int)` is in
+  the literal menu — so `apply_type` is recipe-only, and the parametric
+  constructors whose Int parameter materializes storage (`Array`, `NTuple`,
+  `Vararg`, plus `Ptr`) are kept out of the argument pool entirely.
+- **Uninitialized `Memory` reads are not deterministic.** `Memory{Int}(undef, n)`
+  reads back whatever bytes the allocator handed out, which differs between the
+  reference module and the interpreted one — a `value_divergence` made of pure
+  heap noise (observed in the first probe soak). The memory recipes fill their
+  memory; where an *unset* slot is wanted, they use `Memory{Any}`, whose read
+  is a deterministic `UndefRefError`.
+- **Unchecked `MemoryRef`s are wild reads and writes.** `memoryrefnew(ref, i,
+  false)` with an out-of-range `i` produced a silent out-of-bounds read (and
+  `memoryrefset!` a silent out-of-bounds *write*) without crashing — the worst
+  kind of failure. The whole `memoryref*` family is recipe-only, every recipe
+  passes a literal `true` for the bounds-check flag, and no `MemoryRef` value
+  ever enters the generic argument pool.
+- **Program-defined types print with their module name.** A probe can return a
+  type, and a type the program defined renders as `FJ12.S1` on one side and
+  `FJ13.S1` on the other. `__fjnorm__` strips its own module's prefix.
+- **Builtins whose argument validity is checked by *codegen*, not by the
+  runtime, diverge on invalid arguments.** Two instances, both found by the
+  prober and both confined to recipes rather than reported:
+  `Core._apply_iterate(f, g, args...)` with `f !== iterate` — compiled Julia
+  ignores `f` and applies `g` (`Core._apply_iterate(+, +, (1, 2)) == 3`) while
+  `maybe_evaluate_builtin` raises `ErrorException("cannot handle
+  `_apply_iterate` with non iterate as first argument")`; and
+  `Core.compilerbarrier(:unknown_setting, x)` — an ErrorException from codegen
+  compiled, plain `x` from the runtime builtin the interpreter calls. Neither
+  argument shape is producible by lowering, so both are known-and-permanent
+  rather than news. When probing a builtin whose *compiled* form is a codegen
+  special case, expect this class and check what real lowering can actually
+  emit before believing the divergence.
 
 ## Sources of legitimate divergence (excluded or normalized)
 
