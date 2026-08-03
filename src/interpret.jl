@@ -160,6 +160,10 @@ function resolvefc(frame::Frame, @nospecialize(expr))
     elseif isa(expr, SSAValue)
         expr = lookup_var(frame, expr)
         isa(expr, Symbol) && return QuoteNode(expr)
+    elseif isa(expr, GlobalRef) && isconst(expr.mod, expr.name)
+        # native codegen statically evaluates a const GlobalRef target
+        expr = invoke_in_world(frame.world, getglobal, expr.mod, expr.name)
+        isa(expr, Symbol) && return QuoteNode(expr)
     end
     (isa(expr, Symbol) || isa(expr, String) || isa(expr, Ptr) || isa(expr, QuoteNode)) && return expr
     isa(expr, Tuple{Symbol,Symbol}) && return expr

@@ -383,8 +383,9 @@ function build_compiled_foreigncall!(stmt::Expr, code::CodeInfo, sparams::Vector
             cfunc isa Symbol && (cfunc = QuoteNode(cfunc))
         end
         # n.b. Base.memhash is deprecated (continued use would cause serious faults) in the same version as the syntax is deprecated
-        # so this is only needed as a legacy hack
-        if isa(cfunc, Expr) || (cfunc isa GlobalRef && cfunc == GlobalRef(Base, :memhash))
+        # so the Expr case is only needed as a legacy hack. A const GlobalRef target is
+        # statically evaluated, matching native codegen's static_eval of const bindings.
+        if isa(cfunc, Expr) || (cfunc isa GlobalRef && isconst(cfunc.mod, cfunc.name))
             evaluated = try QuoteNode(Core.eval(evalmod, cfunc)) catch nothing end
             if evaluated !== nothing
                 # The expression's value (e.g. a `(name, lib)` tuple) is baked into the compiled

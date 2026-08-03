@@ -1847,3 +1847,23 @@ end
     ll_dead(ir, flag) = flag ? 1 : Base.llvmcall(ir, Cvoid, Tuple{})
     @test (@interpret ll_dead("ret void", true)) === ll_dead("ret void", true) === 1
 end
+
+# a const binding used as a raw :foreigncall target (defined at top level for the
+# testset below); native codegen statically evaluates such targets
+module FCGlobalRefTarget
+const csym = :jl_get_world_counter
+end
+
+@testset "foreigncall with a const GlobalRef target" begin
+    fex = Expr(:foreigncall, GlobalRef(FCGlobalRefTarget, :csym), UInt, Core.svec(), 0, QuoteNode(:ccall))
+    @eval fc_globalref_target() = $fex
+    n = fc_globalref_target()
+    @test n isa UInt && n > 0
+    # the interpreter used to throw ErrorException("unexpected ccall to ...") or
+    # demote the call to a dynamic ccall with a Symbol "pointer"
+    @test (@interpret fc_globalref_target()) isa UInt
+    # the non-optimized path resolves the target the same way
+    resolvefc_probe() = 1
+    fr = JuliaInterpreter.enter_call(resolvefc_probe)
+    @test JuliaInterpreter.resolvefc(fr, GlobalRef(FCGlobalRefTarget, :csym)) === QuoteNode(:jl_get_world_counter)
+end
