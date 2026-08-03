@@ -96,6 +96,42 @@ churning live set, frequent collections), with no JuliaInterpreter dependency.
 If it segfaults in `gc-stock.c`, the bug is proven pure-Julia and this file is
 the upstream reproducer. See its header for status/usage.
 
+## Relation to known upstream issues (searched 2026-08-03)
+
+The prominent Julia 1.12 GC-corruption regression is **#59483** ("GC error on
+Julia 1.12", label `regression 1.12`) with **#60622** split out from it. Root
+cause, per fix **PR #60651** (merged 2026-01-16): codegen emitted a GC root for
+`value_to_pointer` that LLVM's **LICM** could hoist into existence holding an
+**undef** value, which the collector then tried to mark — a garbage pointer in
+the root set. Fixed by conservatively zero-initializing GC pointers; backported
+to the 1.12 release branch (in the 1.12.5 backport batch, #60612).
+
+**This is almost certainly NOT our bug**, for three independent reasons:
+
+1. **The fix is already in our binary.** We crash on **1.12.6**, commit
+   `15346901f00`, built **2026-04-09** — ~3 months after #60651 merged and was
+   backported. So the uninitialized-root fix is present, yet we still crash.
+2. **#59483/#60622 are a *parallel*-collector bug.** Their signature is the
+   assertion `gc_check_ptls_of_parallel_collector_thread` /
+   `JL_GC_PARALLEL_COLLECTOR_THREAD`, which only fires with ≥2 GC threads. This
+   environment runs **1 GC thread** (`Threads.ngcthreads() == 1`, the default on
+   4 vcores), and our crashes are plain `SIGSEGV` in `gc_mark_loop_serial_` /
+   the allocator — **serial** marking, not the parallel assertion.
+3. **No open issue matches.** A search for open 1.12/1.13 GC-corruption issues
+   turned up only unrelated reports (pkgimage/JLL load segfaults, #59219).
+
+So our crash is either a **distinct, still-unreported serial-GC corruption** on
+1.12.6, or a **residual of the same bad-root class #60651 addressed** that its
+fix did not fully cover. Both are worth reporting, and the distinguishing facts
+above (serial GC, post-#60651 build, cumulative/heap-state-dependent) are what
+tell a triager it is not a duplicate of #59483.
+
+Caveats kept honest: the search was not exhaustive; we have no minimal repro yet
+so the mechanism is unconfirmed; and a residual-of-#59483 root cause cannot be
+ruled out without a debug+asserts build (`GC_ASSERT_PARENT_VALIDITY`, as used in
+#59483 to print the corrupt parent/child object types — the single most useful
+next diagnostic, and runnable here without `rr`).
+
 ## For the upstream report
 
 - Attach all three `crashed/*.txt` backtraces (crash 1 first — it is the
