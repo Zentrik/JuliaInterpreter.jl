@@ -209,7 +209,7 @@ elseif o["engine"] == "corpus"
                             maxsplice=o["maxsplice"], maxcmds=o["maxcmds"],
                             dostep=!o["nostep"], seeddisk=!o["fresh"], doshrink=!o["noshrink"],
                             journalsync=!o["nosync"], journaldir=o["journaldir"], shrinkopts...)
-    @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted stats.findings stats.duplicates stats.suppressed
+    @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted certified = stats.certified stats.nondet_discard stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else
     error("unknown engine $(o["engine"]) (expected: supposition | native | step | evalcode | corpus | split)")

@@ -14,6 +14,11 @@ Base.@kwdef mutable struct Stats
     # like findings/duplicates; a case that only produced these is rolled up out
     # of `agreed`, so a rising nondet rate cannot hide inside the agreement rate.
     nondet_discard::Int = 0
+    # Corpus axis (determinism.md §6): fragments that passed self-agreement
+    # certification (compiled reference ran twice and agreed) and so graduated
+    # from the failure-mode oracle to the full differential value oracle. Printed
+    # next to ran/discarded_junk; a collapse means the gate broke, not the corpus.
+    certified::Int = 0
 end
 
 # Known, already-reported divergences go here so reruns surface only news.
@@ -30,7 +35,8 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
     # The split axis's verdicts are mostly about the *module tree*, so its
     # reproducer has to compare that too — `reprorun` only diffs observations.
     reprocall = mode === :cmp   ? "reprorun(SRC; compiled=true)" :
-                mode === :split ? "reprosplit(SRC)" : "reprorun(SRC)"
+                mode === :split ? "reprosplit(SRC)" :
+                mode === :corpusvalue ? "reprocorpus(SRC)" : "reprorun(SRC)"
     # The stepping/eval_code/corpus axes drive their own walk from `walkseed`;
     # without it the reported source alone does not describe the run.
     walkline = walkseed === nothing ? "" : "\n# walk seed: $walkseed"

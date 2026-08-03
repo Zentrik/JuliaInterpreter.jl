@@ -402,6 +402,286 @@ function corpus_run(ex::Expr, prelude::Vector{Expr}; nstmts::Int)
                          site, prelude)
 end
 
+# ---------------------------------------------------------------------------
+# Self-agreement certification (determinism.md §6)
+#
+# The corpus axis demotes *all* real code to the failure-mode oracle because
+# "real code is not deterministic" — but that property is per-fragment and
+# measurable. Seed the sandbox RNG, run the compiled reference twice in two fresh
+# modules, and compare the observation streams: if they agree, the fragment is
+# certified observationally deterministic on this input, and it graduates to the
+# full differential value oracle (`classify` applies unchanged). Fragments that
+# are deterministic-but-not-idempotent (mutate a stdlib global, consume a
+# counter) fail self-agreement and fall back — the safe direction.
+#
+# Real fragments do not call `__obs__` themselves, so there is nothing to compare
+# unless the harness observes it. After a run completes, observe the fragment's
+# top-level assigned bindings (like the differential axis observes live
+# bindings), conservatively: only bindings whose normalized value is
+# content-comparable.
+
+# A fixed sandbox seed makes any `rand()` inside a fragment reproducible across
+# the two reference runs and the interpreted run (task-local RNG).
+const CORPUS_CERT_SEED = 0x00C0FFEE
+
+# Top-level bindings a fragment assigns, in source order. Only simple targets:
+# `x = ...`, `const x = ...`, `x::T = ...`, and tuple-destructuring `a, b = ...`.
+# Function/type/macro definitions are skipped — their values are not
+# content-comparable, and observing them teaches nothing.
+function toplevel_assigned_names(ex::Expr)
+    names = Symbol[]
+    seen = Set{Symbol}()
+    add(n) = (n isa Symbol && !(n in seen)) && (push!(names, n); push!(seen, n); true)
+    function target(@nospecialize(t))
+        if t isa Symbol
+            add(t)
+        elseif t isa Expr && t.head === :tuple
+            for e in t.args
+                target(e)
+            end
+        elseif t isa Expr && (t.head === :(::) || t.head === :ref)
+            target(t.args[1])
+        end
+    end
+    function scan(sts)
+        for st in sts
+            st isa LineNumberNode && continue
+            if st isa Expr && (st.head === :toplevel || st.head === :block)
+                scan(st.args)   # transparent containers keep bindings at top level
+            elseif st isa Expr && st.head === :(=)
+                lhs = st.args[1]
+                # `f(x) = ...` / `f(x) where T = ...` are function defs, not bindings.
+                (lhs isa Expr && (lhs.head === :call || lhs.head === :where)) && continue
+                target(lhs)
+            elseif st isa Expr && st.head === :const && !isempty(st.args)
+                inner = st.args[1]
+                (inner isa Expr && inner.head === :(=)) && target(inner.args[1])
+            end
+        end
+    end
+    scan(ex.args)
+    return names
+end
+
+# Conservative content-comparability: a value whose `__fjnorm__` normalization is
+# a stable, identity-free, cross-run-comparable scalar or an aggregate of such.
+# Everything else (functions, types, modules, structs, pointers, big/lazy
+# collections) is skipped — the safe direction.
+function comparable_value(@nospecialize(x), depth::Int=0)
+    depth > 4 && return false
+    (x isa Bool || x isa Number || x isa AbstractString || x isa Symbol ||
+     x isa Char || x === nothing) && return true
+    try
+        if x isa Tuple
+            length(x) > 64 && return false
+            return all(comparable_value(e, depth + 1) for e in x)
+        elseif x isa AbstractArray
+            length(x) > 64 && return false
+            for i in eachindex(x)
+                isassigned(x, i) || return false
+                comparable_value(x[i], depth + 1) || return false
+            end
+            return true
+        elseif x isa AbstractSet
+            length(x) > 64 && return false
+            return all(comparable_value(e, depth + 1) for e in x)
+        elseif x isa AbstractDict
+            length(x) > 64 && return false
+            return all(comparable_value(k, depth + 1) && comparable_value(v, depth + 1)
+                       for (k, v) in x)
+        elseif x isa Pair
+            return comparable_value(x.first, depth + 1) && comparable_value(x.second, depth + 1)
+        end
+    catch
+        return false
+    end
+    return false
+end
+
+# Push the fragment's comparable top-level bindings into `m.__OBS__`, in the
+# fixed `names` order, so the value oracle has data to compare. The same
+# predicate runs on both engines, so a binding present-and-comparable on one side
+# and missing (or a different, non-comparable type) on the other becomes a
+# stream-length divergence — which is exactly the ExprSplitter/definition-skipped
+# bug class surfacing.
+function observe_bindings!(m::Module, names::Vector{Symbol})
+    obsfn = Base.invokelatest(getglobal, m, :__obs__)
+    for n in names
+        Base.invokelatest(isdefined, m, n) || continue
+        v = try
+            Base.invokelatest(getglobal, m, n)
+        catch
+            continue
+        end
+        comparable_value(v) || continue
+        try
+            Base.invokelatest(obsfn, v)
+        catch
+            # normalization of this binding failed — skip it, don't fail the run
+        end
+    end
+    return nothing
+end
+
+# Compiled reference run of the fragment, seeded and observed, repairing missing
+# imports as they surface (like `eval_ref`). Returns (Outcome, repaired_prelude).
+function eval_ref_observed(ex::Expr, prelude::Vector{Expr}, names::Vector{Symbol};
+                           seed=CORPUS_CERT_SEED, maxrepairs::Int=4)
+    prelude = copy(prelude)
+    for _ in 0:maxrepairs
+        m = corpusmodule(prelude)
+        Random.seed!(seed)
+        err = try
+            for st in ex.args
+                st isa LineNumberNode && continue
+                Core.eval(m, st)
+            end
+            nothing
+        catch e
+            e
+        end
+        if err === nothing
+            observe_bindings!(m, names)
+            return (Outcome(:done, :none, getobs(m), "", ""), prelude)
+        end
+        while err isa LoadError
+            err = err.error
+        end
+        if err isa UndefVarError
+            mod = supplying_module(err.var)
+            if mod !== nothing
+                imp = Expr(:using, Expr(:., Symbol(mod)))
+                if !any(isequal(imp), prelude)
+                    push!(prelude, imp)
+                    continue
+                end
+            end
+        end
+        return (Outcome(:threw, scrubexc(err), getobs(m), shortstr(err), ""), prelude)
+    end
+    return (Outcome(:threw, :UndefVarError, Any[], "", ""), prelude)
+end
+
+# One seeded+observed compiled run against an already-complete prelude (no
+# repair) — the second certification run and the confirm-gate re-runs.
+function eval_frag_observed(ex::Expr, prelude::Vector{Expr}, names::Vector{Symbol};
+                            seed=CORPUS_CERT_SEED)
+    m = corpusmodule(prelude)
+    Random.seed!(seed)
+    try
+        for st in ex.args
+            st isa LineNumberNode && continue
+            Core.eval(m, st)
+        end
+        observe_bindings!(m, names)
+        return Outcome(:done, :none, getobs(m), "", "")
+    catch err
+        while err isa LoadError
+            err = err.error
+        end
+        return Outcome(:threw, scrubexc(err), getobs(m), shortstr(err), "")
+    end
+end
+
+# Seeded+observed interpreted run (the SUT), returning an Outcome the value
+# oracle can compare against the certified reference.
+function interp_frag_observed(ex::Expr, prelude::Vector{Expr}, names::Vector{Symbol};
+                              seed=CORPUS_CERT_SEED, nstmts::Int)
+    m = corpusmodule(prelude)
+    Random.seed!(seed)
+    try
+        for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
+            frame = Base.invokelatest(Frame, mod, frag)
+            budget = nstmts
+            while true
+                ret, budget = evaluate_limited!(RecursiveInterpreter(), frame, budget, true)
+                ret isa Aborted && return Outcome(:aborted, :none, getobs(m), "", "")
+                ret isa Some && break
+                ret === nothing || break
+            end
+        end
+        Base.invokelatest(observe_bindings!, m, names)
+        return Outcome(:done, :none, getobs(m), "", "")
+    catch err
+        err isa AbortException && return Outcome(:aborted, :none, getobs(m), "", "")
+        bt = sprint(Base.show_backtrace, catch_backtrace(); context = :limit => true)
+        return Outcome(:threw, scrubexc(err), getobs(m), shortstr(err), first(bt, 3000))
+    end
+end
+
+# Certify a fragment: run the compiled reference twice, seeded, and compare the
+# observation streams with the oracle's own `outcomeeq`. Returns
+# (:junk | :certified | :uncertified, ref_outcome, repaired_prelude).
+#   :junk        — the fragment threw on the reference even after import repair;
+#                  it does not stand alone (today's discard).
+#   :certified   — both reference runs completed and agreed → value oracle.
+#   :uncertified — the reference ran but the two runs disagreed → fall back to
+#                  the failure-mode oracle.
+function corpus_certify(ex::Expr, prelude::Vector{Expr}, names::Vector{Symbol};
+                        seed=CORPUS_CERT_SEED)
+    ref1, prelude = eval_ref_observed(ex, prelude, names; seed)
+    ref1.status === :threw && return (:junk, ref1, prelude)
+    ref2 = eval_frag_observed(ex, prelude, names; seed)
+    (ref2.status === :done && outcomeeq(ref1, ref2)) || return (:uncertified, ref1, prelude)
+    return (:certified, ref1, prelude)
+end
+
+# Confirm-on-divergence for a certified value finding. The reference is already
+# double-agreed (that is what certification is), so re-confirm it once more and
+# re-run the interpreted side; a side that disagrees with itself → nondet.
+function corpus_value_confirm(ex::Expr, prelude::Vector{Expr}, names::Vector{Symbol},
+                              ref::Outcome, int::Outcome; seed=CORPUS_CERT_SEED, nstmts::Int)
+    outcomeeq(ref, eval_frag_observed(ex, prelude, names; seed)) || return :nondet_ref
+    outcomeeq(int, interp_frag_observed(ex, prelude, names; seed, nstmts)) || return :nondet_interp
+    return :stable
+end
+
+function corpus_value_confirmed(v::Verdict, ex::Expr, prelude::Vector{Expr},
+                                names::Vector{Symbol}, ref::Outcome, int::Outcome;
+                                seed=CORPUS_CERT_SEED, nstmts::Int)
+    isfinding(v) || return v
+    st = corpus_value_confirm(ex, prelude, names, ref, int; seed, nstmts)
+    st === :stable && return v
+    return nondetverdict(st === :nondet_ref ? :ref : :interp)
+end
+
+# The full certified-value pipeline for one case: certify, and if certified run
+# the interpreted side, classify, and gate. Returns (tag, verdict, prelude):
+#   tag :junk       → discard (v is agree())
+#   tag :certified  → v is the value verdict (agree or a confirmed finding)
+#   tag :uncertified→ caller should fall back to the failure-mode oracle
+function corpus_value_run(ex::Expr, prelude::Vector{Expr}; nstmts::Int, seed=CORPUS_CERT_SEED)
+    names = toplevel_assigned_names(ex)
+    cst, ref, pl = corpus_certify(ex, prelude, names; seed)
+    cst === :junk && return (:junk, agree(), pl)
+    cst === :uncertified && return (:uncertified, agree(), pl)
+    int = interp_frag_observed(ex, pl, names; seed, nstmts)
+    v = classify(ref, int)
+    v = corpus_value_confirmed(v, ex, pl, names, ref, int; seed, nstmts)
+    return (:certified, v, pl)
+end
+
+"""
+    corpus_value_keep(fp; nstmts, seed) -> keep
+
+Shrink predicate for a certified value finding: re-split the candidate,
+re-certify (a shrink that breaks determinism or removes the binding stops
+certifying → edit rejected), re-run the value oracle, and require the same
+fingerprint plus stability.
+"""
+function corpus_value_keep(fp::String; nstmts::Int, seed=CORPUS_CERT_SEED)
+    return function (src::String)
+        sp = corpus_split(src)
+        sp === nothing && return false
+        case, prelude = sp
+        tag, v, _ = quiet_stdout() do
+            corpus_value_run(case, prelude; nstmts, seed)
+        end
+        tag === :certified || return false
+        return isfinding(v) && fingerprint(v) == fp
+    end
+end
+
 # Step the same case. Real code is nondeterministic, so its *values* are not
 # comparable — but "the debugger must not fall over or freeze" holds regardless,
 # and this is the only way those code paths ever see real Julia.
@@ -534,44 +814,80 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
             stats.cases += 1
             # Lowering is part of what we are testing, so no parse gate here:
             # a fragment that does not lower is skipped by ExprSplitter itself.
-            o = quiet_stdout() do
+            #
+            # First try self-agreement certification (determinism.md §6): if the
+            # compiled reference agrees with itself on two seeded runs, the
+            # fragment is observationally deterministic on this input and gets the
+            # full differential VALUE oracle. Otherwise fall back to today's
+            # failure-mode-only oracle (plus stepping). `isvalue` picks the shrink
+            # predicate and repro mode accordingly.
+            isjunk = false
+            iscertified = false   # passed self-agreement (graduated to value oracle)
+            isvalue = false       # certified AND value-compared to completion
+            v = quiet_stdout() do
+                tag, vv, _pl = corpus_value_run(case, prelude; nstmts)
+                if tag === :junk
+                    isjunk = true
+                    return agree()
+                elseif tag === :certified
+                    iscertified = true
+                    # An interp-side budget abort on a certified fragment is
+                    # inconclusive, never a finding — fold it into the junk/discard
+                    # path exactly as the failure-mode oracle folds budget aborts.
+                    if vv.class === :aborted
+                        isjunk = true
+                        return agree()
+                    end
+                    isvalue = true
+                    return vv
+                end
+                # :uncertified — the reference did not agree with itself, so real
+                # code's nondeterminism is in play: failure-mode + stepping only.
                 r = corpus_run(case, prelude; nstmts)
-                # Only step fragments compiled Julia already ran cleanly:
-                # stepping one that cannot run at all says nothing about the
-                # debugger.
-                (r.status === :ok && dostep) ? corpus_step(case, r.prelude, Xoshiro(walkseed); maxcmds) : r
+                r2 = (r.status === :ok && dostep) ?
+                     corpus_step(case, r.prelude, Xoshiro(walkseed); maxcmds) : r
+                r2.status === :junk && (isjunk = true)
+                return corpusverdict(r2)
             end
-            v = corpusverdict(o)
+            # Certification rate = fragments that passed self-agreement, whether or
+            # not the interpreted comparison later completed (determinism.md §6: a
+            # collapse means the gate broke, not the corpus).
+            iscertified && (stats.certified += 1)
             # Track discards separately: if nearly every case is junk, the
             # corpus filter or the splice arity is wrong and the axis is
             # testing almost nothing, which a 100%-agreed line would hide.
-            o.status === :junk && (stats.aborted += 1)
-            if v.class === :agree
+            isjunk && (stats.aborted += 1)
+            if v.class === :nondet_discard
+                stats.nondet_discard += 1
+                @debug "corpus nondet_discard" seed detail = v.detail
+            elseif v.class === :agree
                 stats.agreed += 1
             elseif suppressed(v)
                 stats.suppressed += 1
             else
-                fp = tagfp(:corpus, fingerprint(v))
+                fp = tagfp(isvalue ? :corpusvalue : :corpus, fingerprint(v))
                 if fp in seen
                     stats.duplicates += 1
                 else
                     push!(seen, fp)
                     stats.findings += 1
-                    @info "CORPUS FINDING $(v.class)" seed fp walkseed nfragments = k detail = first(v.detail, 400)
+                    @info "CORPUS FINDING $(v.class)" seed fp walkseed certified = isvalue nfragments = k detail = first(v.detail, 400)
                     shrunk = src
                     if doshrink
                         budget = ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)
-                        keep = corpus_keep(fingerprint(v); nstmts, maxcmds, dostep, walkseed)
-                        # no quiet_stdout here: corpus_keep already quiets each
-                        # candidate, and nesting the redirect buys nothing
+                        keep = isvalue ? corpus_value_keep(fingerprint(v); nstmts) :
+                                         corpus_keep(fingerprint(v); nstmts, maxcmds, dostep, walkseed)
+                        # no quiet_stdout here: the keep predicate already quiets
+                        # each candidate, and nesting the redirect buys nothing
                         shrunk = ddmin_source(src, keep; budget)
                         @info "  shrunk" runs = budget.runs lines_orig = countlines(IOBuffer(src)) lines_shrunk = countlines(IOBuffer(shrunk))
                     end
-                    writefinding(outdir, fp, v, seed, src, shrunk; mode=:corpus, walkseed)
+                    writefinding(outdir, fp, v, seed, src, shrunk;
+                                 mode=(isvalue ? :corpusvalue : :corpus), walkseed)
                 end
             end
             if progress > 0 && i % progress == 0
-                @info "corpus progress" i rate_per_s = round(stats.cases / (time() - t0); digits=2) ran = stats.agreed - stats.aborted discarded = stats.aborted stats.findings stats.duplicates
+                @info "corpus progress" i rate_per_s = round(stats.cases / (time() - t0); digits=2) ran = stats.agreed - stats.aborted discarded_junk = stats.aborted certified = stats.certified stats.findings stats.duplicates
             end
         end
     finally

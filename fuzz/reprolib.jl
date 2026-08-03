@@ -4,9 +4,17 @@
 # prints both observation streams and outcomes.
 
 using JuliaInterpreter
+using Random
 
+# Mirrors SETUP_SRC in fuzz/src/render.jl (kept in sync by hand so a repro stays
+# standalone). Includes the determinism-unlock prelude: `using Random` (for a
+# generated program's `const __RNG__ = Xoshiro(...)`), the `__vtime__` virtual
+# clock, and Dict/Set normalization.
 const REPRO_SETUP = raw"""
+using Random
 const __OBS__ = Any[]
+const __VTIME__ = Ref(0)
+__vtime__() = (__VTIME__[] += 1)
 function __fjnorm__(x)
     if x isa Union{Number, String, Symbol, Char, Nothing}
         return x
@@ -14,6 +22,10 @@ function __fjnorm__(x)
         return map(__fjnorm__, x)
     elseif x isa AbstractArray
         return Any[__fjnorm__(el) for el in x]
+    elseif x isa AbstractDict
+        return (:__dict, sort!(Any[(__fjnorm__(k), __fjnorm__(v)) for (k, v) in x]; by = p -> string(p[1])))
+    elseif x isa AbstractSet
+        return (:__set, sort!(Any[__fjnorm__(el) for el in x]; by = string))
     elseif x isa Function
         return :__fn__
     elseif x isa Type
@@ -80,6 +92,150 @@ function reprorun(src::AbstractString; compiled::Bool=false)
     return !agree
 end
 
+# --- corpus certified-value repro (`--engine corpus`, certified findings) ---
+#
+# A corpus value finding is real code that passed self-agreement certification
+# (determinism.md §6): the value oracle applies because the fragment is
+# observationally deterministic on a fixed sandbox seed. Reproduction therefore
+# has to (1) seed the RNG, (2) run each side, and (3) observe the fragment's
+# comparable top-level bindings — real code does not call `__obs__` itself.
+# Standalone copies of the harness's assigned-names / comparability logic
+# (fuzz/src/corpus.jl), so a repro needs nothing but JuliaInterpreter + Random.
+
+const REPRO_CORPUS_SEED = 0x00C0FFEE
+
+function repro_assigned_names(ex::Expr)
+    names = Symbol[]; seen = Set{Symbol}()
+    add(n) = (n isa Symbol && !(n in seen)) && (push!(names, n); push!(seen, n); true)
+    function target(@nospecialize(t))
+        if t isa Symbol
+            add(t)
+        elseif t isa Expr && t.head === :tuple
+            foreach(target, t.args)
+        elseif t isa Expr && (t.head === :(::) || t.head === :ref)
+            target(t.args[1])
+        end
+    end
+    function scan(sts)
+        for st in sts
+            st isa LineNumberNode && continue
+            if st isa Expr && (st.head === :toplevel || st.head === :block)
+                scan(st.args)
+            elseif st isa Expr && st.head === :(=)
+                lhs = st.args[1]
+                (lhs isa Expr && (lhs.head === :call || lhs.head === :where)) && continue
+                target(lhs)
+            elseif st isa Expr && st.head === :const && !isempty(st.args)
+                inner = st.args[1]
+                (inner isa Expr && inner.head === :(=)) && target(inner.args[1])
+            end
+        end
+    end
+    scan(ex.args)
+    return names
+end
+
+function repro_comparable(@nospecialize(x), depth::Int=0)
+    depth > 4 && return false
+    (x isa Bool || x isa Number || x isa AbstractString || x isa Symbol ||
+     x isa Char || x === nothing) && return true
+    try
+        if x isa Tuple
+            return length(x) <= 64 && all(repro_comparable(e, depth + 1) for e in x)
+        elseif x isa AbstractArray
+            length(x) > 64 && return false
+            for i in eachindex(x)
+                (isassigned(x, i) && repro_comparable(x[i], depth + 1)) || return false
+            end
+            return true
+        elseif x isa AbstractSet
+            return length(x) <= 64 && all(repro_comparable(e, depth + 1) for e in x)
+        elseif x isa AbstractDict
+            return length(x) <= 64 &&
+                   all(repro_comparable(k, depth + 1) && repro_comparable(v, depth + 1) for (k, v) in x)
+        elseif x isa Pair
+            return repro_comparable(x.first, depth + 1) && repro_comparable(x.second, depth + 1)
+        end
+    catch
+        return false
+    end
+    return false
+end
+
+function repro_observe!(m::Module, names::Vector{Symbol})
+    obsfn = Base.invokelatest(getglobal, m, :__obs__)
+    for n in names
+        Base.invokelatest(isdefined, m, n) || continue
+        v = try
+            Base.invokelatest(getglobal, m, n)
+        catch
+            continue
+        end
+        repro_comparable(v) || continue
+        try
+            Base.invokelatest(obsfn, v)
+        catch
+        end
+    end
+end
+
+function reprocorpus(src::AbstractString; seed=REPRO_CORPUS_SEED)
+    top = Meta.parseall(String(src))
+    stmts = (top isa Expr && top.head === :toplevel) ? top.args : Any[top]
+    isimport(s) = s isa Expr && (s.head === :using || s.head === :import)
+    prelude = Any[s for s in stmts if isimport(s)]
+    rest = Any[s for s in stmts if !(s isa LineNumberNode) && !isimport(s)]
+    ex = Expr(:toplevel, rest...)
+    names = repro_assigned_names(ex)
+
+    function loadprelude(m)
+        for st in prelude
+            try
+                Core.eval(m, st)
+            catch
+            end
+        end
+    end
+
+    mref = repro_freshmodule(:CorpusRef); loadprelude(mref)
+    Random.seed!(seed)
+    refout = try
+        for st in ex.args
+            st isa LineNumberNode || Core.eval(mref, st)
+        end
+        (:done, nothing)
+    catch err
+        (:threw, err)
+    end
+    refout[1] === :done && repro_observe!(mref, names)
+    refobs = copy(Base.invokelatest(getglobal, mref, :__OBS__))
+
+    mint = repro_freshmodule(:CorpusInterp); loadprelude(mint)
+    Random.seed!(seed)
+    intout = try
+        for (mod, frag) in Base.invokelatest(ExprSplitter, mint, ex)
+            Base.invokelatest(JuliaInterpreter.finish_and_return!,
+                              Base.invokelatest(Frame, mod, frag), true)
+        end
+        (:done, nothing)
+    catch err
+        (:threw, err)
+    end
+    intout[1] === :done && Base.invokelatest(repro_observe!, mint, names)
+    intobs = copy(Base.invokelatest(getglobal, mint, :__OBS__))
+
+    println("=== compiled (reference), seeded + certified ===")
+    println("outcome: ", refout[1], refout[2] === nothing ? "" : " ($(sprint(showerror, refout[2])))")
+    println("observations: ", refobs)
+    println("=== interpreted ===")
+    println("outcome: ", intout[1], intout[2] === nothing ? "" : " ($(sprint(showerror, intout[2])))")
+    println("observations: ", intobs)
+    agree = isequal(refobs, intobs) && refout[1] === intout[1] &&
+            (refout[1] !== :threw || typeof(refout[2]) === typeof(intout[2]))
+    println(agree ? "NO DIVERGENCE (bug may be fixed, or is budget-dependent)" : "DIVERGENCE REPRODUCED")
+    return !agree
+end
+
 # --- ExprSplitter-axis repro (`--engine split` findings) -------------------
 #
 # The split axis's main verdict class is a difference in the *module tree*, not
@@ -88,7 +244,8 @@ end
 # fuzz/src/splitfuzz.jl (this file stays independent of the generator on
 # purpose: a repro must run with nothing but JuliaInterpreter).
 
-const REPRO_SKIP = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fjnorm__])
+const REPRO_SKIP = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fjnorm__,
+                                :__VTIME__, :__vtime__, :__RNG__])
 
 function repro_scrubname(@nospecialize(x))
     n = try

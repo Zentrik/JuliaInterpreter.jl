@@ -6,10 +6,13 @@ using Dates   # for the corpus import-repair assertions
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                nstatements, Cfg, run_both, run_all, shrink, genprogram, render,
+               genprogram_policy, modeinterp,
                shrink_ir, ddmin_source, ShrinkBudget, exhausted, toplevel_statements,
                step_program, step_keep, evalcode_probe, evalcode_keep,
                corpus_split, corpus_run, corpusverdict, quiet_stdout, writefinding,
-               Ex, St, Program, lit, IntT, SymT,
+               toplevel_assigned_names, comparable_value, corpus_certify, corpus_value_run,
+               corpus_value_keep,
+               Ex, St, Program, lit, IntT, SymT, sections,
                outcomeeq, confirm, confirmed, confirmsrc, confirmreport, nondetverdict
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
 # The standalone reproducer library every findings/*/repro.jl includes. Loaded
@@ -375,6 +378,139 @@ end
         end
     end
 
+    @testset "determinism unlocks: __RNG__/Dict/Set/__vtime__ agree" begin
+        # determinism.md §3/§4: explicit-RNG draws, content-keyed containers, and
+        # the virtual clock are deterministic across the two engines. Each program
+        # here must run, agree, AND observe something (an empty stream would agree
+        # vacuously). A divergence is a real finding — triage before shipping.
+        det = [
+        # (a) __RNG__: both sides seed from the same literal and execute the same
+        # Xoshiro transitions, so streams agree bit-for-bit — including a
+        # rand-derived loop bound, a rand-derived guarded index, and a
+        # rand-derived branch condition (data-dependent control flow).
+        "seeded RNG: streams agree bit-for-bit" => """
+        const __RNG__ = Xoshiro(20260803)
+        let
+            acc = 0
+            for i in 1:rand(__RNG__, 0:4)
+                acc = acc + rand(__RNG__, 1:10)
+            end
+            __obs__(acc)
+            v = [10, 20, 30]
+            __obs__(try v[rand(__RNG__, 1:5)] catch __e; (:__thrown, nameof(typeof(__e))) end)
+            __obs__(rand(__RNG__, Bool))
+            __obs__(rand(__RNG__) isa Float64)
+            __obs__(randn(__RNG__) isa Float64)
+            if rand(__RNG__, Bool)
+                __obs__(:branchA)
+            else
+                __obs__(:branchB)
+            end
+        end
+        """,
+        # (b) content-keyed Dict/Set: construction, get/get!/haskey/in/length,
+        # setindex!/delete!/push!, keys/values/iteration — all value-compared.
+        "content-keyed Dict/Set value-compare" => """
+        let
+            d = Dict{Int64, Float64}(1 => 1.5, 2 => 2.5)
+            d[3] = 3.5
+            delete!(d, 1)
+            __obs__(d)
+            __obs__(haskey(d, 2))
+            __obs__(get(d, 9, -1.0))
+            __obs__(get!(d, 4, 4.5))
+            __obs__(length(d))
+            __obs__(keys(d))
+            __obs__(sort(collect(values(d))))
+            s = Set{Symbol}([:a, :b])
+            push!(s, :c)
+            __obs__(s)
+            __obs__(:a in s)
+            __obs__(length(s))
+            dc = Dict{Char, Int64}('x' => 1, 'y' => 2)
+            __obs__(dc)
+            dt = Dict{Tuple{Int64, Symbol}, Bool}((1, :a) => true)
+            __obs__(dt)
+        end
+        """,
+        # (c) __vtime__: a deadline-shaped loop, fuel still governing termination.
+        "virtual clock deadline loop" => """
+        let
+            fuel = 20
+            count = 0
+            while (__vtime__() < 5) && (fuel > 0)
+                fuel -= 1
+                count = count + 1
+            end
+            __obs__(count)
+            __obs__(__vtime__() >= 5)
+        end
+        """,
+        ]
+        for (label, src) in det
+            r = run_both(src; nstmts=2_000_000)
+            @test r !== nothing
+            r === nothing && continue
+            ref, int = r
+            v = classify(ref, int)
+            v.class === :agree ||
+                @warn "determinism-unlock divergence — triage me" label v.class v.detail
+            @test v.class === :agree
+            # not vacuous: the program observed something, and the two engines'
+            # streams are elementwise identical (determinism holds).
+            @test !isempty(ref.obs)
+            @test isequal(ref.obs, int.obs)
+        end
+
+        # cmp mode too (NonRecursiveInterpreter): calls execute natively, a
+        # different path, but the RNG object and __vtime__ counter still advance
+        # identically because the same source runs.
+        for (_, src) in det
+            r = run_all(src; nstmts=2_000_000, modes=(:cmp,))
+            @test r !== nothing
+            r === nothing && continue
+            ref, intruns = r
+            @test classify(ref, intruns[1][2]).class === :agree
+        end
+    end
+
+    @testset "determinism-policy generation manufactures no divergence" begin
+        # The whole thesis of determinism.md: the new grammar must not create
+        # false positives. Generate determinism-policy programs (rand/Dict/Set/
+        # vtime-heavy), run both interpreter modes, and require every candidate to
+        # agree or be a tracked discard (aborted/nondet) — never a finding. Any
+        # finding here is a real bug to triage, not something to relax.
+        ndiverge = nnondet = 0
+        rngstreams = 0
+        for seed in 1:24
+            src = render(genprogram_policy(Xoshiro(seed), Cfg(), :determinism))
+            r = run_all(src; nstmts=500_000, modes=(:rec, :cmp))
+            r === nothing && continue
+            ref, intruns = r
+            for (mode, int) in intruns
+                v = confirmed(classify(ref, int), src, ref, int;
+                              nstmts=500_000, interp=modeinterp(mode))
+                if v.class === :nondet_discard
+                    nnondet += 1
+                elseif isfinding(v)
+                    ndiverge += 1
+                    @warn "determinism-policy divergence (a real finding — triage it!)" seed mode v.class v.detail
+                end
+            end
+            # (a) directly: a generated program that actually uses __RNG__ produces
+            # identical observation streams ref-vs-interp.
+            if occursin("__RNG__", src)
+                rr = run_both(src; nstmts=500_000)
+                if rr !== nothing && rr[2].status === :done && rr[1].status === :done
+                    isequal(rr[1].obs, rr[2].obs) && (rngstreams += 1)
+                end
+            end
+        end
+        @test ndiverge == 0
+        @test nnondet == 0        # the gate should not even need to fire
+        @test rngstreams > 0      # some __RNG__ programs ran clean and matched
+    end
+
     @testset "compiled-mode (NonRecursiveInterpreter) smoke" begin
         ndiverge = 0
         for seed in 1:40
@@ -610,6 +746,92 @@ end
         # and the repaired prelude is handed on, so the stepping stage runs in
         # the same environment the reference succeeded in
         @test any(isequal(:(using Dates)), o.prelude)
+    end
+
+    @testset "corpus self-agreement certification (determinism.md §6)" begin
+        cert(code) = begin
+            case = Expr(:toplevel, Meta.parseall(code).args...)
+            names = toplevel_assigned_names(case)
+            quiet_stdout() do
+                corpus_certify(case, Expr[], names)
+            end
+        end
+        valrun(code) = begin
+            case = Expr(:toplevel, Meta.parseall(code).args...)
+            quiet_stdout() do
+                corpus_value_run(case, Expr[]; nstmts=200_000)
+            end
+        end
+
+        # Binding extraction: simple targets and const, but never function/type
+        # definitions (their values aren't content-comparable).
+        @test toplevel_assigned_names(Expr(:toplevel, :(zx = 1), :(const zy = 2))) == [:zx, :zy]
+        @test toplevel_assigned_names(Expr(:toplevel, Meta.parse("za, zb = 1, 2"))) == [:za, :zb]
+        @test isempty(toplevel_assigned_names(Expr(:toplevel, :(zf(x) = x + 1))))
+        @test isempty(toplevel_assigned_names(Expr(:toplevel, :(function zg(x); x; end))))
+
+        # Comparability: scalars and aggregates of them yes; identity-bearing no.
+        @test comparable_value(3) && comparable_value("s") && comparable_value(:a)
+        @test comparable_value('c') && comparable_value(true) && comparable_value(nothing)
+        @test comparable_value((1, "a", :b)) && comparable_value([1, 2, 3])
+        @test comparable_value(Dict(1 => 2.0)) && comparable_value(Set([:x]))
+        @test !comparable_value(sin)          # a function
+        @test !comparable_value(Int)          # a type
+        @test !comparable_value(Base)         # a module
+
+        # A deterministic fragment certifies, and its reference run actually
+        # observed the binding (non-vacuous) — so the value oracle has data.
+        tag, ref, _ = cert("zd = sum([i^2 for i in 1:5]); ze = zd * 2")
+        @test tag === :certified
+        @test !isempty(ref.obs)               # bindings were auto-observed
+
+        # A seeded rand fragment certifies too — and the interpreted side agrees,
+        # so interpreted rand+sum becomes value-compared against compiled (the §6
+        # headline win). No ExprSplitter/Core.eval RNG desync.
+        vt, vv, _ = valrun("zr = sum(rand(3)); zc = rand(1:100)")
+        @test vt === :certified
+        @test vv.class === :agree
+
+        # A deterministic Dict fragment certifies and value-compares.
+        vt2, vv2, _ = valrun("zdd = Dict(:a => 1, :b => 2); zk = sort(collect(keys(zdd)))")
+        @test vt2 === :certified && vv2.class === :agree
+
+        # Intentionally nondeterministic fragments do NOT certify and fall back to
+        # the failure-mode oracle — the safe direction. `objectid` of a fresh
+        # mutable is address-derived (differs run to run); `time_ns()` is a clock.
+        @test cert("zo = objectid([1, 2, 3])")[1] === :uncertified
+        @test cert("zt = time_ns()")[1] === :uncertified
+        # Unseeded but process-RNG-consuming in a way seeding fixes: a bare
+        # `rand()` IS reproducible under the sandbox seed, so it certifies — that
+        # is the point of seeding. But mutating a process counter is not
+        # idempotent and must fall back.
+        @test cert("zq = rand()")[1] === :certified
+
+        # The value verdict path is gated by confirmation and dedups/reports like
+        # the differential axis: a certified agreeing fragment is not a finding.
+        @test !isfinding(valrun("zs = join(string.(1:4), \"-\")")[2])
+    end
+
+    @testset "determinism-unlock generation floors" begin
+        # metrics.jl reports exact densities; this is the floor that catches a
+        # grammar change silently starving one of the new features (which would
+        # make the axis test nothing while still passing every agreement check).
+        hasrng(src)   = occursin("__RNG__", src)
+        hasdict(src)  = occursin("Dict{", src) || occursin("Set{", src)
+        hasvtime(src) = occursin("__vtime__", src)
+        # Under the :determinism policy the new features must be common.
+        detn = 100
+        detsrcs = [render(genprogram_policy(Xoshiro(s), Cfg(), :determinism)) for s in 1:detn]
+        @test count(hasrng, detsrcs)   / detn >= 0.40
+        @test count(hasdict, detsrcs)  / detn >= 0.25
+        @test count(hasvtime, detsrcs) / detn >= 0.15
+        # Even blended (every policy, swarm on) they must not vanish — swarm keeps
+        # each feature on with p=0.7, so a healthy fraction of programs have them.
+        bn = 150
+        bsrcs = [render(genprogram(Xoshiro(s))) for s in 1:bn]
+        @test count(hasrng, bsrcs)   / bn >= 0.25
+        @test count(hasdict, bsrcs)  / bn >= 0.08
+        @test count(hasvtime, bsrcs) / bn >= 0.08
     end
 
     @testset "eval_code axis: probe selection and verdicts" begin
