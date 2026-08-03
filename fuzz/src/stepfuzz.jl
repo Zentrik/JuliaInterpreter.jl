@@ -44,7 +44,8 @@
 # verdict *class* (and fingerprint salt), never for trace equality.
 
 using JuliaInterpreter: debug_command, root, leaf, BreakpointRef, Frame,
-                        break_on, break_off, breakpoint, remove, is_toplevel_frame
+                        break_on, break_off, breakpoint, remove, is_toplevel_frame,
+                        breakpoints, enable, disable, toggle
 
 # The command vocabulary. Includes the "advanced" commands, which are exactly
 # the thinly-tested ones.
@@ -62,9 +63,11 @@ struct StepOutcome
     cmds::Vector{Symbol}
     site::Symbol        # innermost JuliaInterpreter function in the backtrace (:none if absent)
     excname::Symbol     # exception type (:none unless status === :threw)
+    nbp::Int            # breakpoint actions performed during the walk
 end
-StepOutcome(status, obs, detail, n, cmds) = StepOutcome(status, obs, detail, n, cmds, :none, :none)
-StepOutcome(status, obs, detail, n, cmds, site) = StepOutcome(status, obs, detail, n, cmds, site, :none)
+StepOutcome(status, obs, detail, n, cmds) = StepOutcome(status, obs, detail, n, cmds, :none, :none, 0)
+StepOutcome(status, obs, detail, n, cmds, site) = StepOutcome(status, obs, detail, n, cmds, site, :none, 0)
+StepOutcome(status, obs, detail, n, cmds, site, excname) = StepOutcome(status, obs, detail, n, cmds, site, excname, 0)
 
 # Did this exception come from JuliaInterpreter itself, rather than from the
 # interpreted program? Program-thrown exceptions are expected (the grammar
@@ -115,17 +118,170 @@ end
 # a command that could not step.
 const STUCK_LIMIT = 200
 
+# --- Real breakpoints, driven from the walk ---------------------------------
+#
+# Until now the axis only ever armed `break_on(:error)`; the entire breakpoint
+# API — `breakpoint(f)`, method/conditional/line breakpoints, enable/disable/
+# toggle/remove — never ran, and the coverage report showed it: 30 of 34
+# definitions in src/breakpoints.jl never executed, 13% of its lines hit.
+# That file has a real fix history (3 fix commits), which is exactly the
+# "untested surface with prior bugs" this axis exists for.
+#
+# So the walk now *manages breakpoints as it steps*, the way a Debugger.jl user
+# does: with a small per-command probability (and between fragments, when new
+# definitions have just appeared) it performs one random breakpoint action.
+# Every draw comes from the walk RNG, so `(src, walkseed)` still reproduces a
+# run exactly, and the shrink predicate replays breakpoint decisions along with
+# the commands.
+#
+# Breakpoints must not change what the program computes — pausing is
+# observable only as extra (frame, BreakpointRef) returns from debug_command,
+# which the walk already handles — so invariant 3 (stepping reaches the same
+# observations as running) is unchanged. Conditions are drawn only from shapes
+# that cannot throw and have no side effects: literal comparisons, and
+# `<argname> isa Any` where the name comes from the chosen *method's* own
+# argument list (a condition is only ever attached to the specific Method whose
+# names it uses — attached to the whole function it would hit sibling methods
+# that lack the slot and throw an UndefVarError from inside `shouldbreak`,
+# which would be our bug, not the interpreter's).
+mutable struct BpDriver
+    mod::Module          # the module the program defines things in
+    prob::Float64        # per-command probability of one breakpoint action
+    count::Int           # actions performed (drives the per-walk cap)
+    nset::Int            # breakpoints actually SET on a program callable — the
+                         # teeth metric; the world-age bug this axis shipped
+                         # with had count > 0 and nset == 0
+end
+
+# Setting a breakpoint scans JuliaInterpreter's global framecode caches
+# (`add_to_existing_framecodes` walks `framedict`/`genframedict`), which grow
+# over a long campaign as rec-mode walks step into Base. Unbounded actions per
+# walk would make that scan the axis's dominant cost late in a campaign, so
+# each candidate gets a fixed allowance.
+const MAX_BP_ACTIONS = 40
+
+# Program-defined callables worth breakpointing: named functions and struct
+# types (constructor breakpoints are their own historical bug class, #525).
+# Harness prelude (`__obs__` & friends) and closure types (#-names) excluded —
+# the former pause on every observation and drown the walk, the latter are not
+# reachable by name from a debugger prompt anyway.
+function bptargets(m::Module)
+    out = Base.Callable[]
+    for n in names(m; all=true)
+        s = String(n)
+        (startswith(s, '#') || startswith(s, "__")) && continue
+        isdefined(m, n) || continue
+        v = try
+            getfield(m, n)
+        catch
+            continue
+        end
+        v isa Base.Callable && push!(out, v)
+    end
+    return out
+end
+
+# World age: the program's definitions were `Core.eval`'d after the harness
+# functions were compiled, and 1.12's strict binding rules make `names`/
+# `isdefined`/`getfield` (and method-table queries) world-sensitive — called
+# directly from harness code, the harvest is silently EMPTY. Both the
+# breakpoint driver and the call axis must reach these through invokelatest.
+latesttargets(m::Module) = Base.invokelatest(bptargets, m)::Vector{Base.Callable}
+latestmethods(@nospecialize(f)) = Base.invokelatest(collect, Base.invokelatest(methods, f))
+
+# Safe condition menu for a specific method: literal comparisons (taken/not
+# taken), or an `isa Any` on one of the method's own argument names — true even
+# for an Unassigned slot, so it exercises the slot-lookup machinery in
+# `prepare_slotfunction` without ever throwing.
+function bpcondition(rng::AbstractRNG, m::Module, meth::Method)
+    r = rand(rng)
+    r < 0.3 && return (m, :(1 == 1))
+    r < 0.5 && return (m, :(1 == 2))
+    argnames = [a for a in Base.method_argnames(meth)[2:end] if Base.isidentifier(a)]
+    isempty(argnames) && return (m, :(1 == 1))
+    return (m, :($(rand(rng, argnames)) isa Any))
+end
+
+# One random breakpoint action. Never wrapped in try/catch: an exception from
+# the breakpoint API itself surfaces through step_program's classifier as a
+# step-only throw salted with the breakpoints.jl function that raised it —
+# which is precisely the kind of finding this exists to produce.
+function bpaction!(rng::AbstractRNG, bpd::BpDriver)
+    bpd.count >= MAX_BP_ACTIONS && return
+    bpd.count += 1
+    r = rand(rng)
+    if r < 0.55
+        # Set a breakpoint on a program-defined callable.
+        targets = latesttargets(bpd.mod)
+        if isempty(targets)
+            rand(rng, Bool) ? break_on(:error) : break_off(:error)
+            return
+        end
+        f = rand(rng, targets)
+        ms = latestmethods(f)
+        bpd.nset += 1
+        u = rand(rng)
+        if u < 0.35 || isempty(ms)
+            breakpoint(f)                                   # entry, all methods
+        elseif u < 0.6
+            breakpoint(rand(rng, ms))                       # one specific method
+        elseif u < 0.85
+            meth = rand(rng, ms)
+            breakpoint(meth, bpcondition(rng, bpd.mod, meth))  # conditional
+        else
+            meth = rand(rng, ms)                            # line (possibly past the
+            breakpoint(meth, Int(meth.line) + rand(rng, 0:10))  # end: a legal no-op)
+        end
+    elseif r < 0.8
+        # Flip the state of an existing breakpoint.
+        bps = breakpoints()
+        isempty(bps) && return
+        bp = rand(rng, bps)
+        w = rand(rng)
+        w < 0.35 ? disable(bp) : w < 0.7 ? enable(bp) : toggle(bp)
+    elseif r < 0.92
+        # Remove one breakpoint; rarely, all of them.
+        bps = breakpoints()
+        if rand(rng) < 0.15 || isempty(bps)
+            remove()
+        else
+            remove(rand(rng, bps))
+        end
+    else
+        # The global throw/error switches; :throw was previously never armed.
+        s = rand(rng, (:error, :throw))
+        rand(rng, Bool) ? break_on(s) : break_off(s)
+    end
+    return
+end
+
 # Drive one toplevel fragment to completion with a random command walk.
 # Returns (status, ncommands, stuckcmd) where status is :done, :budget (ran out
 # of commands, which is not by itself evidence of anything) or :stuck.
-function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds::Int)
+function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds::Int,
+                    bpd::Union{BpDriver,Nothing}=nothing)
     fr = frame
     n = 0
     laststate = nothing
     noops = 0
     lastcmd = :none
+    drained = false
     while true
         n >= maxcmds && return (:budget, n, :none)
+        if bpd !== nothing && !drained
+            if n > 0.8 * maxcmds
+                # Entering the drain phase: silence every pause source so the
+                # DRAIN_COMMANDS below can actually finish the frame. Without
+                # this, an entry breakpoint on a hot function turns the whole
+                # tail of the budget into pauses and the walk ends :budget —
+                # a tracked abort, i.e. a wasted candidate.
+                drained = true
+                foreach(disable, breakpoints())
+                break_off(:error, :throw)
+            elseif rand(rng) < bpd.prob
+                bpaction!(rng, bpd)
+            end
+        end
         # Toplevel frames run in the latest world, matching what the interpreter
         # itself does in its toplevel loop (`istoplevel && (frame.world = ...)`,
         # src/interpret.jl) and what the differential executor does. Without it,
@@ -180,29 +336,38 @@ function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveI
     m = freshmodule()
     cmds = Symbol[]
     total = 0
+    bpd = usebreakpoints ? BpDriver(m, 0.04, 0, 0) : nothing
     try
         if usebreakpoints
             # Arm a global break-on-throw: exception handling during stepping is
-            # the interaction the fix history keeps flagging.
+            # the interaction the fix history keeps flagging. :throw (break even
+            # on caught throws) is armed less often — the guarded rules throw on
+            # purpose, so it pauses a lot.
             rand(rng) < 0.5 ? break_on(:error) : break_off(:error)
+            rand(rng) < 0.25 && break_on(:throw)
         end
         for (mod, frag) in ExprSplitter(m, ex)
+            # Between fragments is when new definitions have just appeared, so
+            # it is the natural moment for a user to set a breakpoint on one.
+            bpd !== nothing && rand(rng) < 0.3 && bpaction!(rng, bpd)
             frame = Frame(mod, frag)
-            status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total)
+            status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total, bpd)
             total += n
             if status === :stuck
                 return StepOutcome(:stuck, getobs(m),
                                    "`:$stuckcmd` left execution at the same (framecode, pc) " *
                                    "$STUCK_LIMIT times in a row after $total commands",
-                                   total, cmds, stuckcmd)
+                                   total, cmds, stuckcmd, :none, bpd === nothing ? 0 : bpd.nset)
             end
             # Budget exhaustion is not evidence of a bug — break-on-error stops
             # at every throw, and these programs throw on purpose — so it ends
             # the walk without a verdict rather than reporting one.
             status === :budget && return StepOutcome(:budget, getobs(m),
-                                                     "command budget exhausted", total, cmds)
+                                                     "command budget exhausted", total, cmds,
+                                                     :none, :none, bpd === nothing ? 0 : bpd.nset)
         end
-        return StepOutcome(:done, getobs(m), "", total, cmds)
+        return StepOutcome(:done, getobs(m), "", total, cmds, :none, :none,
+                           bpd === nothing ? 0 : bpd.nset)
     catch err
         bt = catch_backtrace()
         # Record where it surfaced, but do NOT use that to decide whether it is a
@@ -217,9 +382,10 @@ function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveI
         return StepOutcome(:threw, getobs(m),
                            string(nameof(typeof(err)), loc, ": ", shortstr(err), "\n",
                                   first(sprint(Base.show_backtrace, bt; context=:limit => true), 2500)),
-                           total, cmds, sitename, scrubexc(err))
+                           total, cmds, sitename, scrubexc(err),
+                           bpd === nothing ? 0 : bpd.nset)
     finally
-        usebreakpoints && (break_off(:error); remove())
+        usebreakpoints && (break_off(:error, :throw); remove())
     end
 end
 

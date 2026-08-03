@@ -21,12 +21,14 @@ include("shrink.jl")
 include("journal.jl")
 include("driver.jl")
 include("stepfuzz.jl")
+include("callfuzz.jl")
 include("evalcodefuzz.jl")
 include("corpus.jl")
 include("splitfuzz.jl")
 include("supposition.jl")
 
-export campaign, supposition_campaign, step_campaign, evalcode_campaign, corpus_campaign,
+export campaign, supposition_campaign, step_campaign, call_campaign, evalcode_campaign,
+       corpus_campaign,
        split_campaign, genprogram, gensplit, render, run_both, classify, shrink, shrink_ir,
        ddmin_source, ShrinkBudget, Cfg, SplitCfg, ProgramGen
 

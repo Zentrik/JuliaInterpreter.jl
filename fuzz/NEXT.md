@@ -16,13 +16,18 @@ landed**: the confirm-on-divergence gate and `fuzz/triage.jl`. Item 2
 
 ## Where things stand
 
-Five axes exist. Four of them cover surfaces that had no systematic testing
-before.
+Six axes exist. Five of them cover surfaces that had no systematic testing
+before. (See `evaluation-2026-08-03.md` for the rigorous progress review that
+motivated the two newest additions: the step axis's real-breakpoint driver —
+`breakpoints.jl` was 13% covered with 30/34 definitions never executed — and
+the `call` axis over the public entry points, which every other axis
+bypasses.)
 
 | engine | what it tests | oracle |
 |---|---|---|
 | `native` / `supposition` | run-to-completion semantics | differential vs. compiled Julia, on observation streams |
-| `step` | `debug_command` walks — `commands.jl`, `breakpoints.jl` | stepping terminates, raises nothing plain interpretation doesn't, and reaches the same observations |
+| `step` | `debug_command` walks — `commands.jl`, `breakpoints.jl`; the walk now sets/toggles/removes **real breakpoints** (entry, per-method, conditional, line) on the program's own callables | stepping terminates, raises nothing plain interpretation doesn't, and reaches the same observations |
+| `call` | the **public entry points** — `enter_call`/`prepare_args`/`prepare_call` + `debug_command` on method frames, with synthesized arguments (edge values, structs, varargs, kwargs) | native call ×2 (self-agreement certification) vs. `enter_call` + walk, on status/exception/normalized return value |
 | `evalcode` | `eval_code` at paused frames — `utils.jl` | reads match `locals(frame)`; writes round-trip and don't disturb other locals |
 | `corpus` | real Julia source, spliced — `construct.jl`, macro-heavy paths | per-fragment self-agreement certification → full value oracle when certified, else failure-mode only (determinism.md §6) |
 | `split` | adversarial toplevel forms — `ExprSplitter` in `construct.jl` | differential vs. `Core.eval` on failure mode, observation stream, **and the resulting module tree** |

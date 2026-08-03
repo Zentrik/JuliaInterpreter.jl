@@ -236,6 +236,30 @@ function reprocorpus(src::AbstractString; seed=REPRO_CORPUS_SEED)
     return !agree
 end
 
+# --- enter_call-axis repro (`--engine call` findings) ----------------------
+#
+# A call finding is (src, callseed): the seed replays target selection,
+# argument synthesis and the debug_command walk. Synthesis is harness logic a
+# standalone copy would drift from, so this one repro loads FuzzJI from its
+# home next to this file instead of duplicating it.
+
+function reprocall(src::AbstractString, callseed::Integer)
+    isdefined(Main, :FuzzJI) || Base.include(Main, joinpath(@__DIR__, "src", "FuzzJI.jl"))
+    FJ = getfield(Main, :FuzzJI)
+    r = Base.invokelatest(FJ.call_program, String(src); callseed=Int(callseed))
+    if r === nothing
+        println("program failed the parse gate — nothing to compare")
+        return false
+    end
+    println(r.ncalls, " certified call(s) compared, ", length(r.verdicts), " divergence(s)")
+    for v in r.verdicts
+        println("  ", v.class, ": ", v.detail)
+    end
+    println(isempty(r.verdicts) ? "NO DIVERGENCE (bug may be fixed, or is walk-dependent)" :
+                                  "DIVERGENCE REPRODUCED")
+    return !isempty(r.verdicts)
+end
+
 # --- ExprSplitter-axis repro (`--engine split` findings) -------------------
 #
 # The split axis's main verdict class is a difference in the *module tree*, not

@@ -17,10 +17,13 @@
 # *share* findings/, so the dedup set is global: a divergence one shard already
 # reported does not get re-reported by the other three.
 #
-# Default shards cover all five axes plus a large-program variant of the
-# differential one. With four cores, six shards is a slight oversubscription
-# on purpose — the corpus shard spends real time in Core.eval compiling
-# fragments, so it does not hold a core the whole time.
+# Default shards cover all six axes. The large-program variant of the
+# differential axis (native-big) is available by name but not in the default
+# set — yield-analysis.md's conclusion is that program size is the weaker
+# lever, and the slot is better spent on the enter_call axis (new surface).
+# With four cores, six shards is a slight oversubscription on purpose — the
+# corpus shard spends real time in Core.eval compiling fragments, so it does
+# not hold a core the whole time.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -37,7 +40,7 @@ DURATION="${1:-3600}"
 shift || true
 SHARDS=("$@")
 if [ ${#SHARDS[@]} -eq 0 ]; then
-    SHARDS=(native step corpus evalcode split native-big)
+    SHARDS=(native step corpus evalcode split call)
 fi
 
 LOGDIR="fuzz/longrun"
@@ -54,6 +57,7 @@ batch_args() {
         evalcode)   echo "--engine evalcode --n 1200" ;;
         corpus)     echo "--engine corpus --n 800 --maxsplice 4" ;;
         split)      echo "--engine split --n 3000" ;;
+        call)       echo "--engine call --n 1500" ;;
         *) echo "unknown shard $1" >&2; return 1 ;;
     esac
 }

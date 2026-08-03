@@ -36,8 +36,16 @@
 #   step — the debugger axis: drives each generated program through a random
 #     debug_command walk instead of running it, asserting that stepping
 #     terminates, raises no internal error, and reaches the same observations
-#     as plain interpretation. Targets commands.jl/breakpoints.jl.
-#     --maxcmds bounds the walk; --nobreakpoints disables break-on-error.
+#     as plain interpretation. The walk also manages *real breakpoints* (entry,
+#     per-method, conditional, line — set/enable/disable/toggle/remove) on the
+#     program's own callables. Targets commands.jl/breakpoints.jl.
+#     --maxcmds bounds the walk; --nobreakpoints disables both the breakpoint
+#     driver and break-on-error.
+#   call — the public-entry-point axis: defines each program natively, then
+#     compares native calls against enter_call + a debug_command walk on
+#     synthesized arguments (edge values, structs, varargs, kwargs), with
+#     double-native-call self-agreement certification. Targets construct.jl's
+#     enter_call/prepare_* path, which every other axis bypasses.
 #
 # --modes selects the interpreter configurations each candidate runs under:
 #   rec (RecursiveInterpreter), cmp (Compiled mode / NonRecursiveInterpreter),
@@ -194,6 +202,12 @@ elseif o["engine"] == "step"
                           doshrink=!o["noshrink"], journaldir=o["journaldir"], shrinkopts...)
     @info "step campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
+elseif o["engine"] == "call"
+    stats = call_campaign(; n=o["n"], baseseed=o["seed"], cfg=cfg,
+                          seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                          journaldir=o["journaldir"])
+    @info "call campaign complete" stats.cases stats.agreed stats.nondet_discard stats.discarded stats.findings stats.duplicates stats.suppressed
+    exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "evalcode"
     stats = evalcode_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
                               seeddisk=!o["fresh"], journalsync=!o["nosync"],
@@ -215,5 +229,5 @@ elseif o["engine"] == "corpus"
     @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted certified = stats.certified stats.nondet_discard stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else
-    error("unknown engine $(o["engine"]) (expected: supposition | native | step | evalcode | corpus | split)")
+    error("unknown engine $(o["engine"]) (expected: supposition | native | step | call | evalcode | corpus | split)")
 end

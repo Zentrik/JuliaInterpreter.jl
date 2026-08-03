@@ -26,7 +26,8 @@ julia --project=fuzz fuzz/run.jl --selftest                    # harness accepta
 julia --project=fuzz fuzz/run.jl --n 5000                      # Supposition-driven campaign
 julia --project=fuzz fuzz/run.jl --engine native --n 10000 --seed 1  # seeded-RNG campaign
 julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recursive-interp only
-julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis
+julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis (real breakpoints)
+julia --project=fuzz fuzz/run.jl --engine call --n 2000          # enter_call public-API axis
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 2000      # eval_code at paused frames
 julia --project=fuzz fuzz/run.jl --engine corpus --n 5000        # real Julia source, spliced
 julia --project=fuzz fuzz/run.jl --engine split --n 5000          # adversarial toplevel forms (ExprSplitter)
@@ -431,6 +432,75 @@ toplevel loop does (`src/interpret.jl`) and what the differential executor
 does. `debug_command` has no toplevel loop of its own, so without this every
 method the program defines at runtime — including the harness's `__obs__` in
 the fresh module — is "too new" for the frame's world.
+
+**Real breakpoints, driven from the walk.** The axis originally only armed
+`break_on(:error)`, and the coverage report measured the consequence: 30 of 34
+definitions in `src/breakpoints.jl` (3 fix commits) never executed. The walk
+now manages breakpoints the way a Debugger.jl user does: with a small
+per-command probability (and between fragments, right after new definitions
+appear) it performs one random breakpoint action — set an entry/per-method/
+conditional/line breakpoint on one of the program's own callables (struct
+constructors included; #525 was a constructor-breakpoint bug), enable/disable/
+toggle/remove an existing one, or flip `break_on`/`break_off(:error | :throw)`.
+Conditions are drawn only from shapes that cannot throw (`1 == 1`, `1 == 2`,
+`<argname> isa Any`) and a condition is only ever attached to the *specific
+Method* whose argument list supplied the name — attached to the whole function
+it would hit sibling methods without that slot and throw from inside
+`shouldbreak`, a harness false positive. All draws come from the walk RNG, so
+`(src, walkseed)` still reproduces a run exactly. At the drain point (80% of
+the command budget) every breakpoint is disabled and both break_on switches
+cleared so the walk can finish instead of burning the tail of the budget on
+pauses. Actions per walk are capped (`MAX_BP_ACTIONS`): each `breakpoint()`
+call scans the package's global framecode caches, which grow over a campaign.
+Two world-age notes: the target harvest (`names`/`getfield`/`methods` over the
+fresh module) must run through `invokelatest` — 1.12's strict binding rules
+otherwise make it silently *empty* (the driver shipped with that bug; the
+selftest now asserts breakpoints actually get set, not merely that actions
+ran). And walks occasionally print 1.12's "access to binding in a world prior
+to its definition world" deprecation warning from inside the stepped code;
+results are unaffected, but the warning's origin is worth chasing — it may
+implicate a raw binding access inside JuliaInterpreter itself.
+
+### The enter_call axis (`callfuzz.jl`)
+
+`--engine call`. Every other axis reaches the interpreter through the
+harness's own plumbing (`ExprSplitter` + `Frame` + the budgeted executor), so
+the *public entry points* — `enter_call`, `prepare_args`, `prepare_call`,
+`prepare_frame`, `debug_command` on a **method** frame, `get_return` — had
+zero coverage (`coverage-report.md`: `enter_call`, `enter_call_expr`,
+`extract_args`, `interpret`, `prepare_args` all never compiled). This is the
+Debugger.jl path: `@enter f(args...)` is `enter_call` plus a command loop.
+
+The axis defines the generated program *natively* (`Core.eval`; toplevel
+semantics belong to the differential axis), harvests the program's own
+callables — through `invokelatest`, see the world-age note in the step-axis
+section — and calls them with **synthesized arguments** drawn per parameter
+type: menu values including `typemin`/`typemax`, `NaN`, empty strings and
+vectors, program-defined structs built from synthesized fields, trailing
+varargs, and random keyword subsets (wrongly-typed keywords are fine — the
+native reference receives the identical values and must fail identically).
+Each call runs three times in the same module:
+
+1. **native ×2** — the reference, twice. Disagreement between the two native
+   runs means the call is state-sensitive (mutates something it reads); it is
+   *uncertified* and skipped — the corpus axis's self-agreement trick
+   (determinism.md §6), which is what makes calling arbitrary generated
+   functions with arbitrary arguments sound.
+2. **`enter_call` + walk** — the SUT: build the frame with the public API and
+   drive it with a random `debug_command` walk (same drain trick as the step
+   axis), then `get_return`.
+
+Verdicts: `call_value_divergence` (normalized return values differ — types
+compared too), `call_exception_divergence`, `call_only_throw` /
+`call_ref_only_throw`, `call_stuck`. Fingerprints are salted with the
+exception names / value shapes and, for interp-side throws, the innermost
+JuliaInterpreter function. Confirmation on divergence is a whole-candidate
+replay: the same `(src, callseed)` must re-derive the same fingerprint or the
+finding is a tracked `nondet_discard`. Args materialize fresh per run from
+per-parameter thunks, so a callee mutating its argument mutates a private
+copy each time. Not yet done here: shrinking (findings record
+`original == shrunk`), and `enter_call((f, true), ...)` for generator bodies
+of `@generated` functions.
 
 ### The eval_code axis (`evalcodefuzz.jl`)
 

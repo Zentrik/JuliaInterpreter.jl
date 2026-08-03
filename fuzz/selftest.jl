@@ -720,6 +720,90 @@ end
         @test nbad == 0
     end
 
+    @testset "breakpoint-managed walks agree with plain interpretation" begin
+        # With usebreakpoints on, the walk sets/toggles/removes *real*
+        # breakpoints (entry, per-method, conditional, line) on the program's
+        # own functions while stepping. Pausing must never change what the
+        # program computes, so the same three invariants hold; and the driver
+        # must actually fire, or this testset silently tests the previous one.
+        nbad = 0
+        totalbp = 0
+        for seed in 1:20
+            src = render(genprogram(Xoshiro(seed)))
+            ex = FuzzJI.parsegate(src)
+            ex === nothing && continue
+            plain = FuzzJI.run_interp(ex; nstmts=500_000)
+            st = FuzzJI.step_program(src; walkseed=seed, maxcmds=4000, usebreakpoints=true)
+            st === nothing && continue
+            totalbp += st.nbp
+            v = FuzzJI.classify_step(plain, st)
+            if !(v.class === :agree || v.class === :aborted)
+                nbad += 1
+                @warn "breakpoint-walk divergence (a real finding — triage it!)" seed v.class v.detail
+            end
+            # No breakpoint state may leak into the next candidate.
+            @test isempty(JuliaInterpreter.breakpoints())
+        end
+        @test nbad == 0
+        @test totalbp > 0
+        # Replay: the same (src, walkseed) must reproduce the same breakpoint
+        # decisions along with the same commands.
+        src = render(genprogram(Xoshiro(3)))
+        a = FuzzJI.step_program(src; walkseed=99, maxcmds=1500, usebreakpoints=true)
+        b = FuzzJI.step_program(src; walkseed=99, maxcmds=1500, usebreakpoints=true)
+        @test a !== nothing && b !== nothing
+        @test a.status === b.status && a.ncommands == b.ncommands && a.nbp == b.nbp
+        @test isequal(a.obs, b.obs)
+    end
+
+    @testset "call axis: certified enter_call comparisons execute and agree" begin
+        # The enter_call axis defines the program natively, harvests its
+        # callables, and compares native calls against enter_call + a
+        # debug_command walk on synthesized arguments. The axis must actually
+        # compare calls (a zero count is how the world-age harvest bug looked)
+        # and, on a correct interpreter, report nothing.
+        ncalls = 0
+        nbad = 0
+        for seed in 1:10
+            rng = Xoshiro(seed)
+            src = render(genprogram(rng))
+            callseed = rand(rng, 1:typemax(Int))
+            r = FuzzJI.call_program(src; callseed)
+            r === nothing && continue
+            ncalls += r.ncalls
+            for v in r.verdicts
+                nbad += 1
+                @warn "call divergence (a real finding — triage it!)" seed v.class v.detail
+            end
+        end
+        @test ncalls > 0
+        @test nbad == 0
+        # Replay: the same (src, callseed) derives the same comparisons.
+        rng = Xoshiro(5)
+        src = render(genprogram(rng))
+        callseed = rand(rng, 1:typemax(Int))
+        a = FuzzJI.call_program(src; callseed)
+        b = FuzzJI.call_program(src; callseed)
+        @test a.ncalls == b.ncalls && length(a.verdicts) == length(b.verdicts)
+    end
+
+    @testset "call oracle detects a planted divergence" begin
+        ok = FuzzJI.CallOutcome(:done, :none, 7, :none, "")
+        wrong = FuzzJI.CallOutcome(:done, :none, 8, :none, "")
+        threw = FuzzJI.CallOutcome(:threw, :BoundsError, nothing, :none, "")
+        threw2 = FuzzJI.CallOutcome(:threw, :MethodError, nothing, :none, "")
+        @test FuzzJI.classify_call(ok, ok, "f/1").class === :agree
+        @test FuzzJI.classify_call(ok, wrong, "f/1").class === :call_value_divergence
+        @test FuzzJI.classify_call(threw, threw, "f/1").class === :agree
+        @test FuzzJI.classify_call(threw, threw2, "f/1").class === :call_exception_divergence
+        @test FuzzJI.classify_call(ok, threw, "f/1").class === :call_only_throw
+        @test FuzzJI.classify_call(threw, ok, "f/1").class === :call_ref_only_throw
+        # A typed return value must not compare equal to a differently-typed one.
+        int1 = FuzzJI.CallOutcome(:done, :none, 1, :none, "")
+        flt1 = FuzzJI.CallOutcome(:done, :none, 1.0, :none, "")
+        @test FuzzJI.classify_call(int1, flt1, "f/1").class === :call_value_divergence
+    end
+
     @testset "stepping oracle detects a planted divergence" begin
         # Prove the step oracle can actually fail: compare a program's real
         # observations against a deliberately wrong stepped stream, and against
