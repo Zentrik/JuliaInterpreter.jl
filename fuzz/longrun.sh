@@ -53,6 +53,20 @@ if [ ${#SHARDS[@]} -eq 0 ]; then
     SHARDS=(native step step2 call corpus misc)
 fi
 
+# Per-run seed offset, so two campaigns explore DIFFERENT programs instead of
+# re-testing the same ones. Without this every invocation — local reruns, the
+# nightly CI, a second machine — started from the same shard bases and walked
+# the same seed sequence, differing only by Julia version. Generation is a pure
+# function of the seed, so identical bases meant identical programs and no
+# growth in cumulative coverage.
+#
+# Determinism is preserved where it matters: every finding's meta.md/repro.jl
+# records the *absolute* candidate seed, so a bug still reproduces exactly. What
+# varies per run is only the starting point. Set SEED_BASE explicitly to replay
+# a whole campaign; default is random (bash $RANDOM, 0..32767). The nightly CI
+# passes a monotonic per-run value in a disjoint high band (see the workflow).
+SEED_BASE="${SEED_BASE:-$RANDOM}"
+
 LOGDIR="fuzz/longrun"
 mkdir -p "$LOGDIR"
 DEADLINE=$(( $(date +%s) + DURATION ))
@@ -110,13 +124,15 @@ run_shard() {
     echo "=== $name done after $batch batches ===" >> "$log"
 }
 
-echo "longrun: ${#SHARDS[@]} shards for ${DURATION}s -> $LOGDIR/"
+echo "longrun: ${#SHARDS[@]} shards for ${DURATION}s, SEED_BASE=$SEED_BASE -> $LOGDIR/"
 i=0
 for s in "${SHARDS[@]}"; do
     i=$((i + 1))
-    # 10^8 apart: shards advance 100000 per batch, so the old 10^6 spacing made
-    # shard i re-explore shard i+1's seed range after ten batches.
-    run_shard "$s" $(( i * 100000000 )) &
+    # Absolute shard base = SEED_BASE·10^9 + i·10^8. The 10^9 per-run stride sits
+    # above the ~6·10^8 a whole run spans (6 shards · 10^8), so distinct SEED_BASE
+    # values never overlap. Within a run, shards stay 10^8 apart (each advances
+    # 100000/batch, ~10^7 over a long run), so they never collide either.
+    run_shard "$s" $(( SEED_BASE * 1000000000 + i * 100000000 )) &
 done
 wait
 echo "longrun: complete"
