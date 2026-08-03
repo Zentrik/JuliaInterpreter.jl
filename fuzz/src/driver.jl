@@ -32,35 +32,31 @@ end
 # Known, already-reported divergences go here so reruns surface only news.
 # Each entry is a predicate over Verdict.
 #
-# Environment-mismatch stopgap. The corpus axis splices real code, which can
-# redefine a constant/binding whose presence depends on which prelude
-# `using`/`import`s actually took effect. When that set differs between the
-# reference module and the interpreted module, `module Foo`/`const Foo = …`
-# redefines a constant on one side only, and the interpreter throws an
-# `invalid redefinition of constant` / `cannot declare …` where the reference
-# does not. That is an artifact of the corpus environment setup, NOT an
-# interpreter bug (the generated grammar excludes const/method redefinition for
-# exactly this reason, and minimal `module Foo`/redefinition cases agree
-# between the interpreter and `Core.eval`). The proper fix is the corpus
-# environment-equivalence gate (NEXT.md long-horizon list): record which prelude
-# statements took effect on each side and discard when they diverge. Until that
-# lands, suppress the recognizable redefinition-mismatch messages so they do not
-# flood `findings/`; suppressed cases are still counted in `stats.suppressed`.
-# Definition-time binding/type errors are the recognizable symptoms: the same
-# environment mismatch shows up as a redefinition ("invalid redefinition of
-# constant Future"), a method-definition argument type that resolved to a
-# non-type ("invalid type for argument x in method definition", when a type like
-# `DateTime` is in scope on the reference side via import recovery but not on the
-# interpreted side), or an assignment to an imported binding. All are
-# environment artifacts, not interpreter bugs. This is message whack-a-mole by
-# nature — the durable fix is the corpus environment-equivalence gate — so keep
-# the list tight to definition-time binding/type errors and rely on the gate for
-# the rest.
+# CAUTION — this list was originally framed as an "environment-mismatch" stopgap
+# for the corpus axis, on the assumption that these definition-time errors are
+# artifacts of the corpus prelude setup rather than interpreter bugs. That
+# premise turned out to be WRONG for the dominant member: "invalid redefinition
+# of constant Future" was a genuine JuliaInterpreter bug in
+# `find_or_create_module` (src/construct.jl) — it threw where native `Core.eval`
+# shadows a `using`-imported non-module binding with a fresh submodule. That bug
+# is now FIXED (with a test/toplevel.jl regression), so the redefinition message
+# is deliberately NO LONGER suppressed: if it recurs it is real news, not noise.
+#
+# The remaining entries below are UNVERIFIED. They are kept only as coarse
+# noise-control so a single recurring signature cannot flood `findings/`, and
+# must NOT be read as "confirmed not-a-bug". Each still needs its own root-cause
+# triage exactly like the redefinition one got — treat a hit as a lead, not a
+# dismissal. The corpus prelude is in fact applied identically to the reference
+# and interpreted runs (corpus.jl `corpus_run`), so the "environment differs"
+# story does not hold on its face; the true cause of each is an open question.
+# The durable path is per-signature triage (as done for redefinition), not a
+# blanket environment-equivalence gate.
 function env_binding_mismatch(v::Verdict)::Bool
     (v.class === :interp_only_throw || v.class === :exception_divergence) || return false
     d = v.detail
-    return occursin("redefinition of constant", d) ||
-           occursin("cannot assign a value to imported", d) ||
+    # NOTE: "redefinition of constant" intentionally removed — it was a real bug,
+    # now fixed in src/construct.jl. Leave it unsuppressed so a regression surfaces.
+    return occursin("cannot assign a value to imported", d) ||
            (occursin("cannot declare", d) && occursin("constant", d)) ||
            occursin("invalid type for argument", d) ||
            occursin("invalid subtyping in definition", d)

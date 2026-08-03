@@ -144,12 +144,27 @@ Strong evidence the crash is **optimizer-induced**, consistent with the
 - **`-O1`**: the same shard ran **22 batches with 0 deaths** (campaign
   `SEED_BASE=1785779695`), and no shard produced a `gc-stock.c` death.
 
-This is not a perfectly controlled A/B (different seeds), but the mechanism is
-exact — `-O1` does not run LICM — so it is the expected result and it holds.
-For the upstream report this pins the crash to codegen/optimization rather
-than the collector proper, and gives a clean mitigation (run at `-O1`) and a
-sharper repro recipe: **run the aggregate reproducer at `-O2`** (`JULIA_OPT=2
-./fuzz/longrun.sh`), which is where it reproduces; `-O1` will not show it.
+This is not a perfectly controlled A/B (different seeds), but the direction is
+clear and reproducible.
+
+### Correction (2026-08-03, later): `-O1` reduces but does NOT eliminate it
+
+A longer `-O1` run (campaign `SEED_BASE=1785779695`) produced a **gc-stock.c
+SIGSEGV at `-O1`** after all: the `misc` (evalcode/split) shard died once at
+batch ~35 (`ijl_gc_small_alloc` → `maybe_collect` → `gc_mark_loop_serial`,
+exit 139), having survived ~34 batches clean. So the effect of `-O1` is a large
+**frequency reduction** (roughly 1 death per ~35 `-O1` batches vs ~1 per ~8 at
+`-O2`), not avoidance.
+
+This is an important refinement for the upstream report: it **weakens the
+"purely LICM/#60651" hypothesis**, because LICM does not run at `-O1` yet the
+crash still occurs there. The crash is therefore either a broader
+codegen/optimization interaction (more than just LICM hoisting an `undef`
+root) or an optimization-independent serial-GC corruption whose *probability*
+optimization level modulates via allocation/marking volume. Either way the
+practical guidance changes: `-O1` is a mitigation that cuts the rate, not a
+fix, and the aggregate reproducer will still eventually hit it at `-O1` — it is
+just faster to reproduce at `-O2` (`JULIA_OPT=2 ./fuzz/longrun.sh`).
 
 ## For the upstream report
 

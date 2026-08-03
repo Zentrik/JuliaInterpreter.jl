@@ -1,47 +1,50 @@
-# Status: LIKELY corpus environment-equivalence FALSE POSITIVE (not a core interp bug)
+# Status: FIXED — was a GENUINE interpreter bug (NOT an environment false positive)
 
 Found by the `corpus` certified-value oracle on the `-O1` campaign
-(2026-08-03). Reproduces (`reprocorpus`): reference completes, interpreter
-throws `ErrorException: invalid redefinition of constant Future` on a spliced
-copy of Julia's stdlib `Future` module, preceded by `using .ConflictingBindings`
-and `using Test, Distributed, Random, Logging, Libdl; using REPL`.
+(2026-08-03). The interpreter threw `ErrorException: invalid redefinition of
+constant Future` on a spliced copy of Julia's stdlib `Future` module, where
+compiled Julia (`Core.eval`) completed.
 
-## Why it is most likely NOT a core interpreter bug
+## Resolution
 
-Minimal module-redefinition cases all AGREE between the interpreter and
-`Core.eval` (both `ok`):
-- `module Future end`
-- `using Distributed; module Future end`  (Distributed exports `Future`)
-- `const Future = 1; module Future end`
+This was **misdiagnosed** as a corpus environment-equivalence false positive.
+It is a real JuliaInterpreter bug, now **fixed** in `src/construct.jl`
+(`find_or_create_module`), with a regression test in `test/toplevel.jl`
+("module shadows a using-imported non-module binding").
 
-So the interpreter's `module`/const-redefinition handling is correct in
-isolation. The divergence only appears with the full fragment's environment —
-the classic shape of an **environment mismatch**: a `using` (here plausibly
-`using .ConflictingBindings`, a test-fixture relative import, or the interplay
-of the stdlib preludes) takes effect differently on the interpreted single
-run than on the certification's two fresh-module reference runs, so
-`module Future` redefines a constant only on the interpreted side.
+### Root cause
 
-This is exactly the **corpus environment-equivalence** false-positive class
-NEXT.md flags as a deferred hardening item ("discard a case when the
-interpreted module's environment differs from the environment the reference
-succeeded in"). The certified-value oracle admits it because that gate is not
-yet implemented.
+`find_or_create_module` unconditionally threw
+`invalid redefinition of constant $newname` whenever `newname` was already a
+defined global that was not itself a `Module`:
 
-## Recommendation
+```julia
+found = invokelatest(getglobal, parentmod, newname)
+found isa Module || throw(ErrorException("invalid redefinition of constant $(newname)"))
+```
 
-Do NOT change `src/`. Two options, in order:
-1. **Un-defer the corpus environment-equivalence gate** (NEXT.md long-horizon
-   item / port from `claude/julia-fuzzing-strategy-bmh692` commit `be1d869`):
-   have the corpus runner record which prelude `using`/`import`s actually took
-   effect on each side and discard when the interpreted and reference
-   environments diverge. That suppresses this whole class.
-2. Until then, add a targeted suppression for
-   `interp_only_throw` whose message is `invalid redefinition of constant …`
-   on the corpus axis (redefinition mismatches are environment artifacts,
-   not interpreter bugs — method/const redefinition is excluded from the
-   generated grammar for the same reason).
+When `using Distributed` (or any `using` exporting a non-module `Future`) is in
+scope, `Future` resolves to `Distributed.Future` (a `DataType`). Native
+toplevel `Core.eval(parentmod, :(module Future end))` **shadows** that
+`using`-import with a fresh submodule — ordinary, well-defined Julia (same as
+`include`). The interpreter's guard rejected exactly this legal case.
 
-Before fully closing, a keen reviewer could still try to minimize the full
-fragment to rule out a genuine `ExprSplitter`/module bug — but the minimal
-evidence above puts the burden on that, not on the interpreter.
+### Why the "environment mismatch" framing was wrong
+
+The corpus prelude is applied *identically* to the reference and interpreted
+runs (`corpus.jl` `corpus_run`), so there was no uncontrolled environment
+difference. The minimal trigger is a **single statement**
+(`using Distributed; module Future end`), so it is not a batch-vs-sequential
+world-age artifact either. Native `Core.eval` and the interpreter disagreed in
+the same module, same world, same imports — a genuine divergence.
+
+### Fix
+
+Take the module-reuse fast path only when `found isa Module`; for a non-module
+`found`, fall through to `Core.eval(parentmod, module_ex)`, which shadows the
+import (or raises Julia's own error for a true owned redefinition), matching
+native evaluation by construction. Selftest 437/437; `test/toplevel.jl` green.
+
+The `env_binding_mismatch` suppression in `fuzz/src/driver.jl` no longer
+suppresses `redefinition of constant` — a regression will now surface as real
+news. Duplicates of this signature: `-254b14e6`, `-938d349c`.

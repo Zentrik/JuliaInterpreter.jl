@@ -135,6 +135,31 @@ end
     @test JIVisible.TestPkg718._VARIABLE_UNASSIGNED == -84.0
 end
 
+# Host for the "module shadows a using-imported binding" regression below: `Future`
+# is a *non-module* binding brought into `ShadowHost` by `using .ShadowOwner`, the
+# same shape as `using Distributed` exporting `Distributed.Future` (a `DataType`).
+module ShadowHost
+    module ShadowOwner
+        const Future = 42
+        export Future
+    end
+    using .ShadowOwner
+end
+
+@testset "module shadows a using-imported non-module binding" begin
+    # A `module Future` that shadows a `using`-imported *non-module* binding named
+    # `Future` is a fresh local module, not a redefinition error — matching native
+    # `Core.eval`, which shadows the import. Found by differential fuzzing: the
+    # interpreter previously threw a spurious `invalid redefinition of constant Future`
+    # from `find_or_create_module` (src/construct.jl).
+    @test isdefinedglobal(ShadowHost, :Future)
+    @test !(getglobal(ShadowHost, :Future) isa Module)
+    for (m, _) in ExprSplitter(ShadowHost, :(module Future; f() = 1; end))
+        @test parentmodule(m) === ShadowHost
+    end
+    @test getglobal(ShadowHost, :Future) isa Module
+end
+
 module Toplevel end
 module ToplevelDirect end
 
