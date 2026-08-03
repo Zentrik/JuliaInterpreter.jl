@@ -100,17 +100,24 @@ Everything else the work produced:
   denylist now steers around: wrong-arity intrinsic calls abort inside
   codegen, and a float intrinsic handed a same-width integer
   (`Core.Intrinsics.ceil_llvm(3)`) corrupts the heap without raising.
-- a **transient GC segfault on Julia 1.11.9**, in the same family: a
-  campaign dies with SIGSEGV at an allocation site (seen at `firstdiff` in
-  the comparator and at `gc_mark_obj8` in the prober's soak) after cumulative
-  heap activity. It does **not** reproduce on isolated replay of the
-  candidate that was executing — the crashing candidate runs clean in a fresh
-  process — so it is heap-state-dependent, not a harness or interpreter bug.
-  `longrun.sh` is built to survive it: each shard restart-loops and preserves
-  `current.jl` to `crashed/` before the next batch. Expect native-both-modes
-  batches to die partway and restart; that is the designed behaviour, not a
-  failure. Worth confirming whether 1.12 clears it (the codegen-abort sibling
-  was fixed there) before the next long run.
+- a **transient GC segfault on Julia 1.11.9 *and* 1.12.6**, in the same
+  family: a campaign dies with SIGSEGV inside a garbage collection (seen at
+  `firstdiff` in the comparator and `gc_mark_obj8` in the prober's soak on
+  1.11.9; at `gc_mark_objarray`/`gc_try_claim_and_push` on 1.12.6) after
+  cumulative heap activity. It does **not** reproduce on isolated replay of
+  the candidate that was executing — the crashing candidate runs clean in a
+  fresh process (confirmed 1.12.6: the evalcode candidate that took a misc
+  shard down at batch 4 of the 2026-08-03 run ran clean across 5 processes ×
+  40 walkseeds) — so it is heap-state-dependent, not a harness or interpreter
+  bug. `longrun.sh` is built to survive it: each shard restart-loops and
+  preserves `current.jl` to `crashed/` before the next batch. Expect shards
+  to die partway and restart; that is the designed behaviour, not a failure.
+  **1.12 does NOT clear it** (the standing question from the previous run,
+  now answered — unlike the codegen-abort sibling, which 1.12 did fix). It is
+  worth reducing to a standalone reproducer and reporting upstream: a
+  cumulative-heap GC crash that survives to 1.12 is a live Julia bug, and the
+  `crashed/` candidate plus `--bug-report=rr` (NEXT.md item 1's open rr step)
+  is the way in — but it is a *Julia* bug, so it does not block this harness.
 
 One bug in ~10^4 candidates is not a yield estimate. The axes have not run at
 the scale where they would be expected to produce much — the literature's
