@@ -3,8 +3,15 @@
 #   julia --project=fuzz fuzz/run.jl [--engine supposition|native] [--n N] [--seed S]
 #                                    [--budget NSTMTS] [--modes rec|cmp|both] [--selftest]
 #                                    [--big] [--fresh] [--patience K]
+#                                    [--noshrink] [--shrinkruns N] [--shrinksecs S]
 #                                    [--maxdepth D] [--maxblockdepth D] [--maxblockstmts N]
 #                                    [--maxloop N] [--bodystmts LO:HI]
+#
+# Shrinking: every axis minimizes a finding before writing it, against its own
+# property (differential fingerprint / same stepping verdict class / same
+# eval_code check / same corpus verdict class). --noshrink reports findings as
+# generated; --shrinkruns and --shrinksecs cap the per-finding cost so one
+# stubborn case cannot stall a campaign.
 #
 # Generator size: --big selects a larger profile (deeper nesting, more sections,
 # longer bodies); the individual knobs override whichever profile is in effect.
@@ -40,6 +47,7 @@ function parseargs(args)
                          "patience" => 1, "nosync" => false, "noswarm" => false,
                          "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false,
                          "maxsplice" => 3, "nostep" => false,
+                         "shrinkruns" => nothing, "shrinksecs" => nothing,
                          "journaldir" => joinpath(@__DIR__, "journal"))
     # Cfg overrides start unset (nothing) and fall through to the profile default.
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop", "bodystmts")
@@ -60,8 +68,12 @@ function parseargs(args)
             o["modes"] = args[i += 1]
         elseif a == "--selftest"
             o["selftest"] = true
-        elseif a == "--noshrink"
+        elseif a == "--noshrink"       # report findings unminimized (every axis)
             o["noshrink"] = true
+        elseif a == "--shrinkruns"     # per-finding cap on candidate re-executions
+            o["shrinkruns"] = parse(Int, args[i += 1])
+        elseif a == "--shrinksecs"     # per-finding wall-clock cap, seconds
+            o["shrinksecs"] = parse(Float64, args[i += 1])
         elseif a == "--big"
             o["big"] = true
         elseif a == "--fresh"          # ignore findings/ when seeding the dedup set
@@ -130,6 +142,13 @@ end
 o = parseargs(ARGS)
 cfg = makecfg(o)
 
+# Shrink-budget overrides. Only the knobs actually given on the command line are
+# forwarded, so each axis keeps its own default (the stepping and eval_code
+# predicates replay a whole command walk per candidate and are correspondingly
+# more expensive than a differential re-run).
+shrinkopts = merge(o["shrinkruns"] === nothing ? NamedTuple() : (shrinkruns = o["shrinkruns"],),
+                   o["shrinksecs"] === nothing ? NamedTuple() : (shrinksecs = o["shrinksecs"],))
+
 # Interpreter configurations to test each candidate under:
 #   rec — RecursiveInterpreter (everything interpreted)
 #   cmp — Compiled mode (toplevel stepped, calls execute natively)
@@ -142,36 +161,36 @@ modes = o["modes"] == "both" ? (:rec, :cmp) :
 if o["selftest"]
     include(joinpath(@__DIR__, "selftest.jl"))
 elseif o["engine"] == "supposition"
-    nfound = supposition_campaign(examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
+    nfound = supposition_campaign(; examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
                                   modes=modes, cfg=cfg, patience=o["patience"],
                                   seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                                  journaldir=o["journaldir"])
+                                  journaldir=o["journaldir"], shrinkopts...)
     @info "supposition campaign complete" nfound
     exit(nfound == 0 ? 0 : 2)   # non-zero exit on new findings, for CI
 elseif o["engine"] == "native"
-    stats = campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], doshrink=!o["noshrink"],
+    stats = campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], doshrink=!o["noshrink"],
                      modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                     journaldir=o["journaldir"])
+                     journaldir=o["journaldir"], shrinkopts...)
     @info "campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "step"
-    stats = step_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
+    stats = step_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
                           seeddisk=!o["fresh"], journalsync=!o["nosync"],
                           maxcmds=o["maxcmds"], usebreakpoints=!o["nobreakpoints"],
-                          journaldir=o["journaldir"])
+                          doshrink=!o["noshrink"], journaldir=o["journaldir"], shrinkopts...)
     @info "step campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "evalcode"
-    stats = evalcode_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
+    stats = evalcode_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
                               seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                              journaldir=o["journaldir"])
+                              doshrink=!o["noshrink"], journaldir=o["journaldir"], shrinkopts...)
     @info "evalcode campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "corpus"
-    stats = corpus_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
+    stats = corpus_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
                             maxsplice=o["maxsplice"], maxcmds=o["maxcmds"],
-                            dostep=!o["nostep"], seeddisk=!o["fresh"],
-                            journalsync=!o["nosync"], journaldir=o["journaldir"])
+                            dostep=!o["nostep"], seeddisk=!o["fresh"], doshrink=!o["noshrink"],
+                            journalsync=!o["nosync"], journaldir=o["journaldir"], shrinkopts...)
     @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else

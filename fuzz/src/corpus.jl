@@ -442,6 +442,51 @@ corpusverdict(o::CorpusOutcome) =
     (o.status === :ok || o.status === :junk) ? agree() :
     Verdict(Symbol(:corpus_, o.status), o.detail, :none, :none, 0, o.site, :none)
 
+# -- shrinking corpus findings ----------------------------------------------
+# Corpus findings are real code, not generator IR, so the IR shrinker has
+# nothing to work with. What they do have is toplevel structure, which is what
+# `ddmin_source` (shrink.jl) minimizes: delete toplevel statements first — a
+# spliced case is several fragments and usually only one of them matters — then
+# recurse into block bodies, because a surviving fragment is typically one large
+# `function` or `@testset` with the interesting statement buried in it.
+#
+# A rendered corpus case is `prelude ++ fragments`, all as toplevel statements,
+# so re-splitting a candidate is just sorting `using`/`import` from the rest.
+# Deleting an import the fragment needs makes the reference throw, the case
+# becomes junk, the verdict becomes `agree`, and the edit is rejected — the
+# oracle keeps the prelude honest without special-casing it.
+function corpus_split(src::AbstractString)
+    stmts = toplevel_statements(src)
+    stmts === nothing && return nothing
+    isimport(s) = s isa Expr && (s.head === :using || s.head === :import)
+    prelude = Expr[s for s in stmts if isimport(s)]
+    rest = Any[s for s in stmts if !isimport(s)]
+    isempty(rest) && return nothing
+    return (Expr(:toplevel, rest...), prelude)
+end
+
+"""
+    corpus_keep(fp; nstmts, maxcmds, dostep, walkseed) -> keep
+
+The corpus axis's property as a `keep(src)::Bool` predicate: re-run the
+candidate through the same reference-then-interpret-then-step pipeline the
+campaign uses and require the same verdict fingerprint (class plus the
+JuliaInterpreter-function salt).
+"""
+function corpus_keep(fp::String; nstmts::Int, maxcmds::Int, dostep::Bool, walkseed::Int)
+    return function (src::String)
+        sp = corpus_split(src)
+        sp === nothing && return false
+        case, prelude = sp
+        o = quiet_stdout() do
+            r = corpus_run(case, prelude; nstmts)
+            (r.status === :ok && dostep) ? corpus_step(case, r.prelude, Xoshiro(walkseed); maxcmds) : r
+        end
+        v = corpusverdict(o)
+        return isfinding(v) && fingerprint(v) == fp
+    end
+end
+
 """
     corpus_campaign(; n, baseseed, maxsplice, dirs, ...) -> Stats
 
@@ -461,7 +506,8 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
                          journaldir::String=joinpath(@__DIR__, "..", "journal"),
                          dirs::Vector{String}=default_corpus_dirs(), maxsplice::Int=3,
                          maxcmds::Int=1500, progress::Int=50, dostep::Bool=true,
-                         seeddisk::Bool=true, journalsync::Bool=true)
+                         seeddisk::Bool=true, journalsync::Bool=true,
+                         doshrink::Bool=true, shrinkruns::Int=80, shrinksecs::Real=240.0)
     corpus = load_corpus(dirs)
     @info "corpus loaded" nfragments = length(corpus) dirs
     isempty(corpus) && (@warn "empty corpus — nothing to do"; return Stats())
@@ -481,6 +527,9 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
             sc === nothing && continue
             case, prelude = sc
             src = join(vcat([string(p) for p in prelude], [string(a) for a in case.args]), "\n")
+            # Own seed for the stepping walk, so a shrunk candidate replays the
+            # same walk instead of a different one (see stepfuzz.jl's replay note).
+            walkseed = rand(rng, 1:typemax(Int))
             journal_case!(j, seed, src)
             stats.cases += 1
             # Lowering is part of what we are testing, so no parse gate here:
@@ -490,7 +539,7 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
                 # Only step fragments compiled Julia already ran cleanly:
                 # stepping one that cannot run at all says nothing about the
                 # debugger.
-                (r.status === :ok && dostep) ? corpus_step(case, r.prelude, rng; maxcmds) : r
+                (r.status === :ok && dostep) ? corpus_step(case, r.prelude, Xoshiro(walkseed); maxcmds) : r
             end
             v = corpusverdict(o)
             # Track discards separately: if nearly every case is junk, the
@@ -508,8 +557,17 @@ function corpus_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=60_000,
                 else
                     push!(seen, fp)
                     stats.findings += 1
-                    @info "CORPUS FINDING $(v.class)" seed fp nfragments = k detail = first(v.detail, 400)
-                    writefinding(outdir, fp, v, seed, src, src; mode=:corpus)
+                    @info "CORPUS FINDING $(v.class)" seed fp walkseed nfragments = k detail = first(v.detail, 400)
+                    shrunk = src
+                    if doshrink
+                        budget = ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)
+                        keep = corpus_keep(fingerprint(v); nstmts, maxcmds, dostep, walkseed)
+                        # no quiet_stdout here: corpus_keep already quiets each
+                        # candidate, and nesting the redirect buys nothing
+                        shrunk = ddmin_source(src, keep; budget)
+                        @info "  shrunk" runs = budget.runs lines_orig = countlines(IOBuffer(src)) lines_shrunk = countlines(IOBuffer(shrunk))
+                    end
+                    writefinding(outdir, fp, v, seed, src, shrunk; mode=:corpus, walkseed)
                 end
             end
             if progress > 0 && i % progress == 0

@@ -141,6 +141,78 @@ evalverdict(o::EvalOutcome) =
         Verdict(Symbol(:evalcode_, o.status), o.detail, :none, :none, 0, :none, :none)
 
 """
+    evalcode_probe(src; walkseed, nstmts, pausesper) -> EvalOutcome or nothing
+
+Run one program's worth of the axis: step it to a series of pause points and run
+the `eval_code` checks at each. Returns the first non-`:ok` outcome, an `:ok`
+outcome if nothing fired, or `nothing` if the source did not survive the parse
+gate.
+
+Like the stepping axis, the pause walk and the write probes draw from a fresh
+`Xoshiro(walkseed)` rather than from the generator's stream — that is what makes
+`(src, walkseed)` a complete description of the run, and hence what makes the
+axis shrinkable.
+"""
+function evalcode_probe(src::String; walkseed::Int, nstmts::Int=300_000, pausesper::Int=25)
+    ex = parsegate(src)
+    ex === nothing && return nothing
+    rng = Xoshiro(walkseed)
+    interp = RecursiveInterpreter()
+    m = freshmodule()
+    worst = nothing
+    nchecks = 0     # kept so a collapse to "this axis checks nothing" stays visible
+    try
+        for (mod, frag) in ExprSplitter(m, ex)
+            fr = Frame(mod, frag)
+            # Step a bounded number of times, checking eval_code at each pause.
+            # Frames are checked wherever the walk lands — including inside
+            # callees, where slots and static parameters actually exist.
+            for _ in 1:pausesper
+                is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
+                o = check_evalcode(rng, fr)
+                nchecks += o.nchecks
+                if o.status !== :ok
+                    worst = o
+                    break
+                end
+                ret = try
+                    debug_command(interp, fr, pick(rng, (:s, :n, :se, :nc)), true)
+                catch
+                    nothing   # program-level error ends this fragment's walk
+                end
+                ret === nothing && break
+                fr, _pc = ret
+            end
+            worst === nothing || break
+        end
+    catch err
+        site = internalframe(stacktrace(catch_backtrace()))
+        site === nothing || (worst = EvalOutcome(:internal_error,
+            "$(nameof(typeof(err))): $(shortstr(err))", Symbol(site[1]), nchecks))
+    end
+    return worst === nothing ? EvalOutcome(:ok, "", :none, nchecks) : worst
+end
+
+"""
+    evalcode_keep(fp; walkseed, nstmts, pausesper) -> keep
+
+The eval_code axis's property as a `keep(src)::Bool` predicate. Re-runs the
+pause-and-check procedure with the same `walkseed` and requires the same verdict
+fingerprint — which for this axis means the same *check kind*, since the class
+itself distinguishes read-mismatch from write-lost from collateral-write, and
+internal errors are additionally salted with the JuliaInterpreter function that
+raised.
+"""
+function evalcode_keep(fp::String; walkseed::Int, nstmts::Int, pausesper::Int)
+    return function (src::String)
+        o = evalcode_probe(src; walkseed, nstmts, pausesper)
+        o === nothing && return false
+        v = evalverdict(o)
+        return isfinding(v) && fingerprint(v) == fp
+    end
+end
+
+"""
     evalcode_campaign(; n, baseseed, ...) -> Stats
 
 Generate programs, step each to a series of random pause points, and run the
@@ -150,14 +222,15 @@ function evalcode_campaign(; n::Int=300, baseseed::Int=1, nstmts::Int=300_000,
                            outdir::String=joinpath(@__DIR__, "..", "findings"),
                            journaldir::String=joinpath(@__DIR__, "..", "journal"),
                            cfg::Cfg=Cfg(), progress::Int=50, pausesper::Int=25,
-                           seeddisk::Bool=true, journalsync::Bool=true)
+                           seeddisk::Bool=true, journalsync::Bool=true,
+                           doshrink::Bool=true, shrinkruns::Int=150,
+                           shrinksecs::Real=180.0)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
     seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
     end
-    interp = RecursiveInterpreter()
     t0 = time()
     try
         for i in 1:n
@@ -165,45 +238,18 @@ function evalcode_campaign(; n::Int=300, baseseed::Int=1, nstmts::Int=300_000,
             rng = Xoshiro(seed)
             prog = genprogram(rng, cfg)
             src = render(prog)
+            # Own seed for the pause walk, drawn from the generator's stream so
+            # the case still reproduces from `seed`, but consumed through a fresh
+            # Xoshiro so a shrunk candidate can be replayed identically.
+            walkseed = rand(rng, 1:typemax(Int))
             journal_case!(j, seed, src)
             stats.cases += 1
-            ex = parsegate(src)
-            if ex === nothing
+            o = evalcode_probe(src; walkseed, nstmts, pausesper)
+            if o === nothing
                 stats.discarded += 1
                 continue
             end
-            m = freshmodule()
-            worst = nothing
-            try
-                for (mod, frag) in ExprSplitter(m, ex)
-                    fr = Frame(mod, frag)
-                    # Step a bounded number of times, checking eval_code at each
-                    # pause. Frames are checked wherever the walk lands —
-                    # including inside callees, where slots and static
-                    # parameters actually exist.
-                    for _ in 1:pausesper
-                        is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
-                        o = check_evalcode(rng, fr)
-                        if o.status !== :ok
-                            worst = o
-                            break
-                        end
-                        ret = try
-                            debug_command(interp, fr, pick(rng, (:s, :n, :se, :nc)), true)
-                        catch
-                            nothing   # program-level error ends this fragment's walk
-                        end
-                        ret === nothing && break
-                        fr, _pc = ret
-                    end
-                    worst === nothing || break
-                end
-            catch err
-                site = internalframe(stacktrace(catch_backtrace()))
-                site === nothing || (worst = EvalOutcome(:internal_error,
-                    "$(nameof(typeof(err))): $(shortstr(err))", Symbol(site[1]), 0))
-            end
-            v = worst === nothing ? agree() : evalverdict(worst)
+            v = evalverdict(o)
             if v.class === :agree
                 stats.agreed += 1
             elseif suppressed(v)
@@ -215,8 +261,15 @@ function evalcode_campaign(; n::Int=300, baseseed::Int=1, nstmts::Int=300_000,
                 else
                     push!(seen, fp)
                     stats.findings += 1
-                    @info "EVALCODE FINDING $(v.class)" seed fp detail = first(v.detail, 400)
-                    writefinding(outdir, fp, v, seed, src, src; mode=:evalcode)
+                    @info "EVALCODE FINDING $(v.class)" seed fp walkseed detail = first(v.detail, 400)
+                    shrunk = src
+                    if doshrink
+                        budget = ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)
+                        keep = evalcode_keep(fingerprint(v); walkseed, nstmts, pausesper)
+                        shrunk = render(shrink_ir(prog, keep; budget))
+                        @info "  shrunk" runs = budget.runs lines_orig = countlines(IOBuffer(src)) lines_shrunk = countlines(IOBuffer(shrunk))
+                    end
+                    writefinding(outdir, fp, v, seed, src, shrunk; mode=:evalcode, walkseed)
                 end
             end
             if progress > 0 && i % progress == 0

@@ -5,7 +5,11 @@ using Test
 using Dates   # for the corpus import-repair assertions
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
-               nstatements, Cfg, run_both, run_all, shrink, genprogram, render
+               nstatements, Cfg, run_both, run_all, shrink, genprogram, render,
+               shrink_ir, ddmin_source, ShrinkBudget, exhausted, toplevel_statements,
+               step_program, step_keep, evalcode_probe, evalcode_keep,
+               corpus_split, corpus_run, corpusverdict, quiet_stdout, writefinding,
+               Ex, St, Program, lit, IntT, SymT
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
 
 # The Supposition probes run at file scope, *outside* the testset below: a
@@ -317,7 +321,7 @@ end
             ex = FuzzJI.parsegate(src)
             ex === nothing && continue
             plain = FuzzJI.run_interp(ex; nstmts=500_000)
-            st = FuzzJI.step_program(src; rng=Xoshiro(seed), maxcmds=4000)
+            st = FuzzJI.step_program(src; walkseed=seed, maxcmds=4000)
             st === nothing && continue
             v = FuzzJI.classify_step(plain, st)
             if v.class !== :agree
@@ -532,6 +536,204 @@ end
         v2 = classify(r2...)
         @test isfinding(v2) && fingerprint(v2) == fp
         @info "shrinker" before = nstatements(prog) after = nstatements(shrunk) src = render(shrunk)
+    end
+
+    # -- the predicate shrinker, exercised without needing a real bug --------
+    # `shrink_ir` takes the property as `keep(src)::Bool`, so it can be tested
+    # against a synthetic one. A pure string-containment predicate isolates the
+    # *search* (statement removal, simplification, repair, budget) from any
+    # axis's oracle: if these fail, the shrinker is broken, not the oracle.
+    marker = St(:observe; exs=[lit(:zzmarker, SymT)])
+    inertst(i) = St(:assign, (Symbol("zz", i), IntT, true, false); exs=[lit(i, IntT)])
+    padded(k) = Program(St[], St[], St[],
+                        vcat(St[inertst(i) for i in 1:k], [marker], St[inertst(i) for i in k+1:2k]))
+
+    @testset "predicate shrinker minimizes against an arbitrary property" begin
+        prog = padded(10)                      # 20 inert statements around the marker
+        keepmarker = src -> occursin("__obs__(:zzmarker)", src)
+        budget = ShrinkBudget(; maxruns=500, seconds=60)
+        shrunk = shrink_ir(prog, keepmarker; budget)
+        @test nstatements(shrunk) < nstatements(prog)
+        @test nstatements(shrunk) <= 3          # the marker, and essentially nothing else
+        # The property must still hold, and — this is what repair buys — the
+        # result must still be a *valid program*, not just a string that happens
+        # to contain the marker.
+        src = render(shrunk)
+        @test keepmarker(src)
+        lwr = Meta.lower(Main, Meta.parseall(src))
+        @test !(Meta.isexpr(lwr, :error) || Meta.isexpr(lwr, :incomplete))
+        # A property nothing satisfies leaves the program untouched rather than
+        # returning something the predicate rejected.
+        @test nstatements(shrink_ir(prog, _ -> false;
+                                    budget=ShrinkBudget(; maxruns=40, seconds=60))) ==
+              nstatements(prog)
+    end
+
+    @testset "shrink budget caps the work spent on one finding" begin
+        prog = padded(10)
+        budget = ShrinkBudget(; maxruns=7, seconds=60)
+        shrink_ir(prog, src -> occursin("__obs__(:zzmarker)", src); budget)
+        @test budget.runs <= 7
+        @test exhausted(budget)
+        # A wall-clock cap stops it too, even with runs to spare.
+        tbudget = ShrinkBudget(; maxruns=10_000, seconds=0.0)
+        shrink_ir(prog, src -> occursin("__obs__(:zzmarker)", src); budget=tbudget)
+        @test tbudget.runs == 0
+        @test exhausted(tbudget)
+    end
+
+    @testset "ddmin shrinks source text at statement granularity" begin
+        # Corpus findings are real code, not generator IR, so they are minimized
+        # by delta debugging over parsed statements — crashmin.jl's loop, made
+        # reusable and given the same keep-predicate interface.
+        src = """
+        zd1 = 1
+        zd2 = 2
+        function zdf(x)
+            q1 = x + 1
+            q2 = q1 * 2
+            zdmarker = q2
+            q3 = zdmarker
+            return q3
+        end
+        zd3 = 3
+        """
+        budget = ShrinkBudget(; maxruns=400, seconds=60)
+        out = ddmin_source(src, s -> occursin("zdmarker", s); budget)
+        @test occursin("zdmarker", out)
+        @test length(toplevel_statements(out)) == 1          # only `zdf` survives
+        @test !occursin("zd1", out) && !occursin("zd3", out)
+        # ... and the recursion into block bodies removed the statements inside
+        # `zdf` that the property does not need.
+        @test !occursin("q3", out)
+        @test count(==('\n'), out) < count(==('\n'), src)
+        # Line-number comments from the reparse are stripped, not printed.
+        @test !occursin("#=", out)
+        # A property that does not hold at all leaves the source alone.
+        @test ddmin_source(src, _ -> false;
+                           budget=ShrinkBudget(; maxruns=40, seconds=60)) == src
+    end
+
+    @testset "step walks replay from their own seed" begin
+        # The walk used to continue the generator's RNG stream, which made the
+        # command sequence a function of the program's size: deleting a
+        # statement changed every later draw, so no shrunk candidate could be
+        # judged. It now draws from `Xoshiro(walkseed)`, so `(src, walkseed)`
+        # fully describes a run and a shrunk candidate replays the same seed.
+        src = render(genprogram(Xoshiro(3)))
+        a = step_program(src; walkseed=77, maxcmds=1500)
+        b = step_program(src; walkseed=77, maxcmds=1500)
+        @test a !== nothing && b !== nothing
+        @test a.status === b.status
+        @test a.ncommands == b.ncommands
+        @test isequal(a.obs, b.obs)
+        # The same walk seed applies unchanged to a *different* (here, shorter)
+        # program — which is the property the shrink predicate relies on.
+        @test step_program(render(genprogram(Xoshiro(4))); walkseed=77, maxcmds=1500) !== nothing
+        # The axis predicates are conservative: a program with no finding must
+        # never be reported as preserving one.
+        @test !step_keep("step_stuck-deadbeef"; walkseed=77, nstmts=500_000,
+                         maxcmds=1500, usebreakpoints=false)(src)
+    end
+
+    @testset "eval_code probes replay from their own seed" begin
+        src = render(genprogram(Xoshiro(5)))
+        a = evalcode_probe(src; walkseed=99, pausesper=10)
+        b = evalcode_probe(src; walkseed=99, pausesper=10)
+        @test a !== nothing && b !== nothing
+        @test a.status === b.status
+        @test a.nchecks == b.nchecks
+        @test a.nchecks > 0        # the axis actually checked something
+        @test !evalcode_keep("evalcode_write_lost-deadbeef"; walkseed=99,
+                             nstmts=500_000, pausesper=10)(src)
+    end
+
+    @testset "corpus findings shrink through the same interface" begin
+        # A corpus case is `prelude ++ fragments` as toplevel statements; the
+        # predicate re-splits a candidate and re-runs the pipeline, so deleting
+        # an import the fragment needs simply makes the case junk and the edit is
+        # rejected. (Here the import is recovered by corpus_run's own repair,
+        # which is why `using Dates` is droppable.)
+        src = """
+        using Dates
+        zc1 = 1 + 1
+        zc2 = [i^2 for i in 1:3]
+        function zcf(x)
+            y = x + 1
+            zcmarker = Date(2020, 1, 1)
+            y
+        end
+        zc3 = zcf(2)
+        """
+        sp = corpus_split(src)
+        @test sp !== nothing
+        @test any(isequal(:(using Dates)), sp[2])
+        @test length(sp[1].args) == 4          # prelude removed from the case
+        keep = function (s::String)
+            occursin("zcmarker", s) || return false
+            p = corpus_split(s)
+            p === nothing && return false
+            o = quiet_stdout() do
+                corpus_run(p[1], p[2]; nstmts=100_000)
+            end
+            return o.status === :ok
+        end
+        budget = ShrinkBudget(; maxruns=200, seconds=90)
+        out = ddmin_source(src, keep; budget)
+        @test count(==('\n'), out) < count(==('\n'), src)
+        @test keep(out)                        # never returns a rejected candidate
+    end
+
+    @testset "step-axis findings are written shrunk" begin
+        # End-to-end through the axis's real machinery, with a deliberately
+        # broken oracle standing in for a bug that does not exist: plain
+        # interpretation is made to *lie* about the marker observation, so any
+        # program that observes the marker classifies as a genuine
+        # `step_divergence`. Everything else is the production path — replay the
+        # walk from `walkseed`, classify against plain interpretation, require
+        # the same fingerprint — so this covers generate → step → classify →
+        # shrink → writefinding without waiting for a live finding.
+        WALKSEED = 4242
+        prog = padded(7)
+        orig = render(prog)
+        # `keep` for a given fingerprint, exactly the shape of `step_keep`.
+        stubverdict = function (s::String)
+            ex = FuzzJI.parsegate(s)
+            ex === nothing && return nothing
+            plain = FuzzJI.run_interp(ex; nstmts=500_000)
+            lying = FuzzJI.Outcome(plain.status, plain.excname,
+                                   Any[x === :zzmarker ? :notmarker : x for x in plain.obs],
+                                   "", "")
+            st = step_program(s; walkseed=WALKSEED, maxcmds=600)
+            st === nothing && return nothing
+            return FuzzJI.classify_step(lying, st)
+        end
+        v0 = stubverdict(orig)
+        @test v0 !== nothing && v0.class === :step_divergence
+        fp0 = fingerprint(v0)
+        stubkeep = function (s::String)
+            v = stubverdict(s)
+            return v !== nothing && isfinding(v) && fingerprint(v) == fp0
+        end
+        budget = ShrinkBudget(; maxruns=200, seconds=90)
+        shrunk = render(shrink_ir(prog, stubkeep; budget))
+        @test length(shrunk) < length(orig)
+        # The shrunk program still reproduces the *same class and salt* under a
+        # replay of the same walk seed — the criterion the real predicate uses.
+        @test stubkeep(shrunk)
+        @test fingerprint(stubverdict(shrunk)) == fp0
+        # writefinding records both programs plus the walk seed, so the report
+        # describes the run and not just the source.
+        mktempdir() do dir
+            d = writefinding(dir, "step-stub", v0, 1, orig, shrunk; mode=:step, walkseed=WALKSEED)
+            meta = read(joinpath(d, "meta.md"), String)
+            @test occursin("walk seed: `$WALKSEED`", meta)
+            @test occursin(shrunk, meta) && occursin(orig, meta)
+            @test occursin("# walk seed: $WALKSEED", read(joinpath(d, "repro.jl"), String))
+        end
+        @info "step-axis shrink (stub oracle)" runs = budget.runs
+        @info "  before" src = orig
+        @info "  after" src = shrunk
     end
 
 end

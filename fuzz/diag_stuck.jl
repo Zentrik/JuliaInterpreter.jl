@@ -1,16 +1,20 @@
 # Diagnose a step_stuck / long-walk report for one seed.
 #
-#   julia --project=fuzz fuzz/diag_stuck.jl SEED [MAXCMDS]
+#   julia --project=fuzz fuzz/diag_stuck.jl SEED [MAXCMDS] [WALKSEED]
 #
 # Answers the two questions triage actually needs: *which command* fails to
 # advance, and *what statement* it is sitting on when it does. A command budget
 # only ever said "this took a while", which is not the same thing — with
 # break-on-error armed, `:c` legitimately stops at every throw.
 #
-# The RNG stream must match the campaign exactly or the command sequence
-# differs and the report will not reproduce: step_campaign seeds one RNG, uses
-# it for generation, then continues the same stream into the walk (including
-# the break-on-error coin flip).
+# Reproducing a report means reproducing its *walk*, and the walk has its own
+# seed. `step_campaign` seeds one RNG from the case seed, generates the program
+# with it, then draws `walkseed` from it and runs the walk on a fresh
+# `Xoshiro(walkseed)` — the separation that makes the axis shrinkable (see
+# src/stepfuzz.jl). This script mirrors that derivation, so SEED alone
+# reproduces a campaign case; pass WALKSEED explicitly (findings record it in
+# meta.md) to replay a walk against a *shrunk* program, whose generator seed no
+# longer produces the source.
 
 include(joinpath(@__DIR__, "src", "FuzzJI.jl"))
 using .FuzzJI
@@ -23,13 +27,17 @@ using JuliaInterpreter: debug_command, Frame, BreakpointRef, is_toplevel_frame, 
 seed = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 20168
 maxcmds = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 20000
 
-rng = Xoshiro(seed)
-prog = genprogram(rng)
+genrng = Xoshiro(seed)
+prog = genprogram(genrng)
 src = render(prog)
 ex = parsegate(src)
 ex === nothing && error("seed $seed did not survive the parse gate")
 
-println("=== seed $seed: ", count(==('\n'), src), "-line program ===")
+# Same derivation step_campaign uses, unless the caller supplied the walk seed.
+walkseed = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : rand(genrng, 1:typemax(Int))
+rng = Xoshiro(walkseed)
+
+println("=== seed $seed (walk seed $walkseed): ", count(==('\n'), src), "-line program ===")
 
 m = freshmodule()
 interp = JuliaInterpreter.RecursiveInterpreter()

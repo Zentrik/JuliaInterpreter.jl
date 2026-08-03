@@ -30,9 +30,18 @@
 #      preambles, self-field-access wrappers) — all of which are "the debugger
 #      ran the wrong statements", invisible without this check.
 #
-# Nondeterminism note: `:c` with no breakpoints runs to completion, and command
-# sequences are drawn from the same seeded RNG as the program, so a finding
-# reproduces from (seed, mode).
+# Replay note. The command walk draws from its own `Xoshiro(walkseed)`, not from
+# the generator's stream. That separation is what makes this axis shrinkable: if
+# the walk continued the generator's RNG, deleting a statement would change every
+# draw the walk makes afterwards, so a shrunk program could never be replayed
+# with a comparable command sequence and no shrink step could be judged. With an
+# independent seed, `(src, walkseed)` reproduces a walk exactly, and a *shrunk*
+# `src` replays the same seed from scratch.
+#
+# What replay does NOT promise is an identical command trace. A shorter program
+# has fewer pause points, so the same draws land on different statements and the
+# walk legitimately diverges. The shrink predicate therefore asks for the same
+# verdict *class* (and fingerprint salt), never for trace equality.
 
 using JuliaInterpreter: debug_command, root, leaf, BreakpointRef, Frame,
                         break_on, break_off, breakpoint, remove, is_toplevel_frame
@@ -153,14 +162,19 @@ function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds
 end
 
 """
-    step_program(src; nstmts, interp, seed, breakpoints) -> StepOutcome
+    step_program(src; walkseed, interp, maxcmds, usebreakpoints) -> StepOutcome
 
 Execute `src` through `ExprSplitter`, driving every fragment with a random
 `debug_command` walk instead of running it. Returns what happened plus the
 observation stream the stepped program produced.
+
+The walk is driven by a fresh `Xoshiro(walkseed)`, independent of whatever
+randomness produced `src`; `(src, walkseed)` is therefore a complete description
+of the run, which is what makes the axis replayable and hence shrinkable.
 """
-function step_program(src::String; rng::AbstractRNG, interp::Interpreter=RecursiveInterpreter(),
+function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveInterpreter(),
                       maxcmds::Int=4000, usebreakpoints::Bool=false)
+    rng = Xoshiro(walkseed)
     ex = parsegate(src)
     ex === nothing && return nothing
     m = freshmodule()
@@ -260,6 +274,33 @@ function classify_step(plain::Outcome, st::StepOutcome)::Verdict
 end
 
 """
+    step_keep(fp; walkseed, nstmts, maxcmds, usebreakpoints) -> keep
+
+The stepping axis's property as a `keep(src)::Bool` predicate, for the shared
+shrinker. Replays the *same* `walkseed` walk on the candidate source and asks
+whether the verdict still has fingerprint `fp` — i.e. the same class and the
+same salt (the stuck command for `step_stuck`, the innermost JuliaInterpreter
+function for a step-only/divergent throw, the divergent observation's shape for
+`step_divergence`).
+
+Exact command-sequence equality is deliberately *not* required: a shrunk
+program has fewer pause points, so the same draws produce a different trace.
+Class preservation is the criterion, and it is the one the report is about.
+"""
+function step_keep(fp::String; walkseed::Int, nstmts::Int, maxcmds::Int,
+                   usebreakpoints::Bool)
+    return function (src::String)
+        ex = parsegate(src)
+        ex === nothing && return false
+        plain = run_interp(ex; nstmts, interp=RecursiveInterpreter())
+        st = step_program(src; walkseed, maxcmds, usebreakpoints)
+        st === nothing && return false
+        v = classify_step(plain, st)
+        return isfinding(v) && fingerprint(v) == fp
+    end
+end
+
+"""
     step_campaign(; n, baseseed, ...) -> Stats
 
 Generate programs, run each normally, then drive the same program through a
@@ -271,7 +312,8 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                        journaldir::String=joinpath(@__DIR__, "..", "journal"),
                        cfg::Cfg=Cfg(), progress::Int=50, maxcmds::Int=4000,
                        seeddisk::Bool=true, journalsync::Bool=true,
-                       usebreakpoints::Bool=true)
+                       usebreakpoints::Bool=true, doshrink::Bool=true,
+                       shrinkruns::Int=150, shrinksecs::Real=180.0)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
@@ -285,6 +327,13 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
             rng = Xoshiro(seed)
             prog = genprogram(rng, cfg)
             src = render(prog)
+            # The walk gets its own seed, drawn from the generator's stream so a
+            # case still reproduces from `seed` alone, but consumed through a
+            # *fresh* Xoshiro. Continuing the generator's stream into the walk
+            # (what this axis used to do) makes the command sequence a function
+            # of the program's size, so no edited candidate can be replayed —
+            # see the replay note at the top of this file.
+            walkseed = rand(rng, 1:typemax(Int))
             journal_case!(j, seed, src)
             stats.cases += 1
             ex = parsegate(src)
@@ -297,7 +346,7 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
             # changes the answer, and any interp-vs-compiled divergence is the
             # other axis's job to report.
             plain = run_interp(ex; nstmts, interp=RecursiveInterpreter())
-            st = step_program(src; rng, maxcmds, usebreakpoints)
+            st = step_program(src; walkseed, maxcmds, usebreakpoints)
             if st === nothing
                 stats.discarded += 1
                 continue
@@ -316,8 +365,15 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                 else
                     push!(seen, fp)
                     stats.findings += 1
-                    @info "STEP FINDING $(v.class)" seed fp ncommands = st.ncommands detail = first(v.detail, 400)
-                    writefinding(outdir, fp, v, seed, src, src; mode=:step)
+                    @info "STEP FINDING $(v.class)" seed fp walkseed ncommands = st.ncommands detail = first(v.detail, 400)
+                    shrunk = src
+                    if doshrink
+                        budget = ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs)
+                        keep = step_keep(fingerprint(v); walkseed, nstmts, maxcmds, usebreakpoints)
+                        shrunk = render(shrink_ir(prog, keep; budget))
+                        @info "  shrunk" runs = budget.runs lines_orig = countlines(IOBuffer(src)) lines_shrunk = countlines(IOBuffer(shrunk))
+                    end
+                    writefinding(outdir, fp, v, seed, src, shrunk; mode=:step, walkseed)
                 end
             end
             if progress > 0 && i % progress == 0
