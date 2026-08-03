@@ -27,7 +27,10 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
                       walkseed::Union{Nothing,Int}=nothing)
     dir = joinpath(outdir, fp)
     mkpath(dir)
-    reprocall = mode === :cmp ? "reprorun(SRC; compiled=true)" : "reprorun(SRC)"
+    # The split axis's verdicts are mostly about the *module tree*, so its
+    # reproducer has to compare that too — `reprorun` only diffs observations.
+    reprocall = mode === :cmp   ? "reprorun(SRC; compiled=true)" :
+                mode === :split ? "reprosplit(SRC)" : "reprorun(SRC)"
     # The stepping/eval_code/corpus axes drive their own walk from `walkseed`;
     # without it the reported source alone does not describe the run.
     walkline = walkseed === nothing ? "" : "\n# walk seed: $walkseed"

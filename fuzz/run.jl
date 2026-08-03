@@ -27,6 +27,12 @@
 #   native — seeded-RNG loop (one integer seed per candidate); the only mode
 #     with the crash-safe journal, so use it when hunting worker crashes:
 #     while true; julia --project=fuzz fuzz/run.jl --engine native --n 100000 --seed $RANDOM; done
+#   split — the ExprSplitter axis: adversarial *toplevel forms* (nested modules,
+#     baremodules, unsplittable blocks, toplevel macros, docstrings, odd
+#     declarations) run through ExprSplitter + Frame and compared against
+#     Core.eval on failure mode, observation stream, and the resulting module
+#     tree. Targets construct.jl. --splitdepth bounds module nesting,
+#     --maxfrags the iteration budget.
 #   step — the debugger axis: drives each generated program through a random
 #     debug_command walk instead of running it, asserting that stepping
 #     terminates, raises no internal error, and reaches the same observations
@@ -48,6 +54,7 @@ function parseargs(args)
                          "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false,
                          "maxsplice" => 3, "nostep" => false,
                          "shrinkruns" => nothing, "shrinksecs" => nothing,
+                         "splitdepth" => 3, "maxfrags" => 4000,
                          "journaldir" => joinpath(@__DIR__, "journal"))
     # Cfg overrides start unset (nothing) and fall through to the profile default.
     for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop", "bodystmts")
@@ -92,6 +99,10 @@ function parseargs(args)
             o["maxsplice"] = parse(Int, args[i += 1])
         elseif a == "--nostep"         # corpus engine: run only, don't also step
             o["nostep"] = true
+        elseif a == "--splitdepth"     # split engine: max module nesting depth
+            o["splitdepth"] = parse(Int, args[i += 1])
+        elseif a == "--maxfrags"       # split engine: ExprSplitter iteration budget
+            o["maxfrags"] = parse(Int, args[i += 1])
         elseif a == "--journaldir"     # per-shard journal: current.jl is one file,
             o["journaldir"] = args[i += 1]   # so concurrent shards must not share it
         elseif a == "--patience"       # consecutive empty supposition rounds before stopping
@@ -186,6 +197,13 @@ elseif o["engine"] == "evalcode"
                               doshrink=!o["noshrink"], journaldir=o["journaldir"], shrinkopts...)
     @info "evalcode campaign complete" stats.cases stats.agreed stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
+elseif o["engine"] == "split"
+    stats = split_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
+                           cfg=SplitCfg(maxdepth=o["splitdepth"], maxfrags=o["maxfrags"]),
+                           seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                           journaldir=o["journaldir"])
+    @info "split campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
+    exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "corpus"
     stats = corpus_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
                             maxsplice=o["maxsplice"], maxcmds=o["maxcmds"],
@@ -194,5 +212,5 @@ elseif o["engine"] == "corpus"
     @info "corpus campaign complete" stats.cases ran = stats.agreed - stats.aborted discarded_junk = stats.aborted stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 else
-    error("unknown engine $(o["engine"]) (expected: supposition | native | step | evalcode | corpus)")
+    error("unknown engine $(o["engine"]) (expected: supposition | native | step | evalcode | corpus | split)")
 end

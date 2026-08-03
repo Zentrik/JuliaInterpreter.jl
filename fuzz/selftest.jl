@@ -12,6 +12,9 @@ using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                Ex, St, Program, lit, IntT, SymT,
                outcomeeq, confirm, confirmed, confirmsrc, confirmreport, nondetverdict
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
+# The standalone reproducer library every findings/*/repro.jl includes. Loaded
+# here so the artifact a human triages is covered by the suite too.
+include(joinpath(@__DIR__, "reprolib.jl"))
 
 # The triage CLI, loaded as a library: its `if abspath(PROGRAM_FILE) == @__FILE__`
 # guard keeps `main` from running when it is included rather than executed.
@@ -259,6 +262,24 @@ end
             __obs__(r2)
         end
         """,
+        # Regression: `__fjnorm__` used to observe a type as its *module-
+        # qualified* name, so a type the program itself defined read as
+        # `Main.FJ95.ZT` on one side and `Main.FJ96.ZT` on the other — a
+        # divergence manufactured entirely by the harness (the split axis
+        # produced 16 of them in 5000 cases before the normalizer was fixed).
+        # Type parameters must still survive the scrubbing.
+        "observing a locally-defined type is module-independent" => """
+        abstract type ZAT end
+        struct ZT <: ZAT
+            a::Int
+        end
+        __obs__(ZT)
+        __obs__(ZAT)
+        __obs__(typeof(ZT(1)))
+        __obs__(Vector{Int})
+        __obs__(Vector{Float64})
+        __obs__(Vector{ZT})
+        """,
         "opaque closure / invoke / atomics-builtin probes" => """
         let
             __obs__(try (Base.Experimental.@opaque x -> x + 1)(41) catch __e; (:__thrown, nameof(typeof(__e))) end)
@@ -499,6 +520,203 @@ end
             end
         end
         @test nbad == 0
+    end
+
+    @testset "ExprSplitter axis: generator validity" begin
+        # Same contract as the IR generator's: every seed must produce a
+        # parseable toplevel program. A template that emits something Julia
+        # rejects would otherwise show up as an oracle "finding" about the
+        # generator (module inside `begin`, misplaced `global`, a macro defined
+        # and invoked in the same block — all of which this generator is
+        # explicitly built to avoid).
+        nbad = 0
+        for seed in 1:150
+            src = FuzzJI.gensplit(Xoshiro(seed))
+            ex = try
+                Meta.parseall(src)
+            catch err
+                nbad += 1
+                @error "split generator parse failure" seed err src
+                continue
+            end
+            (ex isa Expr && ex.head === :toplevel) || (nbad += 1; @error "not toplevel" seed src)
+        end
+        @test nbad == 0
+        # Determinism: a seed reproduces a case exactly (the reproducer contract).
+        @test FuzzJI.gensplit(Xoshiro(7)) == FuzzJI.gensplit(Xoshiro(7))
+        # And the axis must actually emit the shapes it exists for. A generator
+        # regression that quietly stopped producing modules or macros would
+        # leave every campaign green while testing nothing.
+        srcs = [FuzzJI.gensplit(Xoshiro(seed)) for seed in 1:150]
+        hasany(pat) = count(s -> occursin(pat, s), srcs)
+        @test hasany(r"(?m)^\s*module ") >= 30            # measured 75/150
+        @test hasany(r"(?m)^\s*baremodule ") >= 10        # 37/150
+        @test hasany(r"(?m)^\s*macro ") >= 20             # 69/150
+        @test hasany(r"Expr\(:toplevel") >= 10            # 42/150
+        @test hasany(r"(?m)^\s*local ") >= 10             # 43/150
+        @test hasany(r"(?m)^\s*global \w+$") >= 10        # 45/150
+        @test hasany(r"(?m)^\s*import \.") >= 20          # 72/150
+        @test hasany(r"(?m)^\s*let ") >= 10               # 34/150 (unsplittable scope block)
+        @test hasany(r"(?m)^\s*try$") >= 10               # 32/150
+        @test hasany(r"(?m)^\s*abstract type ") >= 20     # 67/150
+        @test hasany(r"doc: \$\(") >= 10                  # 33/150 (interpolating module doc)
+    end
+
+    @testset "ExprSplitter axis: module-state comparator" begin
+        # Unit-test the comparator itself on hand-built modules, since a planted
+        # `split_internal_error` is not something one can write down: the point
+        # is to prove the oracle *can* fire and *does not* fire spuriously.
+        modstate, statediff = FuzzJI.modstate, FuzzJI.statediff
+        a, b = FuzzJI.freshmodule(), FuzzJI.freshmodule()
+        for m in (a, b)
+            Core.eval(m, :(const zk = 5))
+            Core.eval(m, :(zf() = 1))
+            Core.eval(m, :(module ZSub; const zi = 7; end))
+        end
+        # Two modules built the same way must compare equal — the prelude, the
+        # module's own self-binding, `eval`/`include` and every '#'-prefixed
+        # compiler/docsystem name have to be excluded for this to hold, and the
+        # two root modules have different names by construction.
+        @test statediff(modstate(a), modstate(b)) === nothing
+        @test haskey(modstate(a), "zk") && modstate(a)["zk"] == 5
+        @test modstate(a)["ZSub"] === :__submodule__
+        @test modstate(a)["ZSub.zi"] == 7      # recursion into generated submodules
+        # A name defined on one side only.
+        Core.eval(b, :(const zextra = 1))
+        d = statediff(modstate(a), modstate(b))
+        @test d !== nothing && d[1] === :missing && d[2] == "zextra"
+        @test d[3] === FuzzJI.STATE_MISSING
+        # A value divergence, including one buried in a submodule.
+        c = FuzzJI.freshmodule()
+        Core.eval(c, :(const zk = 5)); Core.eval(c, :(zf() = 1))
+        Core.eval(c, :(module ZSub; const zi = 8; end))
+        d2 = statediff(modstate(a), modstate(c))
+        @test d2 !== nothing && d2[1] === :value && d2[2] == "ZSub.zi" && d2[3] == 7 && d2[4] == 8
+        # Type divergences count: `isequal(7, 7.0)` is true, so a comparator
+        # built on `isequal` alone would miss a conversion bug.
+        e = FuzzJI.freshmodule()
+        Core.eval(e, :(const zk = 5.0)); Core.eval(e, :(zf() = 1))
+        Core.eval(e, :(module ZSub; const zi = 7; end))
+        @test statediff(modstate(a), modstate(e))[2] == "zk"
+        # Identity is scrubbed, not compared: two independently created
+        # functions/types/modules must not read as a divergence just because
+        # they live in differently-named modules.
+        @test FuzzJI.normstate(a) === Symbol("__module__:", nameof(a))
+        @test FuzzJI.normstate(sin) === Symbol("__fn__:sin")
+        @test FuzzJI.normstate(Int) === Symbol("__type__:Int64")
+        @test FuzzJI.normstate(x -> x) === Symbol("__fn__:__anon__")   # gensym'd name
+    end
+
+    @testset "ExprSplitter axis: verdicts and fingerprints" begin
+        cs = FuzzJI.classify_split
+        SO = FuzzJI.SplitOutcome
+        st(pairs...) = Dict{String,Any}(pairs...)
+        done(state, obs...) = SO(:done, :none, Any[obs...], state, "", :none, 3)
+        threw(exc, state, obs...) = SO(:threw, exc, Any[obs...], state, "d", :none, 3)
+        @test cs(done(st("a" => 1)), done(st("a" => 1))).class === :agree
+        # A definition the interpreted path never made.
+        v = cs(done(st("a" => 1, "b" => 2)), done(st("a" => 1)))
+        @test v.class === :split_missing_effect
+        @test cs(done(st("a" => 1)), done(st("a" => 2))).class === :split_missing_effect
+        # Observation streams are compared too.
+        @test cs(done(st(), 1, 2), done(st(), 1, 3)).class === :split_missing_effect
+        # Failure-mode classes.
+        @test cs(done(st()), threw(:UndefVarError, st())).class === :split_only_throw
+        @test cs(threw(:UndefVarError, st()), done(st())).class === :eval_only_throw
+        @test cs(threw(:UndefVarError, st()), threw(:MethodError, st())).class ===
+              :split_exception_divergence
+        # Both sides throwing the same thing is agreement, not a finding: a
+        # `baremodule` that reaches for `+` has no Base, and *both* engines are
+        # supposed to fail on it.
+        @test cs(threw(:UndefVarError, st(), 1), threw(:UndefVarError, st(), 1)).class === :agree
+        # An error raised inside JuliaInterpreter's own code is routed to its own
+        # class and salted with the function, so distinct internal breakages get
+        # distinct dedup buckets — but the *decision* that it is a finding came
+        # from the differential above, never from the backtrace.
+        internal = SO(:threw, :MethodError, Any[], st(), "d", :queuenext!, 3)
+        @test cs(done(st()), internal).class === :split_internal_error
+        other = SO(:threw, :MethodError, Any[], st(), "d", :find_or_create_module, 3)
+        @test fingerprint(cs(done(st()), internal)) != fingerprint(cs(done(st()), other))
+        # Budget exhaustion is a tracked discard on either side.
+        @test cs(done(st()), SO(:aborted)).class === :aborted
+        @test !isfinding(cs(done(st()), SO(:aborted)))
+        # Unrelated state divergences must not collapse into one bucket: the
+        # first one reported would otherwise mask every later one.
+        vmissing = cs(done(st("a" => 1, "b" => 2)), done(st("a" => 1)))
+        vvalue = cs(done(st("a" => 1)), done(st("a" => 2)))
+        @test fingerprint(vmissing) != fingerprint(vvalue)
+        vsub = cs(done(st("a" => 1, "M" => :__submodule__)), done(st("a" => 1)))
+        @test fingerprint(vsub) != fingerprint(vmissing)
+    end
+
+    @testset "ExprSplitter axis: known-agree smoke batch" begin
+        # The real oracle on real generated programs. Any finding here is either
+        # a harness miscalibration or a genuine ExprSplitter bug — triage before
+        # shipping either way.
+        nbad = 0
+        ndiscarded = 0
+        for seed in 1:40
+            src = FuzzJI.gensplit(Xoshiro(seed))
+            r = FuzzJI.split_case(src; nstmts=300_000, maxfrags=4000)
+            if r === nothing
+                ndiscarded += 1
+                continue
+            end
+            v = r[1]
+            if isfinding(v)
+                nbad += 1
+                @warn "split divergence (a real finding — triage it!)" seed v.class v.detail src
+            end
+        end
+        @test nbad == 0
+        # A campaign that discarded everything would report a perfect
+        # agreement line while testing nothing.
+        @test ndiscarded == 0
+        # ... and the cases must genuinely reach ExprSplitter: fragments, module
+        # tree and observations all non-trivial.
+        o = FuzzJI.split_interp(Meta.parseall(FuzzJI.gensplit(Xoshiro(3)));
+                                nstmts=300_000, maxfrags=4000)
+        @test o.status === :done
+        @test o.nfrags >= 3
+        @test !isempty(o.state)
+        # Both budgets must actually bite, and bite as *discards*: a starved run
+        # has a truncated module tree, and reporting that as a missing effect
+        # would make every slow program a finding.
+        starved = [FuzzJI.split_case(FuzzJI.gensplit(Xoshiro(seed)); nstmts=40, maxfrags=4000)
+                   for seed in 1:20]
+        @test count(r -> r !== nothing && r[1].class === :aborted, starved) >= 15
+        @test !any(r -> r !== nothing && isfinding(r[1]), starved)
+        fragstarved = [FuzzJI.split_case(FuzzJI.gensplit(Xoshiro(seed)); maxfrags=2)
+                       for seed in 1:20]
+        @test count(r -> r !== nothing && r[1].class === :aborted, fragstarved) >= 15
+        @test !any(r -> r !== nothing && isfinding(r[1]), fragstarved)
+    end
+
+    @testset "ExprSplitter axis: the reproducer reproduces" begin
+        # `findings/*/repro.jl` is what a human actually runs, and for this axis
+        # it has to compare the module tree — `reprorun` only diffs observation
+        # streams, which is exactly what the main verdict class does *not* use.
+        # Quiet: the reproducer prints its report by design.
+        function quiet(f)
+            path, io = mktemp()
+            r = try
+                redirect_stdout(f, io)
+            finally
+                close(io)
+            end
+            return (r, read(path, String))
+        end
+        agreeing, _ = quiet(() -> reprosplit(FuzzJI.gensplit(Xoshiro(3))))
+        @test agreeing == false                      # nothing to reproduce
+        # A source where the two paths genuinely differ: `module` inside `begin`
+        # is not valid Julia, so `Core.eval` refuses it while `ExprSplitter`
+        # splits the block first and creates the module. Not an interpreter bug
+        # (which is why the generator never emits it) but a real, stable
+        # difference — the ideal fixture for "can the reproducer see one".
+        diverging, out = quiet(() -> reprosplit("begin\nmodule ZRB\nconst q = 7\nend\nend\n"))
+        @test diverging == true
+        @test occursin("DIVERGENCE REPRODUCED", out)
+        @test occursin("ZRB.q", out)                 # the missing binding is named
     end
 
     @testset "canary: pipeline detects a genuine known divergence" begin

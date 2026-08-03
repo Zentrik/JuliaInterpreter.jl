@@ -284,7 +284,13 @@ function __fjnorm__(x)
     elseif x isa Function
         return :__fn__
     elseif x isa Type
-        return Symbol(string(x))
+        # `string(T)` is module-qualified, and the two sides run in differently
+        # named fresh modules — so a type the program itself defined renders as
+        # `Main.FJ95.M1.S` on one side and `Main.FJ96.M1.S` on the other, a
+        # divergence manufactured entirely by the harness. Strip this module's
+        # own prefix; the rest of the name (including type parameters, so
+        # `Vector{Int}` and `Vector{Float64}` stay distinct) is preserved.
+        return Symbol(replace(string(x), string(@__MODULE__, ".") => ""))
     else
         return Symbol(nameof(typeof(x)))
     end

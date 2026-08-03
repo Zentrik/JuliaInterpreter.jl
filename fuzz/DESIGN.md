@@ -29,6 +29,7 @@ julia --project=fuzz fuzz/run.jl --engine native --modes rec --n 10000  # recurs
 julia --project=fuzz fuzz/run.jl --engine step --n 5000         # debugger/stepping axis
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 2000      # eval_code at paused frames
 julia --project=fuzz fuzz/run.jl --engine corpus --n 5000        # real Julia source, spliced
+julia --project=fuzz fuzz/run.jl --engine split --n 5000          # adversarial toplevel forms (ExprSplitter)
 julia --project=fuzz fuzz/run.jl --engine native --n 5000 --big --fresh  # larger programs, re-report known buckets
 julia --project=fuzz fuzz/metrics.jl --n 500                    # what the generator actually produces
 ```
@@ -331,6 +332,73 @@ Programs are stepped to a series of pause points; at each one:
 
 No determinism is required, so this works at any pause in any frame.
 
+### The ExprSplitter axis (`splitfuzz.jl`)
+
+`--engine split`. `src/construct.jl` has the densest fix history in the package
+(9 fix commits), and nearly all of it is `ExprSplitter`: how a chunk of source
+is carved into `(module, expression)` pairs that `Frame` can each evaluate.
+Every other axis exercises it *incidentally* — the IR generator emits one flat
+module, so nested `module` blocks, `baremodule`, toplevel macros, docstrings and
+odd declarations never appear, and none of the machinery the fix history is
+about ever runs.
+
+This axis therefore does not use the IR grammar at all. It is a **template
+combinator** over a seeded RNG that emits toplevel *shapes*: nested `module` and
+`baremodule` blocks (with and without `using Base`), bare `begin` blocks —
+including the `local`-declaring kind `ExprSplitter` must refuse to descend into
+(issue #427) — `if` at toplevel wrapping definitions, macros defined *in the
+program* that expand to several statements or to an `Expr(:toplevel, ...)` or to
+a bare `global` declaration, `const`/`global`/typed-global declarations in odd
+positions, definitions inside nested modules, qualified cross-module references
+(`M1.M2.f()`) reached through relative imports, docstrings on
+functions/consts/structs/modules, and empty/comment-only sections. Programs
+terminate by construction: no loops and no recursion are generated at all.
+
+The oracle is differential against compiled Julia (`Core.eval` per toplevel
+statement in a fresh module), in two halves:
+
+| class | meaning |
+|---|---|
+| `split_internal_error` | compiled Julia ran the program; the `ExprSplitter` path threw, and the throw surfaced inside JuliaInterpreter's own code |
+| `split_only_throw` | same, but the throw surfaced outside the package |
+| `eval_only_throw` | `Core.eval` threw and the `ExprSplitter` path completed |
+| `split_exception_divergence` | both threw, different exception types |
+| `split_missing_effect` | both ran (or both threw the same thing) but the resulting **module state** or the observation stream differs |
+| `aborted` | statement or fragment budget exhausted → tracked discard |
+
+`split_missing_effect` is the reason this axis exists in its own file. Programs
+here mostly *define* things rather than compute them, so the observation stream
+is a weak oracle; the strong one is the module tree. After both runs,
+`modstate` walks every name defined in the root module and recursively in the
+submodules the program created, and normalizes each value the way `SETUP_SRC`'s
+`__fjnorm__` does — module, function and type *identity* scrubbed to bare names,
+scalars/strings/symbols compared structurally, struct instances compared by type
+name plus fields. Excluded: everything starting with `#` (closure/`struct` type
+names and the docsystem's gensym'd META binding), each module's automatic
+`eval`/`include`/self-binding, and the harness prelude (`__OBS__`, `__obs__`,
+`__fjnorm__`). A definition the interpreted path silently skipped — the
+historical `ExprSplitter` failure mode — surfaces as a name present on one side
+and absent on the other rather than as nothing at all.
+
+Which throw is a finding is decided *only* by the differential, never by the
+backtrace (a program-thrown exception unwinds through interpreter frames too);
+the innermost JuliaInterpreter function is used solely to split internal errors
+into their own dedup buckets. Two harness obligations are worth knowing:
+`Base.invokelatest` wraps both `ExprSplitter` and `Frame` construction, because
+both expand macros — and the program's own macros, like the prelude's `__obs__`,
+were defined after the harness function's world; and the *reference* side is run
+first, so a program that is not valid Julia at all (a syntax error) is discarded
+rather than compared.
+
+Two divergences are known-legitimate and designed out of the generator rather
+than suppressed (suppressing them would also hide a real bug of the same shape):
+duplicate `module M` names in one parent, where `find_or_create_module`
+deliberately *reuses* the existing module while `Core.eval` replaces it
+(documented in the `ExprSplitter` docstring — so every module gets a unique
+name); and `module`/bare `global`/define-and-invoke-a-macro inside a
+`begin`/`if`, all of which Julia itself rejects, so `ExprSplitter`'s greater
+permissiveness there is about invalid input rather than about the interpreter.
+
 ### The corpus axis (`corpus.jl`)
 
 `--engine corpus`. A grammar only emits constructs someone wrote a rule for;
@@ -476,7 +544,12 @@ two-engine oracle.
 
 Excluded from the grammar: I/O, `eval`/`include`, `ccall`/pointers/`unsafe_*`,
 tasks/threads (see roadmap), timing, `objectid`, method redefinition.
-Normalized away: module names, closure/struct type identity, function values.
+Normalized away: module names, closure/struct type identity, function values,
+and the *module prefix of a type name* — `string(T)` is module-qualified, so a
+type the program defined reads as `Main.FJ95.ZT` on one side and `Main.FJ96.ZT`
+on the other; `__fjnorm__` strips its own module's prefix and keeps the rest
+(type parameters included). The split axis produced 16 such false divergences
+in 5000 cases before that was fixed.
 Handled: RNG (both sides could seed identically; the grammar currently
 doesn't call `rand`), stack depth (fueled recursion keeps it shallow;
 `StackOverflowError` asymmetries would classify as `exception_divergence`
@@ -505,12 +578,15 @@ and belong in `SUPPRESSIONS` if hit).
   property as a `keep(src)::Bool` predicate, the stepping/eval_code/corpus
   walks got their own replayable seeds, and corpus findings are minimized by a
   statement-level delta debugger shared with `crashmin.jl`. See Shrinking,
-  above.
+  above. (The split axis, added after, still writes findings unshrunk.)
+- **M3.7 — ExprSplitter axis** (done): `--engine split` feeds `construct.jl`
+  adversarial toplevel forms from a template-combinator generator, with a
+  module-tree effect oracle on top of the failure-mode one.
 - **Finding-intake hardening** (done, `NEXT.md` item 1, minus the rr step):
   the confirm-on-divergence gate above, and `fuzz/triage.jl` for version-aware
   attribution of what broke.
-- Still open, in priority order: semantic coverage (above), an `ExprSplitter`
-  axis, throughput, EMI, a nightly CI job. Structured
+- Still open, in priority order: semantic coverage (above), throughput, EMI,
+  a nightly CI job. Structured
   concurrency (`@sync`/`@async` with observations only from the root task) and
   a **pluggable lowerer** — the lowering step as an injectable function, so a
   JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
