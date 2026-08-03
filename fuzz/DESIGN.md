@@ -197,6 +197,35 @@ earlier waves designed out):
   (MethodError construction / localmethtable misses, and errors thrown deep
   inside interpreted callees propagating through interpreted frames).
 
+Determinism-unlock grammar (`determinism.md` §3/§4; gated by the `:rng`/`:dict`/
+`:vtime` swarm features and a `:determinism` policy):
+
+- **explicit RNG.** `const __RNG__ = Xoshiro(seed)` is baked into the rendered
+  program as a *literal* seed (`Program.rngseed`, `render.jl`) — not a harness
+  global — so both engines seed identically and run the same pure-Julia Xoshiro
+  transitions, agreeing bit-for-bit (`SETUP_SRC` gains `using Random`). Rules
+  `rand(__RNG__, Int)`, `rand(__RNG__, 1:n)`, `rand(__RNG__, Bool)`,
+  `rand(__RNG__)`, `randn(__RNG__)` feed the Int/Float/Bool expression menus, so
+  rand-derived values reach guarded indices, `if`/`while` conditions, and a
+  rand-derived `for` trip count (`for i in 1:rand(__RNG__, 0:maxloop)`) —
+  data-dependent control flow the guarded rules previously lacked. Termination
+  stays by construction: rand supplies loop *counts* (capped at `maxloop`),
+  never while-fuel;
+- **content-keyed `Dict`/`Set`** (new `DictT`/`SetT`/`CharT` summaries), keyed
+  by the content-hashed whitelist — Int/String/Symbol/Char/Bool and tuples of
+  those — whose `hash` is identical across the two engines, so iteration order
+  is too and the *full value oracle* applies (not the failure-mode one). Rules
+  for construction, `get`/`get!`/`haskey`/`in`/`length`, `setindex!`
+  (`d[k]=v`)/`delete!`/`push!`, and `keys`/`values`/whole-container/`length`
+  observations; `__fjnorm__` normalizes `AbstractDict`/`AbstractSet` to sorted
+  normalized contents. Mutable/objectid-keyed containers (class X) are
+  unreachable — the key menus never offer a mutable summary;
+- **virtual clock.** `__vtime__()` (a monotone counter in `SETUP_SRC`) is in the
+  Int menu, so deadline/elapsed-shaped control flow (`while __vtime__() < N`,
+  fuel still governing termination) becomes generable. Deterministic because
+  both sides call it the same number of times in the same order. The ENV/fs
+  doubles from `determinism.md` §3 are deferred (NEXT.md item 5).
+
 ### The builtins prober (`probes.jl`)
 
 `src/builtins.jl` is itself *generated*, by `bin/generate_builtins.jl`, which
@@ -479,13 +508,39 @@ this repo's tests — and splices `1:maxsplice` of them into one module,
 producing combinations that exist in no file.
 
 Real code is neither deterministic nor terminating, so the differential
-*value* oracle cannot be used on it. The oracle is differential on **failure
-mode only**: run the fragment with `Core.eval`; if that throws, the fragment
-does not stand alone (a snippet lifted out of a test file references names its
-file imported) and the case is discarded as junk. Only "compiled Julia ran
-this and the interpreter did not" is reported, plus the stepping invariants
-from the axis above. Comparing whether execution failed, never what it
-computed, is what makes nondeterministic real code usable as input.
+*value* oracle cannot be used on it *in general*. But determinism is a
+per-fragment, *measurable* property, so this axis now has **two** oracle paths,
+chosen per case by a self-agreement certification step (`determinism.md` §6):
+
+- **Certified → full value oracle.** Before anything else, seed the sandbox RNG
+  (`Random.seed!`) and run the fragment under `Core.eval` **twice** in two fresh
+  modules, auto-observing its comparable top-level bindings at the end (real
+  fragments don't call `__obs__`; only bindings whose normalized value is
+  content-comparable are observed — the conservative direction). If the two
+  reference runs agree (`outcomeeq`), the fragment is certified observationally
+  deterministic *on this input*, and it graduates to the full differential value
+  oracle: the interpreted side is run (seeded + observed the same way),
+  `classify` compares the streams, and the confirm-on-divergence gate,
+  fingerprinting, dedup, shrinking (`corpus_value_keep`) and `writefinding`
+  (`reprocorpus` repro) all apply exactly as on the differential axis. A
+  seeded-`rand`/`sum` fragment thus becomes a value-compared test of interpreted
+  `rand`+`sum` against compiled — which it could not be before.
+- **Uncertified → failure-mode oracle (as before).** If the reference disagrees
+  with itself (address-derived values, clocks, stdlib-global mutation — the
+  deterministic-but-not-idempotent cases), the fragment falls back to the
+  **failure-mode-only** oracle: run the fragment with `Core.eval`; if that
+  throws, the fragment does not stand alone (a snippet lifted out of a test file
+  references names its file imported) and the case is discarded as junk; only
+  "compiled Julia ran this and the interpreter did not" is reported, plus the
+  stepping invariants from the axis above. Comparing whether execution failed,
+  never what it computed, is what makes nondeterministic real code usable.
+
+The confirm-on-divergence gate is the safety net: a certified fragment that is
+actually flaky (a stable heap repeating an address-derived value, say) is caught
+when the finding fails to re-confirm, and becomes a tracked `nondet_discard`
+rather than a false value divergence. A `certified` counter is printed next to
+`ran`/`discarded_junk` for the reason those exist — a rate collapse means the
+gate broke, not the corpus.
 
 Two mechanisms make this work in practice, both deliberately derived rather
 than enumerated:
@@ -507,9 +562,10 @@ than enumerated:
   happens to need. Measured on 200 cases: 23% of cases execute using only the
   imports each fragment's own file declared, 49% with repair.
 
-The `ran` vs `discarded_junk` counters exist so that ratio stays visible: a
-campaign that discards everything would otherwise report a perfect
-100%-agreed line while testing nothing.
+The `ran` vs `discarded_junk` vs `certified` counters exist so those ratios stay
+visible: a campaign that discards everything would otherwise report a perfect
+100%-agreed line while testing nothing, and a `certified` collapse would mean the
+certification gate — not the corpus — broke.
 
 ### Shrinking (`shrink.jl`)
 
@@ -523,7 +579,8 @@ strategy is shared; each axis supplies its own oracle.
 | `native` / `supposition` | re-run both sides, classify, same fingerprint | `differential_keep` |
 | `step` | replay the *same walk seed*, same verdict class + salt | `step_keep` |
 | `evalcode` | replay the same pause walk, same check kind | `evalcode_keep` |
-| `corpus` | re-run the fragment, same corpus verdict class | `corpus_keep` |
+| `corpus` (failure-mode) | re-run the fragment, same corpus verdict class | `corpus_keep` |
+| `corpus` (certified value) | re-certify + re-run the value oracle, same fingerprint | `corpus_value_keep` |
 
 Two search strategies, both budgeted:
 
@@ -682,10 +739,14 @@ type the program defined reads as `Main.FJ95.ZT` on one side and `Main.FJ96.ZT`
 on the other; `__fjnorm__` strips its own module's prefix and keeps the rest
 (type parameters included). The split axis produced 16 such false divergences
 in 5000 cases before that was fixed.
-Handled: RNG (both sides could seed identically; the grammar currently
-doesn't call `rand`), stack depth (fueled recursion keeps it shallow;
-`StackOverflowError` asymmetries would classify as `exception_divergence`
-and belong in `SUPPRESSIONS` if hit).
+Handled: RNG — the grammar now calls `rand` through a per-program
+`const __RNG__ = Xoshiro(seed)` baked in as a literal, so both engines run the
+same Xoshiro transitions and agree bit-for-bit (`determinism.md` §3; the corpus
+axis seeds the task-local RNG instead, and certifies per-fragment before value
+comparison, §6); content-keyed `Dict`/`Set` and the `__vtime__` virtual clock
+are likewise deterministic across the two engines. Stack depth: fueled recursion
+keeps it shallow; `StackOverflowError` asymmetries would classify as
+`exception_divergence` and belong in `SUPPRESSIONS` if hit.
 
 ## Roadmap
 

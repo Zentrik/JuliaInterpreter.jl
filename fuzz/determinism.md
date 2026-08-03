@@ -296,11 +296,13 @@ stabilizes shrinking: every shrink step already re-runs the candidate, and
 a nondeterministic fingerprint would make the shrinker reject or, worse,
 chase moving targets.)
 
-**Self-agreement admission for the corpus axis (the big prize).** The
-corpus axis is the direct answer to "we can't generate a lot of code" — real
-Julia has the constructs no one wrote rules for — but it currently demotes
+**Self-agreement admission for the corpus axis (the big prize).**
+*Implemented — see `corpus.jl`'s `corpus_certify`/`corpus_value_run` and the
+`certified` counter; the description below is the design it was built to.*
+The corpus axis is the direct answer to "we can't generate a lot of code" — real
+Julia has the constructs no one wrote rules for — but it used to demote
 *all* real code to the failure-mode oracle because "real code is not
-deterministic" (`corpus.jl:12-17`). That property is per-fragment, not
+deterministic" (`corpus.jl` header). That property is per-fragment, not
 universal, and it is *measurable*: seed the sandbox RNG (`Random.seed!(k)`
 before every run — task-local RNG makes corpus `rand` calls reproducible),
 run the fragment under `Core.eval` **twice** in two fresh modules, and
@@ -384,15 +386,41 @@ widening of this oracle.
    `confirm`/`confirmed`/`confirmsrc`/`confirmreport`, wired into `driver.jl`
    and `supposition.jl`; new tracked class `nondet_discard`, counted next to
    `aborted` in campaign stats). Safety net for everything below.
-2. **`__RNG__` + rand rules; `Dict`/`Set` with content-hashed keys**
-   (a day). Zero-infrastructure grammar width: data-dependent control flow,
-   associative containers under the full oracle.
-3. **Corpus self-agreement certification** (days; seeding + one extra ref
-   run + verdict plumbing). Real code graduates from failure-mode to value
-   oracle per-fragment — the largest step toward "test a lot more code".
-4. **Virtual doubles** `__vtime__`/`__venv__`/`__vfs__` + handle/do-block
-   grammar rules (days). Unlocks the resource-idiom compositions wave 3
-   wants.
+2. **`__RNG__` + rand rules; `Dict`/`Set` with content-hashed keys** —
+   **done** (§3 RNG, §4). `const __RNG__ = Xoshiro(seed)` is baked into the
+   rendered program as a *literal* seed (`Program.rngseed`, `render.jl`), so
+   both engines run identical Xoshiro transitions and agree bit-for-bit;
+   `SETUP_SRC` gains `using Random`. Rules `rand(__RNG__, Int)` /
+   `rand(__RNG__, 1:n)` / `rand(__RNG__, Bool)` / `rand(__RNG__)` /
+   `randn(__RNG__)` feed the Int/Float/Bool expression menus, so rand-derived
+   values flow into guarded indices, `if`/`while` conditions and a rand-derived
+   `for` trip count (`for i in 1:rand(__RNG__, 0:maxloop)`) — data-dependent
+   control flow, termination still by construction (rand never feeds while-fuel).
+   `Dict`/`Set` are keyed by the content-hashed whitelist (Int/String/Symbol/
+   Char/Bool + tuples of those; new `DictT`/`SetT`/`CharT` summaries): rules for
+   construction, `get`/`get!`/`haskey`/`in`/`length`, `setindex!`/`delete!`/
+   `push!`, and `keys`/`values`/whole/`length` observations; `__fjnorm__`
+   normalizes `AbstractDict`/`AbstractSet` to sorted normalized contents.
+   All gated by the `:rng`/`:dict` swarm features and a new `:determinism`
+   policy. Measured: 0 manufactured divergences over thousands of cases.
+3. **Corpus self-agreement certification** — **done** (§6, `corpus.jl`). Before
+   the failure-mode oracle, each case is certified: seed the sandbox RNG, run
+   the fragment under `Core.eval` twice, auto-observe its comparable top-level
+   bindings, and compare the streams with `outcomeeq`. Agreement graduates the
+   fragment to the full differential value oracle (`classify` + the
+   confirm-on-divergence gate + fingerprint/dedup/shrink/`writefinding`);
+   disagreement falls back to today's failure-mode + stepping oracle. A
+   `certified` counter is printed next to `ran`/`discarded_junk`. Real code
+   graduates from failure-mode to value oracle per-fragment — the largest step
+   toward "test a lot more code".
+4. **Virtual doubles** — **`__vtime__` done**, ENV/fs deferred. `__vtime__()`
+   (monotone counter in `SETUP_SRC`) is in the Int expression menu, so
+   deadline/elapsed-shaped control flow (`while __vtime__() < N`) is generable;
+   deterministic because both sides call it in lockstep. `__venv__`/`__vfs__`
+   and the handle/do-block/`try-finally` grammar rules they would unlock are
+   **deferred** (they are the larger, optional half of this item, and only pay
+   off once the resource-idiom rules that consume them exist); curated
+   deterministic `ccall`s likewise. See NEXT.md item 5.
 5. **Taint bit in `TySum` + relation observations** for
    `objectid`/`gensym`/pointer; curated deterministic `ccall` probes
    (about a week; touches `typesum.jl`/`env.jl`/`rules.jl`/`render.jl`).

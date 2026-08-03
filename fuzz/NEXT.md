@@ -24,7 +24,7 @@ before.
 | `native` / `supposition` | run-to-completion semantics | differential vs. compiled Julia, on observation streams |
 | `step` | `debug_command` walks — `commands.jl`, `breakpoints.jl` | stepping terminates, raises nothing plain interpretation doesn't, and reaches the same observations |
 | `evalcode` | `eval_code` at paused frames — `utils.jl` | reads match `locals(frame)`; writes round-trip and don't disturb other locals |
-| `corpus` | real Julia source, spliced — `construct.jl`, macro-heavy paths | differential on *failure mode only* (never on values) |
+| `corpus` | real Julia source, spliced — `construct.jl`, macro-heavy paths | per-fragment self-agreement certification → full value oracle when certified, else failure-mode only (determinism.md §6) |
 | `split` | adversarial toplevel forms — `ExprSplitter` in `construct.jl` | differential vs. `Core.eval` on failure mode, observation stream, **and the resulting module tree** |
 
 Supporting tools: `metrics.jl` (what the generator actually produces, without
@@ -278,37 +278,49 @@ which does not lower — the parse gate silently discarded 4–8% of *all*
 candidates (17/400 at the default policy, 31/400 under `:exceptions`). Fixed;
 the rate is now 0/400 on every policy.
 
-### 5. Determinism unlocks, the cheap half (`determinism.md` §9)
+### 5. Determinism unlocks, the cheap half (`determinism.md` §9) — **DONE**, ENV/fs doubles deferred
 
-Item 1's confirm-on-divergence gate is the safety net for all three, and it is
-now in place — a determinism mistake in any of these lands as a tracked
-`nondet_discard`, not as a false finding. In order:
+Item 1's confirm-on-divergence gate was the safety net for all three, and it
+held: across the calibration campaigns the new grammar produced **zero**
+nondeterminism false positives (0 `nondet_discard` attributable to the new
+rules). What shipped:
 
-- **Explicit RNG + content-keyed containers.** `__RNG__ = Xoshiro(seed)` in
-  the prelude, with `rand`/`randn`/`shuffle!` rules drawing from it — both
-  sides execute the same generator code, so streams agree bit-for-bit.
-  Unlocks data-dependent control flow and indices, which every guarded rule
-  currently lacks. Plus `Dict`/`Set` keyed by content-hashed types
-  (Int/String/Symbol/Char and immutable combinations): already
-  deterministic cross-engine, iteration order included, and the
-  associative-container and iteration-protocol paths are untested today.
-- **Corpus self-agreement certification.** The corpus axis demotes *all*
-  real code to the failure-mode oracle because real code is "not
-  deterministic" — but that property is per-fragment and measurable. Seed
-  the sandbox RNG before every run, run the compiled reference **twice**;
-  if it agrees with itself, the fragment is certified observationally
-  deterministic and graduates to the full differential value oracle
-  (`classify` applies unchanged). The single largest step toward testing
-  real-world code. Track the certification rate next to
-  `ran`/`discarded_junk` so a collapse is visible.
-- **Virtual doubles.** `__vtime__` (monotone counter), `__venv__` (Dict
-  double of ENV), `__vfs__` (Dict-backed pseudo-files) in `SETUP_SRC`,
-  raising the real exception types so guarded observations stay meaningful.
-  The point is not I/O — it is that resource-handle idioms
-  (`open(...) do`, `try ... finally close(h)`) become generable, and those
-  are the closure + `finally` + early-exit compositions wave 3 exists to
-  stress. Curated deterministic `ccall`s (`strlen`/`memcmp`/libm on
-  generated values) for the `:foreigncall` conversion path ride along.
+- **Explicit RNG + content-keyed containers** — **done** (`determinism.md`
+  §3/§4). `const __RNG__ = Xoshiro(seed)` is baked into the rendered program as
+  a *literal* (`Program.rngseed`), identical on both engines, so `rand(__RNG__,
+  Int)` / `rand(__RNG__, 1:n)` / `rand(__RNG__, Bool)` / `rand(__RNG__)` /
+  `randn(__RNG__)` agree bit-for-bit. Wired into the Int/Float/Bool expression
+  menus and a rand-derived `for` trip count, so data-dependent control flow and
+  indices are now generable (termination still by construction — rand never
+  feeds while-fuel). `Dict`/`Set` keyed by the content-hashed whitelist
+  (Int/String/Symbol/Char/Bool + tuples; new `DictT`/`SetT`/`CharT`): rules for
+  construction, `get`/`get!`/`haskey`/`in`/`length`, `setindex!`/`delete!`/
+  `push!`, and `keys`/`values`/whole/`length` observations, all under the full
+  value oracle (iteration order included; `__fjnorm__` sorts normalized
+  contents). Gated by the `:rng`/`:dict` swarm features and a new
+  `:determinism` policy. Densities under `--policy determinism`: rng 67%,
+  vtime 42%, dict ~50% of programs; blended rng 66%, dict 27%, vtime 34%.
+- **Corpus self-agreement certification** — **done** (`determinism.md` §6,
+  `corpus.jl`). Before the failure-mode oracle, each case is certified: seed the
+  sandbox RNG, run the fragment under `Core.eval` twice, auto-observe its
+  comparable top-level bindings (real fragments don't call `__obs__`), and
+  compare the streams. Agreement graduates the fragment to the full differential
+  value oracle (classify + confirm gate + fingerprint/dedup/shrink/report);
+  disagreement falls back to today's failure-mode + stepping oracle. A
+  `certified` counter is printed next to `ran`/`discarded_junk`. Measured
+  certification rate ~60% of runnable cases; seeded-`rand` fragments certify and
+  become value-compared (the §6 headline), while `objectid`/clock fragments
+  correctly fail self-agreement and fall back.
+- **Virtual doubles** — **`__vtime__` done**, `__venv__`/`__vfs__` **deferred**.
+  `__vtime__()` (monotone counter in `SETUP_SRC`) is in the Int menu, so
+  deadline/elapsed-shaped control flow (`while __vtime__() < N`) is generable.
+  The ENV/fs doubles and the handle/`do`-block/`try-finally` grammar rules they
+  unlock, plus curated deterministic `ccall`s, are **not built** — they are the
+  larger, optional half and only pay off once the resource-idiom rules that
+  consume them exist. Pick this up next: `__venv__::Dict{String,String}` and a
+  `__vfs__` (`__open__`/`__read__`/`__write__`/`__close__`) in `SETUP_SRC`
+  raising the real exception types (`SystemError`/`EOFError`), then
+  `open(...) do`/`try…finally close(h)` templates in `rules.jl`.
 
 ### 6. An `ExprSplitter` axis (P3 item 13) — **done**
 
@@ -478,7 +490,7 @@ never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # ~289 assertions, ~2min
+julia --project=fuzz fuzz/run.jl --selftest              # ~336 assertions, ~2min
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/coverage.jl --n 20             # what a campaign reaches (smoke)
 julia --project=fuzz fuzz/coverage.jl --n 400 --shards 2 \
