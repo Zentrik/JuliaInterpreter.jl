@@ -132,15 +132,21 @@ end
 # it compares equal to itself (both sides interrupted the same way agree) and
 # unequal to any real value (one side producing a value where the other did not
 # is a genuine difference).
-const UNASSIGNED_OBS = :__fj_unassigned__
-
 function getobs(m::Module)
     raw = Base.invokelatest(getglobal, m, :__OBS__)::Vector{Any}
-    out = Vector{Any}(undef, length(raw))
-    for i in eachindex(raw)
-        out[i] = isassigned(raw, i) ? raw[i] : UNASSIGNED_OBS
+    # Stop at the first unassigned slot rather than recording one. `push!` grows
+    # the array and then stores, so an unassigned element means execution
+    # stopped *inside* that push — the observation never happened, and
+    # everything from there on is not data. Anything else here is wrong: a
+    # sentinel value compares unequal to whatever the reference observed and
+    # gets reported as a divergence, which is how a budget cutoff turned into
+    # seven "findings" in one campaign; and reading the slot raises
+    # UndefRefError, or segfaults, which is what it did before that.
+    n = length(raw)
+    for i in 1:n
+        isassigned(raw, i) || return raw[1:i-1]
     end
-    return out
+    return copy(raw)
 end
 
 scrubexc(err) = nameof(typeof(err))
