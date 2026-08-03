@@ -298,7 +298,142 @@ holding never-were-pointers bit patterns, and (possibly) references to
 swept big objects — concentrated around the gf.c dispatch-cache machinery
 under module + method + world churn.
 
-### Interim conclusion
+### Crash 8 + core dump: the corrupting write identified byte-for-byte
+
+Stock-binary run 2 crashed in ~3.5 min (`gc_mark_obj8`, si_code 128 — the
+struct-field signature, now on the official binary) and left an 827 MB
+core. The juliaup binary ships DWARF, so gdb recovered the faulting frame
+fully (`core-forensics.md` has the raw session):
+
+- faulting slot: `0x7f59cd8c1ca0`; corrupt value `0x706a665a00be8430`.
+- The victim is a **live `DataType`** — typename symbol **`#5#6`**, an
+  anonymous closure type from candidate code. Field layout matches
+  name/super/parameters/types/instance/layout, with `parameters` expected
+  to hold `0x00007f5a00be8430` (the empty svec; its sibling DataType holds
+  exactly that value in the same field).
+- The corruption is **7 ASCII bytes `"fjprobe"` memcpy'd at the unaligned
+  address `0x...ca5`**, straddling the `parameters` and `types` fields:
+  the low 5 bytes of `parameters` and high 4 bytes of `types` survive
+  intact around it.
+- A **second victim 64 bytes earlier** (a `Type{...}` DataType) carries a
+  separate 3-byte fragment `"be\0"` at the same field offset — the tail
+  of another `"…be" + NUL` write.
+- `"fjprobe"` is the **harness's write-probe payload**
+  (`fuzz/src/evalcodefuzz.jl:42`): the literal value `writeprobe` assigns
+  into String-typed frame locals, materialized thousands of times per run
+  through `repr`/`string`/IOBuffer machinery and *repeatedly printed by
+  interpreted candidate code* once assigned into frame locals.
+- Only one `"fjprobe"` instance exists in the surrounding 64 KB, and the
+  `"` quote bytes that `repr` would emit adjacent to the payload are
+  absent: the 7-byte **bulk payload copy went to a wild destination while
+  the surrounding single-byte writes went elsewhere**.
+
+So the corruption mechanism is now concrete: **a bulk string write
+(`unsafe_write`/memcpy of a String's bytes) executed with a garbage
+destination pointer**, landing mid-object at unaligned addresses in the
+live heap. Everything else — freelist trash (2/3), wild array elements
+(1/5), corrupt leafcache keys (4/7), corrupt struct fields (6/8) — is
+downstream shrapnel of such writes.
+
+### Attribution reopened: the interpreter is a suspect again
+
+The wild-destination write reframes the suspect list. The payload string
+sits in **frame locals**, and candidate code that touches those locals is
+executed **by JuliaInterpreter**, including Base's string/IO internals
+with their `pointer(...)`/`memcpy` foreigncalls. If the interpreter ever
+supplies a **stale slot value as a pointer argument** to a foreigncall —
+for instance because a recycled `FrameData`'s arrays are still aliased by
+a live frame, so another frame's writes clobber the slot between the
+`pointer(...)` computation and the `memcpy` — the interpreter itself would
+issue exactly this wild write: legit source bytes, garbage destination.
+
+Two very recent optimizations create precisely that hazard class, and
+**both are in the code every crashing campaign ran** (merged 2026-07-21,
+present on the fuzzing branch; the 1.11.9 campaign also postdates them):
+
+- **#761 "optimize frame recycle tracking"** — frame recycling has a
+  prior history of aliasing bugs (#748/#749, "Pool each frame at most
+  once when recycling", "fix double-recycle exception unwind").
+- **#759 "reenable global ref lookup optimization"**.
+
+Registered **v0.11.4 predates both** (same-day release, before the
+merges) while containing the older recycling mechanism. A pinned
+discriminating campaign (`fuzzwt-pin`: identical harness, stock Julia
+1.12.6, `JuliaInterpreter@0.11.4` from the registry) is now running
+alongside the branch-source loops:
+
+- crashes **vanish** on 0.11.4 → regression in the #759–#761 window;
+  bisect those three PRs next.
+- crashes **persist** on 0.11.4 → pre-existing bug (older recycling, or
+  genuinely upstream Julia); next split is disabling recycling entirely.
+
+## VERDICT: upstream JuliaLang/julia issue #62524
+
+A refreshed upstream sweep (prompted mid-investigation) surfaced
+**[#62524] "Segfault in `gc_mark_obj8` from partially initialized boxed
+tuple at `-O2`"** (open, filed 2026-07-27): PR #55767 stopped
+heap-to-stack promotion of boxed tuples carrying GC pointers, and the
+`-O2`-only dead-store-elimination pass from PR #56847 then lets a boxed
+tuple be **rooted before its pointer fields are stored** — any GC at that
+window scans the field bytes, which are whatever the recycled pool cell
+last held. Affects 1.12.6 and 1.13-rc1; incidentally fixed on master by
+#55045 (stack allocation of union results); **no fix in any 1.12.x**.
+
+Every piece of our evidence snaps into place:
+
+- **Exact crash-line match**: #62524's backtrace is `gc_mark_obj8` at
+  gc-stock.c:1704 — identical to crashes 6 and 8.
+- **Confirmation matrix run here** (stock juliaup 1.12.6, evalcode axis):
+  - `-O2 --heap-size-hint=64M`: **"GC error (probable corruption)"
+    detected within ~minutes** (193 GCs) — the issue's predicted
+    fast-reproduction mode (`crashed/crash9-…`).
+  - `-O1 --heap-size-hint=64M`: **clean** — 3,700 candidates over 10
+    minutes at the same extreme GC pressure. DSE runs only at `-O2`;
+    the -O1/-O2 split is the discriminating fingerprint.
+- **The core forensics reread correctly**: nothing *overwrote* the
+  victim object — the object is a **freshly allocated, partially
+  initialized value whose uninitialized field bytes expose the recycled
+  cell's previous contents** (fragments of the omnipresent `"fjprobe"`
+  probe strings, stale pointers' low bytes). This also explains the
+  mixed si_codes: leftover text → non-canonical faults (1/4/5/6/8);
+  leftover stale addresses → SEGV_MAPERR (2/3/7); and leftover junk
+  read as a freelist link → the allocator crashes.
+- **Why this workload, and not the pure reproducers**: JuliaInterpreter's
+  hot loop churns union-typed, type-unstable returns (`(frame, pc)`
+  tuples from `debug_command`/`step_expr!` and `Union{Some,Nothing}`
+  lookups) — exactly the union-split boxed-tuple codegen the bug needs.
+  `repro-pure.jl`/`repro-pure-v2.jl` are too type-stable to emit it,
+  which is why they stayed clean (v1: 27k iters; v2: 126k iters).
+- **JuliaInterpreter fully exonerated**: the pinned campaign on
+  registered **v0.11.4** (predating #759/#760/#761) crashed twice with
+  the same signature within minutes — the interpreter's recent
+  optimizations are not involved; the interpreter is only the workload
+  that emits the vulnerable compiled-code pattern at volume.
+
+Loose end kept honest: README.md reports the previous campaign crashed
+on **1.11.9**, but #62524 says 1.11 is *not* affected (the DSE pass is
+1.12+). Either that campaign's version note is wrong, or the 1.11.9
+crashes were a different (rarer) bug; the 1.11.9 backtraces in
+`crashed/` predate this session and cannot distinguish it. Worth
+stating plainly in any upstream comment.
+
+### What to do with this
+
+1. **Comment on JuliaLang/julia#62524** (rather than filing a new
+   issue) with: the confirmation matrix above, the exact-line match on
+   the official 1.12.6 binary, the core-dump forensics (recycled-cell
+   text visible through uninitialized fields — direct physical evidence
+   of the mechanism), and JuliaInterpreter+fuzz-harness as a reliable
+   open-source reproducer (`--heap-size-hint=64M` → minutes).
+2. **Mitigate the nightly fuzz workflow**: run campaign shards with
+   `-O1` until a fixed 1.12.x ships. The -O1 lane here ran *faster*
+   than -O2 (6.6/s vs 5.7/s — this workload is interpretation-bound and
+   saves compile time), so the mitigation is free.
+3. Track the 1.11.9 question: if the 1.11 lane of a future campaign
+   crashes in `gc-stock.c`, capture a core immediately — that would be
+   a *different* upstream bug.
+
+### Interim conclusion (superseded by the verdict above; kept for the record)
 
 Four distinct fault sites — GC mark of an object array, pool allocator
 freelist walk (×2), and now an egal compare inside the method-table

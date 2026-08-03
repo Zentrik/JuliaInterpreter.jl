@@ -1,0 +1,66 @@
+GC error (probable corruption)
+Allocations: 246552819 (Pool: 246549746; Big: 3073); GC: 193
+
+!!! ERROR in jl_ -- ABORTING !!!
+
+thread 0 ptr queue:
+~~~~~~~~~~ ptr queue top ~~~~~~~~~~
+Task(next=nothing, queue=nothing, storage=Base.IdDict{Any, Any}(ht=Memory{Any}(32, 0x7f6fcaeabc60)[
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  :SOURCE_PATH,
+  "/tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt/fuzz/run.jl",
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>], count=1, ndel=10), donenotify=nothing, result=nothing, scope=nothing, code=#<null>, _state=0x00, sticky=true, priority=0x0000, _isexception=false, pad00=0x00, pad01=0x00, pad02=0x00, rngState0=0x341e6d58811cf939, rngState1=0x14017dc2775f3585, rngState2=0x30cb27a85f602879, rngState3=0x03b60383cd686a50, rngState4=0x036d26056ec7c87a, metrics_enabled=false, pad10=0x00, pad11=0x00, pad12=0x00, first_enqueued_at=0x0000000000000000, last_started_running_at=0x0000000000000000, running_time_ns=0x0000000000000000, finished_at=0x0000000000000000)
+==========
+Task(next=nothing, queue=nothing, storage=nothing, donenotify=nothing, result=nothing, scope=nothing, code=#<null>, _state=0x01, sticky=true, priority=0x0000, _isexception=false, pad00=0x00, pad01=0x00, pad02=0x00, rngState0=0x0000000000000000, rngState1=0x0000000000000000, rngState2=0x0000000000000000, rngState3=0x0000000000000000, rngState4=0x0000000000000000, metrics_enabled=false, pad10=0x00, pad11=0x00, pad12=0x00, first_enqueued_at=0x0000000000000000, last_started_running_at=0x0000000000000000, running_time_ns=0x0000000000000000, finished_at=0x0000000000000000)
+==========
+Task(next=nothing, queue=Base.IntrusiveLinkedList{Task}(head=<circular reference @-2>, tail=<circular reference @-2>), storage=nothing, donenotify=Base.GenericCondition{Base.Threads.SpinLock}(waitq=Base.IntrusiveLinkedList{Task}(head=Task(next=nothing, queue=<circular reference @-2>, storage=nothing, donenotify=Base.GenericCondition{Base.Threads.SpinLock}(waitq=Base.IntrusiveLinkedList{Task}(head=nothing, tail=nothing), lock=Base.Threads.SpinLock(owned=0)), result=nothing, scope=nothing, code=Base.var"#errormonitor##0#errormonitor##1"{Task}(t=<circular reference @-5>), _state=0x00, sticky=false, priority=0x0
+[... ~40KB of GC mark-queue dump truncated; full log in campaign artifacts ...]
+x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb3, 0x82], keys=Memory{Symbol}(16, 0x7f6fc34e9f60)[
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>,
+  :var"#self#",
+  :x], vals=Memory{Array{Int64, 1}}(16, 0x7f6fc34ea000)[
+  #<null>,
+  #<null>,
+  #<null>,
+  #<null>

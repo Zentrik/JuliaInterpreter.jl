@@ -1,0 +1,68 @@
+WARNING: Detected access to binding `FJ850.#f10#1` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+
+[14148] signal 11 (128): Segmentation fault
+in expression starting at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/run.jl:183
+gc_mark_obj8 at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:1704 [inlined]
+gc_mark_outrefs at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2463 [inlined]
+gc_mark_loop_serial_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2519
+gc_mark_loop_serial at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2542
+gc_mark_loop at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2730 [inlined]
+_jl_gc_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:3074
+ijl_gc_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:3475
+maybe_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:351 [inlined]
+jl_gc_small_alloc_inner at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:727 [inlined]
+jl_gc_small_alloc_noinline at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:785 [inlined]
+jl_gc_alloc_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:799
+jl_alloc_genericmemory_unchecked at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/genericmemory.c:41
+GenericMemory at ./boot.jl:588 [inlined]
+array_new_memory at ./array.jl:1067 [inlined]
+#_growend!##0 at ./array.jl:1148
+_growend! at ./array.jl:1131 [inlined]
+_push! at ./array.jl:1292 [inlined]
+push! at ./array.jl:1289 [inlined]
+#genblock#483 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:780
+genblock at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:771
+unknown function (ip: 0x7f78e75f55fc) at (unknown file)
+#genstmt#425 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:664
+genstmt at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:499
+#genblock#483 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:780
+genblock at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:771
+unknown function (ip: 0x7f78e75c5a30) at (unknown file)
+#genstmt#425 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:629
+genstmt at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:499 [inlined]
+genprogram at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:1015
+genprogram at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/rules.jl:948 [inlined]
+#evalcode_campaign#576 at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/evalcodefuzz.jl:243
+evalcode_campaign at /tmp/claude-0/-home-user-JuliaInterpreter-jl/11e9b2e3-3ed4-5e67-9252-25a98ecb5b1d/scratchpad/fuzzwt-pin/fuzz/src/evalcodefuzz.jl:225
+unknown function (ip: 0x7f78e7585eff) at (unknown file)
+jl_apply at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/julia.h:2391 [inlined]
+do_call at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:123
+eval_value at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:243
+eval_stmt_value at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:194 [inlined]
+eval_body at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:707
+jl_interpret_toplevel_thunk at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:898
+jl_toplevel_eval_flex at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:1035
+jl_toplevel_eval_flex at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:975
+ijl_toplevel_eval at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:1047
+ijl_toplevel_eval_in at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:1092
+eval at ./boot.jl:489
+include_string at ./loading.jl:2874
+_include at ./loading.jl:2934
+include at ./Base.jl:306
+exec_options at ./client.jl:317
+_start at ./client.jl:550
+jfptr__start_63319.1 at /root/.julia/juliaup/julia-1.12.6+0.x64.linux.gnu/lib/julia/sys.so (unknown line)
+jl_apply at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/julia.h:2391 [inlined]
+true_main at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/jlapi.c:971
+jl_repl_entrypoint at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/jlapi.c:1139
+main at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/cli/loader_exe.c:58
+unknown function (ip: 0x7f78fcc2a1c9) at /lib/x86_64-linux-gnu/libc.so.6
+__libc_start_main at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+unknown function (ip: 0x4010b8) at /workspace/srcdir/glibc-2.17/csu/../sysdeps/x86_64/start.S
+Allocations: 123292120 (Pool: 123290716; Big: 1404); GC: 29
+timeout: the monitored command dumped core

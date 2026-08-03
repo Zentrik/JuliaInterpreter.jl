@@ -1,8 +1,16 @@
 # Transient GC segfault — a Julia bug, not a JuliaInterpreter bug
 
-**Status:** open, reproducible only in aggregate (heap-cumulative). Candidate
-for an upstream JuliaLang/julia report. NOT a JuliaInterpreter defect — see
-"Attribution" below.
+**Status: RESOLVED — identified as upstream JuliaLang/julia
+[#62524](https://github.com/JuliaLang/julia/issues/62524)** (open there;
+partially-initialized boxed tuples at `-O2`, 1.12-only, no 1.12.x fix yet).
+See `ANALYSIS.md` for the full follow-up investigation: source-level crash
+mapping, core-dump forensics, the `-O1`/`-O2` × `--heap-size-hint=64M`
+confirmation matrix, and the JuliaInterpreter-version control that
+exonerates the interpreter. Mitigation for campaigns: run shards with
+`-O1` (free — this workload is interpretation-bound). The document below
+is the original triage, kept as written; its "Attribution" reasoning
+stands, though the cumulative-heap-state framing is superseded — the
+corruption window is per-allocation, merely *observed* stochastically.
 
 ## Summary
 
