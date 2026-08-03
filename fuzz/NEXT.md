@@ -43,10 +43,10 @@ than an inline campaign can afford), `diag_stuck.jl` (why a stepping walk is
 stuck), `preserve-findings.sh` (force-commit findings, since `findings/` is
 gitignored).
 
-**Results so far: four JuliaInterpreter bugs, all fixed.** A common thread:
+**Results so far: five JuliaInterpreter bugs, all fixed.** A common thread:
 every one is in the interpreter's *hand-reimplemented builtin/exception paths*
 — exactly the seam the literature predicts an interpreter diverges from the
-reference — and three of the four are "wrong exception type on a malformed or
+reference — and four of the five are "wrong exception type on a malformed or
 edge call".
 
 - **Fixed**: `cmp` mode diverged on `rethrow()`/`rethrow(exc)`/
@@ -71,6 +71,19 @@ edge call".
   wrap the callee. `findings/value_divergence-142a17f7/` (minimized to 25
   lines via `ddmin_source`; the seed no longer re-derives it because the
   generator changed mid-campaign).
+- **Fixed** (found by the post-evaluation reweighted campaign, 2026-08-03):
+  `invoke` with a signature argument that is a `Type` but not a *tuple* type —
+  `invoke(Int, Char, …)` — raised `ErrorException("expected tuple type")` from
+  Base's `signature_type` under `RecursiveInterpreter` where compiled Julia
+  raises a clean `TypeError`. The interpreter's `invoke` rewrite
+  (`src/interpret.jl`) admitted any `argtypes isa Type` before calling
+  `signature_type`; now defers a non-tuple `argtypes` to native `invoke`, the
+  same "let native raise the real error" pattern the neighbouring
+  malformed-shape checks use. Regression test in `test/interpret.jl`'s
+  `invoke` testset. `findings/value_divergence-2c10d219/`. This is the first
+  interpreter bug from the axes/throughput reallocation — the differential
+  `native` axis produced it within ~1 h of the reweighted run, on a program
+  reaching the `invoke` probe through the barriered-argument path.
 
 Plus a debugger crash found by the stepping axis (`more_calls_on_current_line`
 dereferencing a `nothing` from `whereis`, `findings/step-step_only_throw-88d4b5b2/`,
