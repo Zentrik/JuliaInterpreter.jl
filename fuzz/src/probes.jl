@@ -305,9 +305,19 @@ const PROBE_TYPE_LITERALS = String[
 const MEM_SRC = "Base.fill!(Memory{Int}(undef, 4), 7)"
 const MEMREF_SRC = "Core.memoryrefnew(" * MEM_SRC * ")"
 
+# Only *valid* atomic ordering symbols. An invalid ordering (e.g.
+# `:bogus_ordering_zzz`) is a known false-positive class, not an interpreter
+# bug: when the compiled side can constant-fold the ordering (which depends on
+# surrounding context and optimization), codegen validates it and throws
+# `ErrorException("invalid atomic ordering")`; when it cannot, the runtime
+# intrinsic throws `ConcurrencyViolationError`. The interpreter always defers to
+# the runtime intrinsic, so its exception type is stable while the compiled
+# side's is optimization-dependent. Wrong-*for-the-field* orderings
+# (`:not_atomic` on an atomic field, etc.) remain — those are runtime-validated
+# on both sides and agree, so they still probe the ordering-dispatch arms.
 const PROBE_ORDERINGS = String[
     ":not_atomic", ":unordered", ":monotonic", ":acquire", ":release",
-    ":acquire_release", ":sequentially_consistent", ":bogus_ordering_zzz",
+    ":acquire_release", ":sequentially_consistent",
 ]
 
 psrc(s::AbstractString) = Ex(:src, AnyT(), String(s))
