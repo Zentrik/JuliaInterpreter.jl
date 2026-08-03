@@ -286,6 +286,31 @@ function call_program(src::String; callseed::Int, maxcalls::Int=6, maxcmds::Int=
         end
     end
     fjnorm = Base.invokelatest(getglobal, m, :__fjnorm__)
+    # Mutable harness state the program's functions read AND advance: the
+    # inline PRNG (`__LCG__`, rendered into the program) and the virtual clock.
+    # Snapshot it once and restore it before EVERY run of a call — native #1,
+    # native #2, and the interpreted run — so all three observe identical
+    # state. Without this, a PRNG-reading function's value legitimately differs
+    # per call, and double-call certification only catches that
+    # *probabilistically*: the first campaign minutes produced a false
+    # `call_value_divergence` where both native samples landed in a
+    # `max(x, 0)` clamp (both negative products → both 0, certified) and the
+    # interpreted call drew the next PRNG value. Restoring the state makes the
+    # comparison a true differential; certification still guards the
+    # *program's own* globals, where the same masking risk remains and is
+    # accepted.
+    refs = Pair{Symbol,Any}[]
+    for nm in (:__LCG__, :__VTIME__)
+        r = try
+            Base.invokelatest(getglobal, m, nm)
+        catch
+            continue
+        end
+        r isa Ref && push!(refs, nm => (r, r[]))
+    end
+    resetstate!() = for (_, (r, v0)) in refs
+        r[] = v0
+    end
     rng = Xoshiro(callseed)
     pairs = Tuple{Any,Method}[]
     for f in latesttargets(m)
@@ -306,7 +331,9 @@ function call_program(src::String; callseed::Int, maxcalls::Int=6, maxcmds::Int=
             continue
         end
         kwthunks = synthkwargs(rng, meth, m)
+        resetstate!()
         o1 = callnative(f, thunks, kwthunks, fjnorm)
+        resetstate!()
         o2 = callnative(f, thunks, kwthunks, fjnorm)
         if o1.status === :skip || o2.status === :skip
             skipped += 1
@@ -318,6 +345,7 @@ function call_program(src::String; callseed::Int, maxcalls::Int=6, maxcmds::Int=
             uncert += 1
             continue
         end
+        resetstate!()
         into = callinterp(rng, f, thunks, kwthunks, fjnorm; maxcmds)
         if into.status === :skip
             skipped += 1

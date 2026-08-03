@@ -490,7 +490,16 @@ Each call runs three times in the same module:
    runs means the call is state-sensitive (mutates something it reads); it is
    *uncertified* and skipped — the corpus axis's self-agreement trick
    (determinism.md §6), which is what makes calling arbitrary generated
-   functions with arbitrary arguments sound.
+   functions with arbitrary arguments sound. The known mutable *harness* state
+   (`__LCG__`, `__VTIME__`) is snapshotted and restored before **every** run
+   (both native runs and the interpreted one), because double-call
+   certification is only probabilistic: the campaign's very first minutes
+   produced a false `call_value_divergence` where a PRNG-reading function's
+   two native samples both landed in a `max(x, 0)` clamp (certified), and the
+   interpreted call drew the next PRNG value. With the state restored, the
+   PRNG contributes identically to all three runs; certification continues to
+   guard the program's *own* globals, where the same masking risk remains and
+   is accepted.
 2. **`enter_call` + walk** — the SUT: build the frame with the public API and
    drive it with a random `debug_command` walk (same drain trick as the step
    axis), then `get_return`.
