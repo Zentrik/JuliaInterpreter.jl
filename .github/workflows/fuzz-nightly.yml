@@ -1,12 +1,16 @@
 # Nightly differential fuzzing of JuliaInterpreter (fuzz/, NEXT.md item 7).
 #
-# Two lanes:
+# Three lanes (campaigns run at -O1 — faster, and it sidesteps the codegen-
+# induced GC-corruption crash; see fuzz/longrun.sh):
 #   - '1.12' (required): the supported Julia. New findings turn this lane red.
-#   - 'pre' (continue-on-error): the NEXT Julia, where JuliaInterpreter's bug
-#     density historically concentrates. A red pre lane is early warning of
-#     upcoming breakage, not a bug in current code. The selftest acts as a
-#     support gate: if the harness itself does not pass on 'pre', the job stops
-#     there — campaign findings are never produced on an unsupported Julia.
+#   - 'pre' (continue-on-error): the upcoming release (RC/beta).
+#   - 'nightly' (continue-on-error): Julia master — earliest warning of an
+#     interpreter break or a codegen/GC regression.
+# The forward lanes are advisory: JuliaInterpreter's bug density historically
+# concentrates on new Julias, so a red pre/nightly lane is early warning of
+# upcoming breakage, not a bug in current code. The selftest is a support gate:
+# if the harness does not pass on a lane's Julia, the job stops there, so
+# campaign findings are never produced on an unsupported Julia.
 #
 # Findings (fuzz/findings/ is gitignored, so a checkout starts empty), the
 # longrun logs and any crash-journal evidence are always uploaded as artifacts;
