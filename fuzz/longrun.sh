@@ -25,6 +25,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Which Julia to run. Default `julia`; override with e.g.
+# JULIA_CMD="julia +release" to run on a newer channel. On Julia 1.11 a latent
+# GC bug (the codegen-abort's sibling, fixed in 1.12) segfaults sustained
+# campaigns at an allocation site every few hundred cases — the restart loop
+# below survives it, but 1.12 avoids it entirely and is the recommended channel
+# for a long run. See NEXT.md.
+JULIA_CMD="${JULIA_CMD:-julia}"
+
 DURATION="${1:-3600}"
 shift || true
 SHARDS=("$@")
@@ -71,7 +79,7 @@ run_shard() {
         echo "=== $name batch $batch seed=$seed $(date -u +%H:%M:%S) ===" >> "$log"
         # --nosync: the fsync per candidate is a disk round trip, and the
         # journal write itself (which is what recovers a crash) still happens.
-        timeout 1800 julia --project=fuzz fuzz/run.jl $args \
+        timeout 1800 $JULIA_CMD --project=fuzz fuzz/run.jl $args \
             --seed "$seed" --nosync --noshrink --journaldir "$jdir" >> "$log" 2>&1
         echo "--- exit $? ---" >> "$log"
         seed=$((seed + 100000))

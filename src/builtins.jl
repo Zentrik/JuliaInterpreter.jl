@@ -327,7 +327,10 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Expr(:call, invoke, args[2:end]...)
     elseif @static isdefinedglobal(Core, :invokelatest) && f === Core.invokelatest
         args = getargs(interp, args, frame)
-        if !expand
+        # A malformed `invokelatest()` (no function argument) must raise the
+        # native ArgumentError, not a BoundsError from indexing `args[1]` in the
+        # expand path below. Defer to the native call, as the `invoke` rewrite does.
+        if !expand || isempty(args)
             return Some{Any}(Core.invokelatest(args...))
         end
         new_expr = Expr(:call, args[1])

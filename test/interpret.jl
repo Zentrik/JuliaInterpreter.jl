@@ -1567,6 +1567,18 @@ end
     @test finish_and_return!(JuliaInterpreter.enter_call(wellformed)) == 3
 end
 
+@static if isdefinedglobal(Core, :invokelatest)
+@testset "malformed invokelatest raises the native error" begin
+    # invokelatest() with no function argument must raise the native
+    # ArgumentError, not a BoundsError from the interpreter's expand path
+    # indexing args[1] (invokelatest became a builtin in 1.12).
+    no_fn() = Core.invokelatest()
+    @test_throws ArgumentError finish_and_return!(JuliaInterpreter.enter_call(no_fn))
+    ok() = Base.invokelatest(*, 6, 7)
+    @test finish_and_return!(JuliaInterpreter.enter_call(ok)) == 42
+end
+end
+
 @testset "invoke selects its method in the frame world" begin
     @eval module InvokeWorld
     function target end
