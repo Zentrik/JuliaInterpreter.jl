@@ -667,6 +667,17 @@ end
         @test o.status === :done
         @test o.nfrags >= 3
         @test !isempty(o.state)
+        # Both budgets must actually bite, and bite as *discards*: a starved run
+        # has a truncated module tree, and reporting that as a missing effect
+        # would make every slow program a finding.
+        starved = [FuzzJI.split_case(FuzzJI.gensplit(Xoshiro(seed)); nstmts=40, maxfrags=4000)
+                   for seed in 1:20]
+        @test count(r -> r !== nothing && r[1].class === :aborted, starved) >= 15
+        @test !any(r -> r !== nothing && isfinding(r[1]), starved)
+        fragstarved = [FuzzJI.split_case(FuzzJI.gensplit(Xoshiro(seed)); maxfrags=2)
+                       for seed in 1:20]
+        @test count(r -> r !== nothing && r[1].class === :aborted, fragstarved) >= 15
+        @test !any(r -> r !== nothing && isfinding(r[1]), fragstarved)
     end
 
     @testset "canary: pipeline detects a genuine known divergence" begin
