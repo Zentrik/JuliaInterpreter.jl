@@ -417,6 +417,22 @@ side.)
   (Antithesis/Hermit-style hypervisors). Wrong layer for a two-engine
   oracle — determinism is not agreement; see `determinism.md` §2. rr for
   crash repro (item 1) is the part of that toolbox worth having.
+- **Corpus environment-equivalence gate** (port from the parallel session's
+  `claude/julia-fuzzing-strategy-bmh692`, commit `be1d869`). That session's
+  corpus axis discards a case when the *interpreted* module's environment
+  (which prelude `using`/`import`s actually took effect) differs from the
+  environment the reference succeeded in — otherwise "compiled ran it, interp
+  threw `UndefVarError: @testset`" is a statement about the harness's setup,
+  not about JuliaInterpreter. This branch instead prevents `LOAD_PATH`
+  corruption at the source (`freshmodule` restores the harness load path) and
+  certifies determinism; the environment-equivalence check is complementary
+  and more general (it catches any environment mismatch, not just load-path
+  ones). Not cherry-pickable directly: their `corpus.jl` predates this
+  branch's certification + `LOAD_PATH` changes, so it needs hand-porting into
+  `corpusmodule`/the corpus runners (have `corpusmodule` report which prelude
+  statements took effect; discard when the interp and ref environments
+  diverge). Deferred deliberately — the `LOAD_PATH` fix already closed the
+  crash it was chasing; this hardens the remaining false-positive surface.
 
 ### Still-open grammar gaps
 
