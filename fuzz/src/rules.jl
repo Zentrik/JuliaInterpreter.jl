@@ -48,11 +48,24 @@ function genlit(ctx::Ctx, want::TySum)::Ex
         want.t === :Bool && return lit(rand(rng, Bool), want)
         want.t === :Str && return lit(randstring_src(ctx), want)
         want.t === :Sym && return lit(pick(rng, [:a, :b, :c, :d, :e]), want)
+        want.t === :Char && return lit(pick(rng, ['a', 'b', 'x', 'α', '∀', '🐛', '0', ' ']), want)
         want.t === :Nothing && return lit(nothing, want)
     elseif want isa TupT
         return Ex(:tuple, want, nothing, [genleaf(ctx, e) for e in want.elts])
     elseif want isa VecT
         return Ex(:vect, want, nothing, [genleaf(ctx, want.elt) for _ in 1:rand(ctx.rng, 1:3)])
+    elseif want isa DictT
+        # Dict{K,V}(k1 => v1, ...) — keys drawn from the content-hashed whitelist.
+        npairs = rand(rng, 0:3)
+        kids = Ex[]
+        for _ in 1:npairs
+            push!(kids, genleaf(ctx, want.k))
+            push!(kids, genleaf(ctx, want.v))
+        end
+        return Ex(:dictlit, want, nothing, kids)
+    elseif want isa SetT
+        nelts = rand(rng, 0:3)
+        return Ex(:setlit, want, nothing, [genleaf(ctx, want.elt) for _ in 1:nelts])
     elseif want isa FnT
         return genclosure(ctx, want)
     elseif want isa StructT
@@ -85,13 +98,21 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     if want isa ConcT && (want.t === :Int || want.t === :Float)
         push!(opts, (3.0, :leaf), (3.0, :arith), (1.0, :ternary), (0.8, :minmax), (0.8, :vecget))
         want.t === :Int && push!(opts, (0.8, :veclen), (0.6, :strlen), (0.6, :intdiv))
+        # Explicit-RNG draws and the virtual clock: data-dependent Int/Float
+        # values that flow into indices, conditions and loop bounds. Both sides
+        # execute the same draw, so the values agree bit-for-bit.
+        if rngavail(ctx)
+            want.t === :Int && push!(opts, (0.8, :rngint), (0.6, :vtime))
+            want.t === :Float && push!(opts, (0.8, :rngfloat))
+        end
     elseif want isa ConcT && want.t === :Bool
         push!(opts, (2.0, :leaf), (3.0, :cmp), (1.5, :andor), (1.0, :not), (0.8, :isa), (0.6, :egal), (0.6, :ternary))
+        rngavail(ctx) && push!(opts, (0.6, :rngbool))
     elseif want isa ConcT && want.t === :Str
         push!(opts, (3.0, :leaf), (2.0, :strcat), (0.8, :ternary))
     elseif want isa ConcT
         push!(opts, (1.0, :leaf))
-    elseif want isa TupT || want isa VecT
+    elseif want isa TupT || want isa VecT || want isa DictT || want isa SetT
         push!(opts, (1.0, :leaf))
     elseif want isa FnT
         push!(opts, (1.0, :closure))
@@ -124,6 +145,23 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
     # field reads off in-scope struct values
     if !isempty([v for v in visiblevars(ctx) if v.sum isa StructT && any(fs -> compat(want, fs), (v.sum::StructT).fieldsums)])
         push!(opts, (1.5, :getprop))
+    end
+    # content-keyed Dict/Set value-producing operations (determinism.md §4).
+    # These are the associative-container / iteration-protocol paths (two-arg
+    # getindex vs three-arg get, haskey, membership, length) untested today.
+    if swarmon(ctx, :dict)
+        dvars = [v for v in visiblevars(ctx) if v.sum isa DictT]
+        svars = [v for v in visiblevars(ctx) if v.sum isa SetT]
+        if want isa ConcT && want.t === :Int && (!isempty(dvars) || !isempty(svars))
+            push!(opts, (0.8, :dictlen))
+        end
+        if want isa ConcT && want.t === :Bool
+            isempty(dvars) || push!(opts, (0.8, :haskey))
+            isempty(svars) || push!(opts, (0.8, :setin))
+        end
+        if want isa ConcT && any(v -> compat(want, (v.sum::DictT).v), dvars)
+            push!(opts, (1.0, :dictget))
+        end
     end
     kind = wpickrule(ctx, opts)
 
@@ -253,6 +291,42 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         # atomic fields must be read with @atomic (plain access is an error)
         return Ex(s.atomicmask[i] ? :aprop : :prop, s.fieldsums[i], s.fieldnames[i],
                   [Ex(:var, v.sum, v.name)])
+    elseif kind === :rngint
+        # rand(__RNG__, Int) or rand(__RNG__, 1:n) — the bounded form is handy as
+        # a guarded index or a small loop-shaped count.
+        src = rand(rng) < 0.5 ? "rand(__RNG__, Int)" : "rand(__RNG__, 1:$(rand(rng, 2:9)))"
+        return Ex(:rng, IntT, src)
+    elseif kind === :rngfloat
+        return Ex(:rng, FloatT, rand(rng) < 0.5 ? "rand(__RNG__)" : "randn(__RNG__)")
+    elseif kind === :rngbool
+        return Ex(:rng, BoolT, "rand(__RNG__, Bool)")
+    elseif kind === :vtime
+        return Ex(:vtime, IntT, nothing)
+    elseif kind === :dictget
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT && compat(want, (v.sum::DictT).v)]
+        isempty(cands) && return genleaf(ctx, want)
+        v = pick(rng, cands)
+        dt = v.sum::DictT
+        # get(d, k, default) / get!(d, k, default) — total, returns the val type.
+        fn = rand(rng) < 0.4 ? :get! : :get
+        return Ex(:callb, dt.v, fn, [Ex(:var, dt, v.name), genex(ctx, dt.k), genex(ctx, want)])
+    elseif kind === :dictlen
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT || v.sum isa SetT]
+        isempty(cands) && return genleaf(ctx, want)
+        v = pick(rng, cands)
+        return Ex(:callb, IntT, :length, [Ex(:var, v.sum, v.name)])
+    elseif kind === :haskey
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT]
+        isempty(cands) && return genleaf(ctx, want)
+        v = pick(rng, cands)
+        dt = v.sum::DictT
+        return Ex(:callb, BoolT, :haskey, [Ex(:var, dt, v.name), genex(ctx, dt.k)])
+    elseif kind === :setin
+        cands = [v for v in visiblevars(ctx) if v.sum isa SetT]
+        isempty(cands) && return genleaf(ctx, want)
+        v = pick(rng, cands)
+        st = v.sum::SetT
+        return Ex(:callb, BoolT, :in, [genex(ctx, st.elt), Ex(:var, st, v.name)])
     elseif kind === :closure
         return genclosure(ctx, want isa FnT ? want : FnT(TySum[IntT], AnyT()))
     end
@@ -311,6 +385,27 @@ end
 
 const CONCRETE_MENU = TySum[IntT, IntT, IntT, FloatT, FloatT, BoolT, StrT, SymT]
 
+# Content-hashed key types (determinism.md §4): Int/String/Symbol/Char/Bool.
+# Their `hash` is content-based and identical across the two engines, so a
+# Dict/Set keyed by them iterates identically on both sides and the full value
+# oracle applies. Mutable/objectid-keyed containers (class X) are excluded by
+# never appearing here. Value types are ordinary comparable scalars.
+const DICT_KEY_MENU = TySum[IntT, StrT, SymT, CharT, BoolT]
+const DICT_VAL_MENU = TySum[IntT, FloatT, StrT, SymT, BoolT]
+
+# A content-hashed key type, occasionally a tuple of two of them (still
+# content-hashed, and it exercises tuple hashing/iteration as a key).
+function dictkeysum(ctx::Ctx)
+    rng = ctx.rng
+    rand(rng) < 0.18 &&
+        return TupT(TySum[pick(rng, DICT_KEY_MENU) for _ in 1:2])
+    return pick(rng, DICT_KEY_MENU)
+end
+
+# A fresh Dict or Set summary, for newvarsum and the observe menu.
+dictsum(ctx::Ctx) = DictT(dictkeysum(ctx), pick(ctx.rng, DICT_VAL_MENU))
+setsum(ctx::Ctx) = SetT(dictkeysum(ctx))
+
 # Summary for a generated function's parameter or return value. Scalars stay
 # dominant, but tuples/vectors/structs/functions now cross call boundaries:
 # previously every parameter and return was concretized to a scalar, so an
@@ -357,6 +452,17 @@ end
 const SCALAR_NONGROW = TySum[IntT, IntT, FloatT, FloatT, BoolT, SymT]
 
 function newvarsum(ctx::Ctx)
+    # Content-keyed Dict/Set bindings gate every Dict/Set rule (they all need a
+    # container in scope), so the :determinism policy raises the rate of creating
+    # one — boosting the op weights alone does nothing without a target. Drawn
+    # first with an independent probability so it doesn't interact with the
+    # struct/scalar cascade below.
+    if swarmon(ctx, :dict)
+        dictrate = ctx.policy === :determinism ? 0.40 : 0.10
+        if rand(ctx.rng) < dictrate
+            return rand(ctx.rng, Bool) ? dictsum(ctx) : setsum(ctx)
+        end
+    end
     r = rand(ctx.rng)
     # Struct-valued bindings gate every struct rule (field read/write, atomic
     # modify, struct aliasing), so the policies that target those rules raise
@@ -420,6 +526,14 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
     allowobs && blockdepth < ctx.cfg.maxblockdepth && push!(opts, (0.5, :loopundef))
     # `local x::T = v` — conversion/typeassert on every later reassignment
     inlocal(ctx) && push!(opts, (0.7, :typedlocal))
+    # content-keyed Dict/Set mutation + observation (determinism.md §4)
+    if swarmon(ctx, :dict)
+        anydict = any(v -> v.sum isa DictT, visiblevars(ctx))
+        anyset = any(v -> v.sum isa SetT, visiblevars(ctx))
+        anydict && push!(opts, (0.8, :dictset), (0.5, :dictdel))
+        anyset && push!(opts, (0.6, :setpush))
+        allowobs && (anydict || anyset) && push!(opts, (0.7, :dictobs))
+    end
     # control-flow exits; break/continue through try/finally is the :enter/:leave
     # and exception-frame-unwinding surface
     ctx.loopdepth > 0 && push!(opts, (1.0, :brk), (0.8, :cont))
@@ -500,11 +614,16 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         return St(:if, haselse; exs=[cond], blocks=blocks)
     elseif kind === :for
         ivar = freshname(ctx, "i")
-        n = rand(rng, 0:ctx.cfg.maxloop)
+        hi = ctx.cfg.maxloop
+        # A rand-derived trip count where a literal bound sits today — data
+        # dependence without breaking termination (bounded by maxloop). Both
+        # sides draw the same count from __RNG__, so iteration stays in lockstep.
+        userng = rngavail(ctx) && rand(rng) < 0.35
+        meta = userng ? (ivar, hi, "rand(__RNG__, 0:$hi)") : (ivar, rand(rng, 0:hi))
         ctx.loopdepth += 1
         body = genblock(ctx, blockdepth; extra=[VInfo(ivar, IntT)])
         ctx.loopdepth -= 1
-        return St(:for, (ivar, n); blocks=[body])
+        return St(:for, meta; blocks=[body])
     elseif kind === :while
         fuelvar = freshname(ctx, "fuel")
         fuel = rand(rng, 1:ctx.cfg.maxloop)
@@ -603,6 +722,28 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         st = St(:typedlocal, (name, s); exs=[rhs])
         declare!(ctx, VInfo(name, s))
         return st
+    elseif kind === :dictset
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT]
+        v = pick(rng, cands)
+        dt = v.sum::DictT
+        return St(:dictset, v.name; exs=[genex(ctx, dt.k), genex(ctx, dt.v)])
+    elseif kind === :dictdel
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT]
+        v = pick(rng, cands)
+        dt = v.sum::DictT
+        return St(:dictdel, v.name; exs=[genex(ctx, dt.k)])
+    elseif kind === :setpush
+        cands = [v for v in visiblevars(ctx) if v.sum isa SetT]
+        v = pick(rng, cands)
+        st = v.sum::SetT
+        return St(:setpush, v.name; exs=[genex(ctx, st.elt)])
+    elseif kind === :dictobs
+        cands = [v for v in visiblevars(ctx) if v.sum isa DictT || v.sum isa SetT]
+        v = pick(rng, cands)
+        # keys/values apply only to Dicts; whole/len apply to both.
+        proj = v.sum isa DictT ? pick(rng, [:whole, :keys, :values, :len]) :
+                                 pick(rng, [:whole, :len])
+        return St(:dictobs, (v.name, proj))
     end
     error("unreachable stmt kind $kind")
 end
@@ -890,5 +1031,8 @@ function genprogram(ctx::Ctx)::Program
     end
     ctx.rtscopes -= 1
     popscope!(ctx)
-    return Program(pre, fundefs, mid, body)
+    # Emit `const __RNG__ = Xoshiro(rngseed)` only when the explicit-RNG feature
+    # is on for this program (rngavail); otherwise no rand rule could fire and
+    # the declaration would be dead.
+    return Program(pre, fundefs, mid, body, rngavail(ctx) ? ctx.rngseed : nothing)
 end

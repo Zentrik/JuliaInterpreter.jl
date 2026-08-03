@@ -617,7 +617,11 @@ end
 # Names every module gets for free, plus the harness's own prelude. Everything
 # starting with '#' is compiler/docsystem internal (`#f` type names, the
 # docsystem's gensym'd META binding) and is excluded wholesale.
-const SPLIT_SKIP_NAMES = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fjnorm__])
+const SPLIT_SKIP_NAMES = Set{Symbol}([:eval, :include, :__OBS__, :__obs__, :__fjnorm__,
+                                      # determinism-unlock prelude bindings (SETUP_SRC);
+                                      # identical on both sides, so never a divergence, but
+                                      # excluded to keep modstate focused on program state.
+                                      :__VTIME__, :__vtime__, :__RNG__])
 
 # Identity-scrubbed name of a function or type. Anonymous functions and closure
 # types are named `#3#4` with counters that depend on how many were created in

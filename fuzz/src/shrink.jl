@@ -49,7 +49,8 @@ end
 cloneex(e::Ex) = Ex(e.kind, e.sum, e.meta, Ex[cloneex(k) for k in e.kids])
 clonest(s::St) = St(s.kind, s.meta, Ex[cloneex(e) for e in s.exs], [St[clonest(x) for x in b] for b in s.blocks])
 cloneprog(p::Program) = Program(St[clonest(s) for s in p.pre], St[clonest(s) for s in p.fundefs],
-                                St[clonest(s) for s in p.mid], St[clonest(s) for s in p.body])
+                                St[clonest(s) for s in p.mid], St[clonest(s) for s in p.body],
+                                p.rngseed)
 
 # -- name accounting ---------------------------------------------------------
 function allbound!(out::Set{Symbol}, st::St)
@@ -145,11 +146,12 @@ strefs(st::St) = refs!(Set{Symbol}(), st)
 
 function repairblock!(sts::Vector{St}, bound::Set{Symbol})
     filter!(sts) do st
-        if st.kind === :push || st.kind === :setindex
+        if st.kind === :push || st.kind === :setindex ||
+           st.kind === :dictset || st.kind === :dictdel || st.kind === :setpush
             (st.meta::Symbol) in bound || return false
         elseif st.kind === :alias
             (st.meta[2]::Symbol) in bound || return false
-        elseif st.kind === :setprop || st.kind === :amodify
+        elseif st.kind === :setprop || st.kind === :amodify || st.kind === :dictobs
             (st.meta[1]::Symbol) in bound || return false
         end
         return true

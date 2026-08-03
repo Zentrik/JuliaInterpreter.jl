@@ -29,6 +29,10 @@
 #   :aprop    meta = fieldname::Symbol                      kids = [obj]    # (@atomic (obj).field)
 #   :compr    meta = (ivar, n::Int, hasfilter::Bool)        kids = [bodyex] or [bodyex, cond]
 #   :kwcall   meta = (fname::Symbol, kwnames::Vector{Symbol}) kids = positional args, then kwarg values
+#   :rng      meta = call source::String                    kids = []   # rand(__RNG__, ...) / randn(__RNG__)
+#   :vtime    meta = nothing                                kids = []   # __vtime__() monotone counter
+#   :dictlit  meta = nothing (sum::DictT)                   kids = [k1,v1,k2,v2,...]  # Dict{K,V}(...)
+#   :setlit   meta = nothing (sum::SetT)                    kids = elts # Set{E}([...])
 #
 # St node kinds:
 #   :assign   meta = (name, sum, isnew, needsglobal::Bool[, decl::Symbol])  exs = [rhs]
@@ -63,6 +67,13 @@
 #             for ivar in 1:n — observes xname's (un)definedness at iteration `when`,
 #             then assigns it; probes per-iteration slot reset (NewvarNode)
 #   :typedlocal meta = (name, sum::TySum)                   exs = [rhs]   # local name::T = rhs
+#   :dictset  meta = dvar::Symbol                           exs = [key, val]   # dvar[key] = val
+#   :dictdel  meta = dvar::Symbol                           exs = [key]        # delete!(dvar, key)
+#   :setpush  meta = svar::Symbol                           exs = [elt]        # push!(svar, elt)
+#   :dictobs  meta = (var::Symbol, proj::Symbol)            exs = []
+#             proj :whole|:keys|:values|:len — observes a content-comparable
+#             projection of a Dict/Set, so associative iteration/keys/values are
+#             oracle data (values sorted; whole-container normalized by __fjnorm__)
 
 struct Ex
     kind::Symbol
@@ -85,8 +96,16 @@ struct Program
     fundefs::Vector{St}   # toplevel :fundef/:recdef statements
     mid::Vector{St}       # extra toplevel statements (toplevel-frame surface)
     body::Vector{St}      # rendered inside a toplevel `let`
+    # Per-program RNG seed, baked into the rendered program as the literal
+    # `const __RNG__ = Xoshiro(rngseed)`. It is a *literal* on both sides (not a
+    # harness global), so the two engines run the same Xoshiro transitions and
+    # agree bit-for-bit (determinism.md §3). `nothing` means the program uses no
+    # explicit RNG and the declaration is omitted. Structural, not a statement:
+    # the shrinker never removes it, and `cloneprog` carries it through.
+    rngseed::Union{Nothing,Int}
 end
-Program(fundefs::Vector{St}, body::Vector{St}) = Program(St[], fundefs, St[], body)
+Program(pre, fundefs, mid, body) = Program(pre, fundefs, mid, body, nothing)
+Program(fundefs::Vector{St}, body::Vector{St}) = Program(St[], fundefs, St[], body, nothing)
 sections(p::Program) = (p.pre, p.fundefs, p.mid, p.body)
 
 lit(v, sum::TySum) = Ex(:lit, sum, v)
@@ -98,9 +117,14 @@ defaultex(s::ConcT) =
     s.t === :Float ? lit(0.0, s) :
     s.t === :Bool ? lit(false, s) :
     s.t === :Str ? lit("", s) :
-    s.t === :Sym ? lit(:a, s) : lit(nothing, s)
+    s.t === :Sym ? lit(:a, s) :
+    s.t === :Char ? lit('a', s) : lit(nothing, s)
 defaultex(s::VecT) = Ex(:vect, s, nothing, [defaultex(s.elt)])
 defaultex(s::TupT) = Ex(:tuple, s, nothing, [defaultex(e) for e in s.elts])
+# Inert empty containers: a removed binding or pruned subtree of Dict/Set
+# summary becomes `Dict{K,V}()` / `Set{E}()`.
+defaultex(s::DictT) = Ex(:dictlit, s, nothing, Ex[])
+defaultex(s::SetT) = Ex(:setlit, s, nothing, Ex[])
 defaultex(s::FnT) = Ex(:closure, s, [Symbol("__p", i) for i in 1:arity(s)], [defaultex(s.ret isa AnyT ? NothingT : s.ret)])
 # `nothing`, not a construction: shrinking may have removed the struct definition.
 defaultex(::StructT) = lit(nothing, NothingT)
@@ -125,11 +149,12 @@ function refs!(out::Set{Symbol}, e::Ex)
 end
 
 function refs!(out::Set{Symbol}, st::St)
-    if st.kind === :push || st.kind === :setindex
+    if st.kind === :push || st.kind === :setindex ||
+       st.kind === :dictset || st.kind === :dictdel || st.kind === :setpush
         push!(out, st.meta::Symbol)
     elseif st.kind === :alias
         push!(out, st.meta[2]::Symbol)
-    elseif st.kind === :setprop || st.kind === :amodify
+    elseif st.kind === :setprop || st.kind === :amodify || st.kind === :dictobs
         push!(out, st.meta[1]::Symbol)
     end
     for e in st.exs

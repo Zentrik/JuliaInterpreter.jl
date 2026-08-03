@@ -9,12 +9,26 @@
 abstract type TySum end
 
 struct ConcT <: TySum
-    t::Symbol   # :Int, :Float, :Bool, :Str, :Sym, :Nothing
+    t::Symbol   # :Int, :Float, :Bool, :Str, :Sym, :Char, :Nothing
 end
 struct TupT <: TySum
     elts::Vector{TySum}
 end
 struct VecT <: TySum
+    elt::TySum
+end
+# Content-keyed associative containers (determinism.md §4). Julia's `hash` for
+# the whitelisted key types (Int/String/Symbol/Char/Bool and tuples of those)
+# is content-based and identical across the two engines, so iteration order is
+# a deterministic function of insertion + hashes + table geometry — identical on
+# both sides. That makes the *full* value oracle apply, iteration order included
+# (§4). Mutable/objectid-keyed containers (class X) are deliberately unreachable:
+# the key-type menus below never offer a mutable summary.
+struct DictT <: TySum
+    k::TySum
+    v::TySum
+end
+struct SetT <: TySum
     elt::TySum
 end
 struct FnT <: TySum
@@ -38,6 +52,7 @@ const FloatT = ConcT(:Float)
 const BoolT = ConcT(:Bool)
 const StrT = ConcT(:Str)
 const SymT = ConcT(:Sym)
+const CharT = ConcT(:Char)
 const NothingT = ConcT(:Nothing)
 
 # `compat(want, have)`: may a value summarized as `have` be used where the
@@ -47,6 +62,8 @@ const NothingT = ConcT(:Nothing)
 compat(::AnyT, ::TySum) = true
 compat(want::ConcT, have::ConcT) = want.t === have.t
 compat(want::VecT, have::VecT) = compat_eq(want.elt, have.elt)
+compat(want::DictT, have::DictT) = compat_eq(want.k, have.k) && compat_eq(want.v, have.v)
+compat(want::SetT, have::SetT) = compat_eq(want.elt, have.elt)
 compat(want::TupT, have::TupT) =
     length(want.elts) == length(have.elts) &&
     all(compat_eq(w, h) for (w, h) in zip(want.elts, have.elts))
@@ -71,11 +88,26 @@ function typename(s::ConcT)
     s.t === :Bool && return "Bool"
     s.t === :Str && return "String"
     s.t === :Sym && return "Symbol"
+    s.t === :Char && return "Char"
     s.t === :Nothing && return "Nothing"
     error("unreachable typename $(s.t)")
 end
 typename(s::VecT) = "Vector"
 typename(s::TupT) = "Tuple"
+typename(::DictT) = "Dict"
+typename(::SetT) = "Set"
 typename(::FnT) = "Function"
 typename(s::StructT) = String(s.name)
 typename(::AnyT) = "Any"
+
+# Fully-parameterized Julia type string for *constructing* a value (e.g.
+# `Dict{Int64, Float64}`), as opposed to `typename` which gives the bare head
+# used for a `::T` annotation. Only the summaries that can appear as Dict/Set
+# key/value/element types need to round-trip here; anything else falls back to
+# `Any`, which is always a valid construction annotation.
+juliatypestr(s::ConcT) = typename(s)
+juliatypestr(s::VecT) = "Vector{" * juliatypestr(s.elt) * "}"
+juliatypestr(s::TupT) = "Tuple{" * join(map(juliatypestr, s.elts), ", ") * "}"
+juliatypestr(s::DictT) = "Dict{" * juliatypestr(s.k) * ", " * juliatypestr(s.v) * "}"
+juliatypestr(s::SetT) = "Set{" * juliatypestr(s.elt) * "}"
+juliatypestr(::TySum) = "Any"

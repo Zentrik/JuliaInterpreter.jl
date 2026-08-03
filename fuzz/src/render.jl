@@ -58,6 +58,31 @@ function render(e::Ex)::String
         # enumeration in probes.jl, so it is always a resolvable callee on the
         # Julia version generating the program; the caller wraps it in a :guard.
         return (e.meta::String) * "(" * join(map(render, e.kids), ", ") * ")"
+    elseif k === :rng
+        # A draw from the program's own `__RNG__` (e.g. `rand(__RNG__, Int)`).
+        # The RNG object is seeded from a literal baked into both modules, so
+        # both engines execute the same Xoshiro transition and agree bit-for-bit.
+        return e.meta::String
+    elseif k === :vtime
+        # Monotone virtual clock (SETUP_SRC). Deterministic because both sides
+        # call it the same number of times in the same order.
+        return "__vtime__()"
+    elseif k === :dictlit
+        dt = e.sum::DictT
+        ts = "Dict{" * juliatypestr(dt.k) * ", " * juliatypestr(dt.v) * "}"
+        isempty(e.kids) && return ts * "()"
+        pairs = String[]
+        i = 1
+        while i + 1 <= length(e.kids)
+            push!(pairs, render(e.kids[i]) * " => " * render(e.kids[i + 1]))
+            i += 2
+        end
+        return ts * "(" * join(pairs, ", ") * ")"
+    elseif k === :setlit
+        st = e.sum::SetT
+        ts = "Set{" * juliatypestr(st.elt) * "}"
+        isempty(e.kids) && return ts * "()"
+        return ts * "([" * join(map(render, e.kids), ", ") * "])"
     elseif k === :splat
         return "(" * render(e.kids[1]) * ")..."
     elseif k === :prop
@@ -127,8 +152,13 @@ function render(st::St, io::IO, ind::Int)
         end
         println(io, pad, "end")
     elseif k === :for
-        ivar, n = st.meta
-        println(io, pad, "for ", String(ivar), " in 1:", n)
+        ivar, n = st.meta[1], st.meta[2]
+        # A rand-derived trip count sits where a literal bound would (meta[3]);
+        # it is capped at maxloop, so termination-by-construction is preserved —
+        # the loop draws its *count* from __RNG__, not its fuel. Both sides draw
+        # the same value, so iteration counts stay in lockstep.
+        boundsrc = length(st.meta) >= 3 ? st.meta[3]::String : string(n)
+        println(io, pad, "for ", String(ivar), " in 1:", boundsrc)
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "end")
     elseif k === :while
@@ -149,6 +179,29 @@ function render(st::St, io::IO, ind::Int)
         println(io, pad, "let ", blist)
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "end")
+    elseif k === :dictset
+        # d[key] = val — content-keyed, so this never throws (key type is always
+        # valid); unguarded, unlike the vector setindex which can be out of range.
+        println(io, pad, String(st.meta::Symbol), "[", render(st.exs[1]), "] = ", render(st.exs[2]))
+    elseif k === :dictdel
+        println(io, pad, "delete!(", String(st.meta::Symbol), ", ", render(st.exs[1]), ")")
+    elseif k === :setpush
+        println(io, pad, "push!(", String(st.meta::Symbol), ", ", render(st.exs[1]), ")")
+    elseif k === :dictobs
+        vname, proj = st.meta
+        n = String(vname)
+        if proj === :keys
+            println(io, pad, "__obs__(keys(", n, "))")
+        elseif proj === :values
+            # sorted, so the observation is order-independent and comparable even
+            # if two iteration orders ever differed; the whole-container observe
+            # (proj :whole) already tests iteration order via __fjnorm__.
+            println(io, pad, "__obs__(sort(collect(values(", n, "))))")
+        elseif proj === :len
+            println(io, pad, "__obs__(length(", n, "))")
+        else   # :whole
+            println(io, pad, "__obs__(", n, ")")
+        end
     elseif k === :push
         println(io, pad, "push!(", String(st.meta::Symbol), ", ", render(st.exs[1]), ")")
     elseif k === :setindex
@@ -259,6 +312,10 @@ end
 
 function render(prog::Program)::String
     io = IOBuffer()
+    # The per-program RNG, as a literal seed baked identically into both engines'
+    # source (determinism.md §3). `Xoshiro` resolves against SETUP_SRC's
+    # `using Random`, which every fresh module evaluates before the program runs.
+    prog.rngseed === nothing || println(io, "const __RNG__ = Xoshiro(", prog.rngseed, ")")
     for st in prog.pre        # struct defs + module globals
         render(st, io, 0)
     end
@@ -278,7 +335,13 @@ end
 # normalizer scrubs anything module- or identity-dependent so observations
 # from the two modules are comparable with `isequal`.
 const SETUP_SRC = raw"""
+using Random
 const __OBS__ = Any[]
+# Virtual monotone clock (determinism.md §3): deadline/elapsed-shaped control
+# flow (`while __vtime__() < N`) without a real clock. Deterministic because
+# both engines call it the same number of times in the same order.
+const __VTIME__ = Ref(0)
+__vtime__() = (__VTIME__[] += 1)
 function __fjnorm__(x)
     if x isa Union{Number, String, Symbol, Char, Nothing}
         return x
@@ -286,6 +349,13 @@ function __fjnorm__(x)
         return map(__fjnorm__, x)
     elseif x isa AbstractArray
         return Any[__fjnorm__(el) for el in x]
+    elseif x isa AbstractDict
+        # Content-keyed Dicts iterate identically across the two engines
+        # (determinism.md §4), but sorting by the normalized key makes the
+        # observation order-independent regardless — safe, and still full-content.
+        return (:__dict, sort!(Any[(__fjnorm__(k), __fjnorm__(v)) for (k, v) in x]; by = p -> string(p[1])))
+    elseif x isa AbstractSet
+        return (:__set, sort!(Any[__fjnorm__(el) for el in x]; by = string))
     elseif x isa Function
         return :__fn__
     elseif x isa Type

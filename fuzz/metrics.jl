@@ -119,6 +119,8 @@ end
 const TRACKED = (:try, :for, :while, :if, :let, :fundef, :recdef, :structdef, :amodify,
                  :setprop, :alias, :loopundef, :maybeundef, :typedlocal, :brk, :cont, :ret,
                  :compr, :push, :setindex,
+                 # determinism unlocks (determinism.md §3/§4)
+                 :rng, :vtime, :dictlit, :setlit, :dictset, :dictdel, :setpush, :dictobs,
                  # expression-level constructs (counted via scanex!)
                  :builtin, :guard, :callfn, :callvar, :kwcall, :closure, :closuremut, :call,
                  :ctrl_in_fn, :try_in_loop, :try_in_loop_in_fn, :exit_through_try)

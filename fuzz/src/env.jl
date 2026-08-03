@@ -66,7 +66,11 @@ end
 # :observe (a program with neither generates nothing and compares nothing).
 const SWARMABLE = (:if, :for, :while, :let, :try, :push, :setindex, :alias, :setprop,
                    :amodify, :compr, :maybeundef, :loopundef, :typedlocal, :brk, :cont,
-                   :ret, :reassign)
+                   :ret, :reassign,
+                   # determinism unlocks (determinism.md §3/§4): explicit-RNG draws,
+                   # content-keyed Dict/Set, and the virtual clock, each maskable so
+                   # a program that targets them isn't diluted by everything else.
+                   :rng, :dict, :vtime)
 
 const POLICIES = (
     :uniform,    # no skew — keeps the historical distribution in the mix
@@ -75,6 +79,7 @@ const POLICIES = (
     :builtins,   # the intrinsics/builtins probe dictionary and atomics
     :toplevel,   # bare-toplevel statements, globals, undefined-variable probes
     :mutation,   # vectors, structs, aliasing, field and atomic writes
+    :determinism,# explicit-RNG draws, content-keyed Dict/Set, virtual clock
 )
 
 # Weight multipliers per (policy, rule). Missing entries default to 1.0.
@@ -90,6 +95,15 @@ const POLICY_BOOST = Dict{Symbol,Dict{Symbol,Float64}}(
                         :reassign => 2.0),
     :mutation   => Dict(:push => 3.0, :setindex => 3.0, :alias => 4.0, :setprop => 3.0,
                         :amodify => 3.0, :compr => 2.0),
+    # RNG draws (int/float/bool), the vtime clock, and every Dict/Set rule
+    # (construction, get/get!/haskey/in/length, setindex/delete/push, keys/values
+    # observations). Boosting the rule weights alone is not enough for Dict/Set —
+    # every op needs a container in scope — so :determinism also raises the rate
+    # of *creating* one (see newvarsum).
+    :determinism => Dict(:rngint => 6.0, :rngfloat => 5.0, :rngbool => 5.0, :vtime => 5.0,
+                         :dictget => 4.0, :dictlen => 3.0, :haskey => 3.0, :setin => 3.0,
+                         :dictset => 4.0, :dictdel => 3.0, :setpush => 3.0, :dictobs => 4.0,
+                         :for => 2.0),
 )
 
 mutable struct Ctx
@@ -108,6 +122,8 @@ mutable struct Ctx
     policy::Symbol                  # generation policy skewing the weights
     rtscopes::Int                   # enclosing constructs that introduce a *runtime* scope
                                     # (for/while/let/try bodies) — `if` does not count
+    rngseed::Int                    # literal seed for `const __RNG__ = Xoshiro(rngseed)`;
+                                    # emitted only when the `:rng` feature is on (rngavail)
 end
 
 function Ctx(rng::AbstractRNG, cfg::Cfg=Cfg())
@@ -120,13 +136,21 @@ function Ctx(rng::AbstractRNG, cfg::Cfg=Cfg())
         (!cfg.swarm || rand(rng) < 0.7) && push!(enabled, r)
     end
     policy = cfg.policy ? pick(rng, POLICIES) : :uniform
+    # Drawn unconditionally (so the choice sequence is stable whether or not the
+    # `:rng` feature is on); used only when `rngavail` is true. A small positive
+    # literal keeps repros readable.
+    rngseed = rand(rng, 1:1_000_000_000)
     return Ctx(rng, cfg, [VInfo[]], FnInfo[], StructT[], cfg.maxdepth, 0, false, 0, nothing,
-               enabled, policy, 0)
+               enabled, policy, 0, rngseed)
 end
 
 # Swarm gate: is this rule family available in the program being generated?
 # Rules not in SWARMABLE are always on.
 swarmon(ctx::Ctx, rule::Symbol) = !ctx.cfg.swarm || rule in ctx.enabled || !(rule in SWARMABLE)
+
+# Is the explicit-RNG feature available? Gates both the `__RNG__` declaration
+# (render.jl, via Program.rngseed) and every rand-drawing rule.
+rngavail(ctx::Ctx) = swarmon(ctx, :rng)
 
 # Apply the program's policy to a (weight, rule) menu, dropping swarm-disabled
 # rules. Every weighted choice over rule names goes through here.
