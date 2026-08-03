@@ -68,6 +68,14 @@ share it. A regression test belongs next to
 `test/interpret.jl:1512` ("rethrow() from a callee of a catch block"), which
 covers this only for the recursive interpreter.
 
+The interception is deliberate and was refined three times — `9409513`
+("Make current_exceptions() see interpreted exception handlers"), `38fd518`
+("Make rethrow() find the exception being handled in caller frames") and
+`f1c7c6f` ("Match native rethrow semantics on the active-exception stack").
+None of the three touched the non-recursive path, and the package's own tests
+for all three call `finish_and_return!` with the default interpreter, so
+nothing was in place to notice.
+
 ## Why the fuzzer had not found it before
 
 The differential axis has run `--modes both` for a long time, so the *inputs*
