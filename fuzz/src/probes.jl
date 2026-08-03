@@ -195,6 +195,7 @@ const PROBE_BANS = ProbeBan[
     ProbeBan(:cglobal, :all, "resolves a raw symbol address: the result is a Ptr (class X) and the call needs literal syntax to lower at all."),
     ProbeBan(r"^memoryref", :arbitrary, "MemoryRef family: with an unchecked (boundscheck=false) reference an out-of-range index is a wild read/write. Reachable only via recipes, which always pass a literal `true`."),
     ProbeBan(:memorynew, :all, "allocation size comes straight from an argument; typemax(Int) is in the literal menu, so the probe becomes an OOM/abort rather than a finding."),
+    ProbeBan(:_svec_len, :all, "unchecked SimpleVector length read: on a non-svec argument compiled Julia type-checks and throws (TypeError) but Compiled mode's native call reads the length field of whatever object is passed and returns a raw address-magnitude integer — a class-X divergence, and the value is nondeterministic."),
 
     # -- class U: the contract itself permits the engines to differ ---------
     # (determinism.md §1/§8: no infrastructure fixes these; the only handles
@@ -690,13 +691,11 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
         ctx -> Ex[psrc("Core.memoryrefnew(" * MEM_SRC * ")"),
                   psrc(string(rand(ctx.rng, 1:4))), psrc("true")],
         ctx -> Ex[psrc("Core.memoryrefnew(" * MEM_SRC * ")"), psrc("9"), psrc("true")],
-        ctx -> Ex[probearg(ctx)],
     ],
     :memoryrefget => Function[
         ctx -> Ex[psrc(MEMREF_SRC), psrc(":not_atomic"), psrc("true")],
         ctx -> Ex[psrc(MEMREF_SRC), psrc(pick(ctx.rng, PROBE_ORDERINGS)), psrc("true")],
         ctx -> Ex[psrc("Core.memoryrefnew(Memory{Any}(undef, 2))"), psrc(":not_atomic"), psrc("true")],
-        ctx -> Ex[probearg(ctx), psrc(":not_atomic"), psrc("true")],
     ],
     :memoryrefset! => Function[
         ctx -> Ex[psrc(MEMREF_SRC), genleaf(ctx, IntT), psrc(":not_atomic"), psrc("true")],
@@ -704,7 +703,6 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
     ],
     :memoryrefoffset => Function[
         ctx -> Ex[psrc(MEMREF_SRC)],
-        ctx -> Ex[probearg(ctx)],
     ],
     :memoryref_isassigned => Function[
         ctx -> Ex[psrc(MEMREF_SRC), psrc(":not_atomic"), psrc("true")],

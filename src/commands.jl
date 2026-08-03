@@ -567,10 +567,19 @@ function maybe_step_through_nkw_meta!(frame::Frame)
 end
 
 function more_calls_on_current_line(frame::Frame)
-    _, curr_line = whereis(frame)
+    # `whereis` returns nothing when a pc carries no line info (a toplevel
+    # surface statement, a compiler-generated statement); with no current line
+    # there is nothing to compare against, so there are no "more calls on it".
+    loc = whereis(frame)
+    loc === nothing && return false
+    _, curr_line = loc
     curr_pc = frame.pc + 1
     while curr_pc <= length(frame.framecode.src.code)
-        _, new_line = whereis(frame, curr_pc)
+        newloc = whereis(frame, curr_pc)
+        # A statement with no line info isn't a call to stop at; skip it and keep
+        # scanning the same line rather than crashing on the missing tuple.
+        newloc === nothing && (curr_pc += 1; continue)
+        _, new_line = newloc
         new_line == curr_line || return false
         stmt = pc_expr(frame, curr_pc)
         is_call(stmt) && !is_assignment_write_call(stmt) && return true

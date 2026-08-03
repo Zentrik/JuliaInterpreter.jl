@@ -1,0 +1,163 @@
+# step_only_throw (step-step_only_throw-88d4b5b2)
+
+- seed: `2000019`
+- walk seed: `5519514113680130179`
+- interp mode: `step`
+- julia: `1.12.6`
+- divergent observation index: 0
+- ref exception: `none`  interp exception: `MethodError`
+
+## Detail
+
+```
+stepping threw where plain interpretation completed
+MethodError in more_calls_on_current_line (commands.jl:570): MethodError: no method matching iterate(::Nothing)
+The function `iterate` exists, but no method is defined for this combination of argument types.
+
+Closest candidates are:
+  iterate(!Matched::Compiler.ForwardToBackedgeIterator, !Matched::Int64)
+   @ Base ~/.julia/juliaup/julia-1.12.6+0.x64.linux.gnu/share/julia/Compiler/src/typeinfer.jl:584
+  iterate(!Matched::Compiler.ForwardToBackedgeIterator)
+   @ Base ~/.julia/juliaup/julia-1.12.6+0.x64.linux.gnu/share/julia/Compiler/src/typeinfer.jl:584
+  i
+
+Stacktrace:
+  [1] indexed_iterate(I::Nothing, i::Int64)
+    @ Base ./tuple.jl:165
+  [2] more_calls_on_current_line(frame::JuliaInterpreter.Frame)
+    @ JuliaInterpreter /home/user/JuliaInterpreter.jl/src/commands.jl:570
+  [3] debug_command(interp::JuliaInterpreter.RecursiveInterpreter, frame::JuliaInterpreter.Frame, cmd::Symbol, rootistoplevel::Bool; line::Nothing)
+    @ JuliaInterpreter /home/user/JuliaInterpreter.jl/src/commands.jl:654
+  [4] debug_command
+    @ /home/user/JuliaInterpreter.jl/src/commands.jl:630 [inlined]
+  [5] walkframe!(rng::Random.Xoshiro, interp::JuliaInterpreter.RecursiveInterpreter, frame::JuliaInterpreter.Frame, maxcmds::Int64)
+    @ Main.FuzzJI /home/user/JuliaInterpreter.jl/fuzz/src/stepfuzz.jl:144
+  [6] step_program(src::String; walkseed::Int64, interp::JuliaInterpreter.RecursiveInterpreter, maxcmds::Int64, usebreakpoints::Bool)
+    @ Main.FuzzJI /home/user/JuliaInterpreter.jl/fuzz/src/stepfuzz.jl:191
+  [7] step_program
+    @ /home/user/JuliaInterpreter.jl/fuzz/src/stepfuzz.jl:175 [inlined]
+  [8] step_campaign(; n::Int64, baseseed::Int64, nstmts::Int64, outdir::String, journaldir::String, cfg::Cfg, progress::Int64, maxcmds::Int64, seeddisk::Bool, journalsync::Bool, usebreakpoints::Bool, doshrink::Bool, shrinkruns::Int64, shrinksecs::Float64)
+    @ Main.FuzzJI /home/user/JuliaInterpreter.jl/fuzz/src/stepfuzz.jl:349
+  [9] top-level scope
+    @ /home/user/JuliaInterpreter.jl/fuzz/run.jl:188
+ [10] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [11] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [12] _start()
+    @ Base ./client.jl:550
+```
+
+## Shrunk program
+
+```julia
+struct S1
+    fld2::Symbol
+end
+global g3::Float64 = -2.47
+function f4()
+    if (!(:c === :c))
+        u5 = "a"
+    end
+    __obs__(@isdefined(u5))
+    __obs__(try; u5; catch __e; (:__undef, nameof(typeof(__e))) end)
+    __obs__(((3 + 1) + 0))
+    __obs__((try (1 % 9223372036854775807) catch __e; (:__thrown, nameof(typeof(__e))) end))
+    return ((((975 * (-814)) - (true ? 5 : (-6))) < 5) ? (min((false ? 729 : 5), 728) - (((-6) - (-1)) * 9223372036854775807)) : 764)
+end
+if (!true)
+    u6 = string(string(f4(), (!("" == "βay")), true), false, :e)
+end
+__obs__(@isdefined(u6))
+__obs__(try; u6; catch __e; (:__undef, nameof(typeof(__e))) end)
+let
+    v7 = ("🐛b🐛0∀∀" == (((false && false) && (false || true)) ? "" : "b y🐛b"))
+    v8 = [g3, 1.5]
+    v9 = S1(:e)
+    for i10 in 1:1
+        v11 = (-6)
+        (((v7 && ((v9).fld2 === (v9).fld2)) && (((try (v8)[i10] catch __e; (:__thrown, nameof(typeof(__e))) end) isa Int64) || ((g3 / g3) isa Number)))) && break
+    end
+    v7 = (("!1" != "") || false)
+    v12 = [4, 1]
+    v9 = S1(:d)
+    v12 = [10]
+    if (("a∀x" == ((false && v7) ? "ββ" : "")) isa Bool)
+        u13 = 9
+    end
+    __obs__(@isdefined(u13))
+    __obs__(try; u13; catch __e; (:__undef, nameof(typeof(__e))) end)
+    v14 = Any[v7]
+    push!(v14, (get(v12, (("b" isa Any) ? 8 : ((-2) * 0)), 9) * 899))
+    __obs__((-794))
+    if (get(v12, (-9), ((v7 && true) ? (9 - (-3)) : (-5))) == min(((1 != 754) ? 0 : (3 + (-7))), (6 * (-331))))
+        u15 = (f4() + (((-6) * f4()) * f4()))
+    end
+    __obs__(@isdefined(u15))
+    __obs__(try; u15; catch __e; (:__undef, nameof(typeof(__e))) end)
+    __obs__(v14)
+    __obs__(v12)
+    __obs__(v9)
+    __obs__(v8)
+    __obs__(v7)
+    __obs__(g3)
+end
+
+```
+
+## Original program
+
+```julia
+struct S1
+    fld2::Symbol
+end
+global g3::Float64 = -2.47
+function f4()
+    if (!(:c === :c))
+        u5 = "a"
+    end
+    __obs__(@isdefined(u5))
+    __obs__(try; u5; catch __e; (:__undef, nameof(typeof(__e))) end)
+    __obs__(((3 + 1) + 0))
+    __obs__((try (1 % 9223372036854775807) catch __e; (:__thrown, nameof(typeof(__e))) end))
+    return ((((975 * (-814)) - (true ? 5 : (-6))) < 5) ? (min((false ? 729 : 5), 728) - (((-6) - (-1)) * 9223372036854775807)) : 764)
+end
+if (!true)
+    u6 = string(string(f4(), (!("" == "βay")), true), false, :e)
+end
+__obs__(@isdefined(u6))
+__obs__(try; u6; catch __e; (:__undef, nameof(typeof(__e))) end)
+let
+    v7 = ("🐛b🐛0∀∀" == (((false && false) && (false || true)) ? "" : "b y🐛b"))
+    v8 = [g3, 1.5]
+    v9 = S1(:e)
+    for i10 in 1:1
+        v11 = (-6)
+        (((v7 && ((v9).fld2 === (v9).fld2)) && (((try (v8)[i10] catch __e; (:__thrown, nameof(typeof(__e))) end) isa Int64) || ((g3 / g3) isa Number)))) && break
+    end
+    v7 = (("!1" != "") || false)
+    v12 = [4, 1]
+    v9 = S1(:d)
+    v12 = [10]
+    if (("a∀x" == ((false && v7) ? "ββ" : "")) isa Bool)
+        u13 = 9
+    end
+    __obs__(@isdefined(u13))
+    __obs__(try; u13; catch __e; (:__undef, nameof(typeof(__e))) end)
+    v14 = Any[v7]
+    push!(v14, (get(v12, (("b" isa Any) ? 8 : ((-2) * 0)), 9) * 899))
+    __obs__((-794))
+    if (get(v12, (-9), ((v7 && true) ? (9 - (-3)) : (-5))) == min(((1 != 754) ? 0 : (3 + (-7))), (6 * (-331))))
+        u15 = (f4() + (((-6) * f4()) * f4()))
+    end
+    __obs__(@isdefined(u15))
+    __obs__(try; u15; catch __e; (:__undef, nameof(typeof(__e))) end)
+    __obs__(v14)
+    __obs__(v12)
+    __obs__(v9)
+    __obs__(v8)
+    __obs__(v7)
+    __obs__(g3)
+end
+
+```
