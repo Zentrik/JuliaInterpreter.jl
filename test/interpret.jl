@@ -1796,3 +1796,14 @@ end
         @test err_interp.msg == err_native.msg
     end
 end
+
+@testset "invoke with too few arguments raises the native ArgumentError" begin
+    inv_va(a...) = invoke(a...)
+    for badargs in ((), (sin,))
+        err_native = try inv_va(badargs...); nothing catch err; err end
+        err_interp = try @interpret inv_va(badargs...); nothing catch err; err end
+        @test err_native isa ArgumentError
+        @test typeof(err_interp) === typeof(err_native)
+        @test err_interp.msg == err_native.msg
+    end
+end

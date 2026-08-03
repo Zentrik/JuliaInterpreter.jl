@@ -383,6 +383,10 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         return Base.ExceptionStack(stack)
     end
     if fargs[1] === Core.invoke # invoke needs special handling
+        if length(fargs) < 3
+            # too few arguments: the native builtin raises its ArgumentError
+            return invoke(fargs[2:end]...)
+        end
         argtypes = fargs[3]
         fargs_pruned = [fargs[2]; fargs[4:end]]
         sig = Tuple{mapany(_Typeof, fargs_pruned)...}
