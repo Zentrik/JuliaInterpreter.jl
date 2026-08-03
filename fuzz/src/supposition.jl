@@ -39,7 +39,7 @@ ProgramGen() = ProgramGen(Cfg())
 Supposition.produce!(tc::TestCase, pg::ProgramGen) = genprogram(TCRNG(tc), pg.cfg)
 
 """
-    supposition_campaign(; rounds, examples, nstmts, outdir, cfg) -> nfindings
+    supposition_campaign(; rounds, examples, nstmts, outdir, cfg) -> (; nfound, nondet_discard)
 
 Run up to `rounds` Supposition `@check` passes of `examples` cases each.
 Each round hunts for a divergence not already suppressed, reported on disk,
@@ -57,6 +57,12 @@ finding can mask unrelated new ones).
 Counterexamples are Supposition-shrunk by choice-sequence replay, then
 polished by the greedy IR shrinker, and reported through the same
 `writefinding` path as the native driver.
+
+Every candidate divergence passes the confirm-on-divergence gate (`confirm`,
+classify.jl) *inside* the property, so a nondeterministic candidate is a
+`nondet_discard` — the property passes, the round keeps hunting, and shrinking
+never chases a moving target. The count of such discards is returned next to
+the finding count.
 """
 function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=300_000,
                               outdir::String=joinpath(@__DIR__, "..", "findings"),
@@ -74,6 +80,7 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
     j = Journal(journaldir; sync=journalsync)
     gen = ProgramGen(cfg)
     nfound = 0
+    nondet = Ref(0)   # divergences dropped by the confirm-on-divergence gate
     dry = 0        # consecutive rounds with no new finding
     for round in 1:rounds
         # Track the smallest failing program ourselves: robust against
@@ -88,6 +95,15 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
             for (mode, int) in intruns
                 v = classify(ref, int)
                 (isfinding(v) && !suppressed(v) && !(tagfp(mode, fingerprint(v)) in seen)) || continue
+                # Confirm before failing the property: an unstable divergence
+                # must not become a counterexample, or the shrinker spends the
+                # round replaying a candidate whose verdict changes underneath
+                # it. The gate only runs on the rare divergence path.
+                if confirm(src, ref, int; nstmts, interp=modeinterp(mode)) !== :stable
+                    nondet[] += 1
+                    @debug "nondet_discard (supposition)" round mode v.class
+                    continue
+                end
                 cur = best[]
                 if cur === nothing || length(render(prog)) < length(render(cur[1]))
                     best[] = (prog, v, mode)
@@ -101,15 +117,16 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
         if b === nothing
             dry += 1
             if dry >= patience
-                @info "supposition campaign exhausted" round examples dry_rounds = dry
+                @info "supposition campaign exhausted" round examples dry_rounds = dry nondet_discard = nondet[]
                 break
             end
-            @info "supposition round found nothing new; continuing" round examples dry_rounds = dry patience
+            @info "supposition round found nothing new; continuing" round examples dry_rounds = dry patience nondet_discard = nondet[]
             continue
         end
         dry = 0
         prog, v0, mode = b
-        r = run_both(render(prog); nstmts, interp=modeinterp(mode))
+        origsrc = render(prog)
+        r = run_both(origsrc; nstmts, interp=modeinterp(mode))
         # verdict of the *minimal* program (fall back to the recorded one if
         # the rerun no longer reproduces, e.g. a budget-sensitive case)
         v = if r !== nothing
@@ -119,13 +136,23 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
             v0
         end
         fp = tagfp(mode, fingerprint(v))
-        push!(seen, fp)
-        nfound += 1
         @info "FINDING (supposition)" round fp v.class mode detail = first(v.detail, 300)
         shrunk = doshrink ? shrink(prog, fingerprint(v); nstmts, interp=modeinterp(mode)) : prog
-        dir = writefinding(outdir, fp, v, -1, render(prog), render(shrunk); mode)
-        @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk)
+        # Same last gate as the native driver: confirm what is about to be
+        # written, preferring the shrunk program and falling back to the
+        # pre-shrink one before giving up on the candidate entirely.
+        reportsrc = confirmreport(origsrc, render(shrunk), fingerprint(v);
+                                  nstmts, interp=modeinterp(mode))
+        if reportsrc === nothing
+            nondet[] += 1
+            @warn "  not reported: neither the shrunk nor the original program confirmed on re-run" fp round
+            continue
+        end
+        push!(seen, fp)
+        nfound += 1
+        dir = writefinding(outdir, fp, v, -1, origsrc, reportsrc; mode)
+        @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk) shrunk_confirmed = (reportsrc == render(shrunk))
     end
     close(j)
-    return nfound
+    return (; nfound, nondet_discard = nondet[])
 end

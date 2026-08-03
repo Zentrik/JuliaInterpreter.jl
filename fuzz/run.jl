@@ -142,17 +142,17 @@ modes = o["modes"] == "both" ? (:rec, :cmp) :
 if o["selftest"]
     include(joinpath(@__DIR__, "selftest.jl"))
 elseif o["engine"] == "supposition"
-    nfound = supposition_campaign(examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
-                                  modes=modes, cfg=cfg, patience=o["patience"],
-                                  seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                                  journaldir=o["journaldir"])
-    @info "supposition campaign complete" nfound
-    exit(nfound == 0 ? 0 : 2)   # non-zero exit on new findings, for CI
+    res = supposition_campaign(examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
+                               modes=modes, cfg=cfg, patience=o["patience"],
+                               seeddisk=!o["fresh"], journalsync=!o["nosync"],
+                               journaldir=o["journaldir"])
+    @info "supposition campaign complete" res.nfound res.nondet_discard
+    exit(res.nfound == 0 ? 0 : 2)   # non-zero exit on new findings, for CI
 elseif o["engine"] == "native"
     stats = campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], doshrink=!o["noshrink"],
                      modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"],
                      journaldir=o["journaldir"])
-    @info "campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
+    @info "campaign complete" stats.cases stats.agreed stats.aborted stats.nondet_discard stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "step"
     stats = step_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,
