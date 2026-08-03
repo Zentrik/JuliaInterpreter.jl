@@ -125,11 +125,10 @@ Do stage one before stage two. It is cheap and it de-risks the rest.
 
 ### 3. ~~Shrinking for the step, evalcode and corpus axes~~ — **DONE**
 
-The step/evalcode/corpus axes minimize a finding before writing it, and
-`meta.md` records the original alongside the shrunk program on every axis.
-Still open: the *split* axis (added after this item landed) writes findings
-unshrunk — its keep predicate is a pure source-text-in/fingerprint-out
-function, the easiest of the four to wire to `ddmin_source`.
+Every axis minimizes a finding before writing it, and `meta.md` records the
+original alongside the shrunk program. The split axis (added after this item
+first landed) uses `ddmin_source` with "same fingerprint" as its property —
+a pure source-text-in/verdict-out predicate.
 
 What it took, in case any of it needs revisiting:
 

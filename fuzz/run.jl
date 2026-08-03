@@ -201,7 +201,7 @@ elseif o["engine"] == "split"
     stats = split_campaign(n=o["n"], baseseed=o["seed"], nstmts=o["budget"],
                            cfg=SplitCfg(maxdepth=o["splitdepth"], maxfrags=o["maxfrags"]),
                            seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                           journaldir=o["journaldir"])
+                           doshrink=!o["noshrink"], journaldir=o["journaldir"], shrinkopts...)
     @info "split campaign complete" stats.cases stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "corpus"

@@ -983,7 +983,8 @@ function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                         outdir::String=joinpath(@__DIR__, "..", "findings"),
                         journaldir::String=joinpath(@__DIR__, "..", "journal"),
                         cfg::SplitCfg=SplitCfg(), progress::Int=100,
-                        seeddisk::Bool=true, journalsync::Bool=true)
+                        seeddisk::Bool=true, journalsync::Bool=true,
+                        doshrink::Bool=true, shrinkruns::Int=80, shrinksecs::Real=240.0)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
@@ -1017,12 +1018,20 @@ function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                     push!(seen, fp)
                     stats.findings += 1
                     @info "SPLIT FINDING $(v.class)" seed fp nfrags = spl.nfrags detail = first(v.detail, 400)
-                    # TODO: unshrunk (original == shrunk). The IR shrinker in
-                    # shrink.jl works on the generated Program IR, which this
-                    # axis does not use; a predicate-driven source shrinker
-                    # ("does this text still produce the same fingerprint")
-                    # would serve every non-IR axis at once.
-                    writefinding(outdir, fp, v, seed, src, src; mode=:split)
+                    # This axis generates source text, not Program IR, so
+                    # minimization is the statement-level delta debugger with
+                    # "same fingerprint" as the property.
+                    shrunksrc = if doshrink
+                        keep = s -> begin
+                            r2 = split_case(s; nstmts, maxfrags=cfg.maxfrags)
+                            r2 !== nothing && tagfp(:split, fingerprint(r2[1])) == fp
+                        end
+                        ddmin_source(src, keep;
+                                     budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs))
+                    else
+                        src
+                    end
+                    writefinding(outdir, fp, v, seed, src, shrunksrc; mode=:split)
                 end
             end
             if progress > 0 && i % progress == 0

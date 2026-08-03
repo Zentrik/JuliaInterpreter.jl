@@ -578,7 +578,8 @@ and belong in `SUPPRESSIONS` if hit).
   property as a `keep(src)::Bool` predicate, the stepping/eval_code/corpus
   walks got their own replayable seeds, and corpus findings are minimized by a
   statement-level delta debugger shared with `crashmin.jl`. See Shrinking,
-  above. (The split axis, added after, still writes findings unshrunk.)
+  above. The split axis minimizes with the same delta debugger against a
+  same-fingerprint property.
 - **M3.7 — ExprSplitter axis** (done): `--engine split` feeds `construct.jl`
   adversarial toplevel forms from a template-combinator generator, with a
   module-tree effect oracle on top of the failure-mode one.
