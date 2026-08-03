@@ -1,0 +1,98 @@
+# Nightly differential fuzzing of JuliaInterpreter (fuzz/, NEXT.md item 7).
+#
+# Two lanes:
+#   - '1.12' (required): the supported Julia. New findings turn this lane red.
+#   - 'pre' (continue-on-error): the NEXT Julia, where JuliaInterpreter's bug
+#     density historically concentrates. A red pre lane is early warning of
+#     upcoming breakage, not a bug in current code. The selftest acts as a
+#     support gate: if the harness itself does not pass on 'pre', the job stops
+#     there — campaign findings are never produced on an unsupported Julia.
+#
+# Findings (fuzz/findings/ is gitignored, so a checkout starts empty), the
+# longrun logs and any crash-journal evidence are always uploaded as artifacts;
+# the job then fails iff the findings directory gained entries.
+name: Fuzz nightly
+on:
+  schedule:
+    - cron: '17 3 * * *'   # 03:17 UTC, off-peak
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'Campaign duration passed to fuzz/longrun.sh (seconds)'
+        required: false
+        default: '10800'
+permissions:
+  contents: read
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  fuzz:
+    name: Fuzz Julia ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.version == 'pre' }}
+    # duration (default 3 h) + up to ~30 min of longrun batch overshoot
+    # + setup/selftest/upload, comfortably under GitHub's 6 h job limit.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.12'   # required lane
+          - 'pre'    # early-warning lane on the upcoming Julia
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The fuzzing harness lives on this branch; master has no fuzz/ yet.
+          # Drop this pin (checkout default) once the branch merges.
+          ref: claude/fuzzing-effectiveness-review-92ph29
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - name: Instantiate the fuzz environment
+        run: julia --project=fuzz -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+      - name: Support gate (fuzz selftest)
+        # A failure here ends the job before any campaign runs: on 'pre' that
+        # means "this Julia is not supported yet", and continue-on-error keeps
+        # the workflow green while the lane itself is marked failed.
+        run: julia --project=fuzz fuzz/run.jl --selftest
+      - name: Snapshot findings
+        run: |
+          mkdir -p fuzz/findings
+          ls -1 fuzz/findings | sort > "$RUNNER_TEMP/findings-before.txt"
+      - name: Run fuzzing campaign
+        env:
+          DURATION: ${{ inputs.duration_seconds || '10800' }}
+        run: ./fuzz/longrun.sh "$DURATION"
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings-julia-${{ matrix.version }}
+          path: fuzz/findings/
+          if-no-files-found: ignore
+      - name: Upload longrun logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-longrun-logs-julia-${{ matrix.version }}
+          path: fuzz/longrun/
+          if-no-files-found: ignore
+      - name: Upload crash journals
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-journals-julia-${{ matrix.version }}
+          path: fuzz/journal-*/crashed/
+          if-no-files-found: ignore
+      - name: Fail on new findings
+        run: |
+          ls -1 fuzz/findings | sort > "$RUNNER_TEMP/findings-after.txt"
+          new_findings=$(comm -13 "$RUNNER_TEMP/findings-before.txt" "$RUNNER_TEMP/findings-after.txt")
+          if [ -n "$new_findings" ]; then
+            echo "New findings:"
+            echo "$new_findings"
+            exit 1
+          fi
+          echo "No new findings."
