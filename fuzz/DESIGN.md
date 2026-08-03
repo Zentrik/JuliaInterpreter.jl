@@ -267,6 +267,29 @@ interpreter special-cases" cannot drift from the interpreter's:
   oracle. `:all` entries are never rendered; `:arbitrary` entries are
   reachable only through a vetted recipe. See "known false-positive and
   worker-death classes" below for the measurements behind them.
+- **Optimizer barriers on probe arguments** (`render.jl`, the `:probe` branch;
+  `probe_arg_mustbeliteral` in `probes.jl`). Every probe argument is wrapped in
+  `Base.compilerbarrier(:const, …)` — which passes the value through unchanged
+  but blocks constant propagation — so the *compiled* reference cannot
+  constant-fold the call and must defer to the runtime builtin/intrinsic,
+  exactly as the interpreter always does. That deferral (1) closes the class-U
+  window where the reference folds constant operands to a *compile-time* error
+  while the interpreter reaches the runtime error, and (2) means the three-way
+  JI adjudicator (see the oracle section) does not have to run a subprocess to
+  absorb a divergence that no longer arises. `:const` is chosen over
+  `:type`/`inferencebarrier` because it is *type*-preserving: a valid call stays
+  valid and returns the same value, so barriers never change what a program
+  computes. Constant-required slots stay **bare** — the cast-intrinsic target
+  `Type` (codegen reads the target width from it), atomic ordering symbols
+  (`atomic_fence` and the getfield/setfield!/…/global/memoryref families), the
+  module references handed to the global-binding builtins, and the `memoryref*`
+  boundscheck flag (memory safety) — because a barrier there is a NEW
+  compile-time error or a lost guarantee, strictly worse than the class-U it
+  removes. Because barriers make the reference defer, the mismatched-operand
+  arm of the numeric intrinsics (a fraction of `sametype_intargs` /
+  `sametype_floatargs`) is re-enabled: without a fold the mismatch is a plain
+  runtime `ErrorException` on both sides (verified: 286 barriered mismatched
+  calls, 0 divergences).
 
 `fuzz/metrics.jl` reports enumerated / allowed / denylisted counts, the recipe
 inventory, and probe density plus distinct-callable coverage under the
@@ -721,6 +744,24 @@ without waiting for a live finding.
   rather than news. When probing a builtin whose *compiled* form is a codegen
   special case, expect this class and check what real lowering can actually
   emit before believing the divergence.
+- **Constant operands the reference folds to a compile-time error** (the
+  numeric-intrinsic and atomic-ordering "phase" class-U). A probe with all
+  constant arguments lets the compiled reference constant-fold the call, and
+  when the folded operands are invalid — mismatched-type integer operands to
+  `add_int`, an invalid atomic ordering — the reference raises the error *while
+  the thunk is compiled*, outside the program's `try`, whereas the interpreter
+  always defers to the runtime builtin/intrinsic and raises a different error at
+  a different phase. Whether the fold happens at all is optimization-dependent,
+  which made this a flaky false positive. Closed structurally by wrapping every
+  non-constant-required probe argument in `Base.compilerbarrier(:const, …)`
+  (`render.jl`): the barrier blocks constant propagation, so the reference can
+  no longer evaluate the operands at compile time and defers to the same runtime
+  path the interpreter takes — both sides now reach the identical runtime error.
+  The barrier is value-preserving (`:const` keeps the exact type, so valid calls
+  still return their value), which also lets the prober re-enable the
+  mismatched-type numeric-intrinsic arm the earlier same-type-only fix had to
+  drop. Slots the reference *needs* as literals stay bare — see the "optimizer
+  barriers" bullet in the prober section for the exact exclusion set.
 
 ## Sources of legitimate divergence (excluded or normalized)
 
