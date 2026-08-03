@@ -916,6 +916,16 @@ end
     let frame = JuliaInterpreter.enter_call(f_log2)
         @test (@test_logs (:error, "this error is ok") debug_command(frame, :c)) === nothing
     end
+
+    # A malformed `invoke` whose signature argument is a Type but not a *tuple*
+    # type must raise the same `TypeError` compiled Julia does, not the bare
+    # `ErrorException("expected tuple type")` the interpreter's own
+    # `signature_type` call produced before it deferred this shape (found by
+    # the differential fuzzer).
+    ferr(x::Int) = x + 1
+    @test_throws TypeError @interpret invoke(ferr, Char, 3)
+    # A well-formed invoke still resolves and runs under the interpreter.
+    @test @interpret(invoke(ferr, Tuple{Int}, 3)) === 4
 end
 
 struct A396

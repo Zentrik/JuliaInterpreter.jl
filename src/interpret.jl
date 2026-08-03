@@ -417,6 +417,12 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
             # run it natively.
             return invoke(fargs[2:end]...)
         else
+            # `argtypes` is a plain Type here. Native `invoke` requires it to be a
+            # *tuple* type (`Type{T} where T<:Tuple`); a non-tuple type such as
+            # `Char` makes `signature_type` raise a bare
+            # `ErrorException("expected tuple type")` where native `invoke` raises a
+            # clean `TypeError`. Defer so the error matches, as the checks above do.
+            Base.unwrap_unionall(argtypes) <: Tuple || return invoke(fargs[2:end]...)
             # Select the method in the frame's world; plain `which` would use the task's
             # (possibly newer) world.
             invoke_sig = Base.signature_type(fargs[2], argtypes)
