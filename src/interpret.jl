@@ -725,7 +725,9 @@ function interpret_toplevel_stmt!(interp::Interpreter, frame::Frame, @nospeciali
         return_from(newframe)
         return rhs
     elseif isexpr(lwr, :error)
-        throw(ArgumentError("lowering returned an error, $lwr"))
+        # evaluate natively so the native syntax error is raised
+        # (an ErrorException whose message starts with "syntax: ")
+        return Core.eval(mod, lwr)
     elseif isexpr(lwr, (:toplevel, :module))
         # macro expansion surfaced a nested toplevel/module; interpret it directly
         newframe = Frame(mod, lwr::Expr; world=frame.world)
@@ -846,10 +848,9 @@ function step_expr!(interp::Interpreter, frame::Frame, @nospecialize(node), isto
                     isa(ret, BreakpointRef) && return ret
                     rhs = get_return(newframe)
                     return_from(newframe)
-                elseif node.head === :error
-                    error("unexpected error statement ", node)
-                elseif node.head === :incomplete
-                    error("incomplete statement ", node)
+                elseif node.head === :error || node.head === :incomplete
+                    # evaluate natively so the native syntax error is raised
+                    rhs = Core.eval(moduleof(frame), node)
                 elseif node.head === :latestworld
                     frame.world = Base.get_world_counter()
                 else

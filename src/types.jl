@@ -460,7 +460,9 @@ function Frame(mod::Module, ex::Expr; world::UInt=default_world())
             # statements, which are lowered individually in toplevel context.
             return toplevel_frame(mod, ex.args; world)
         end
-        throw(ArgumentError("lowering returned an error, $lwr"))
+        # evaluate natively so the native syntax error is raised (an ErrorException
+        # whose message starts with "syntax: ", or the ParseError for :incomplete)
+        return Core.eval(mod, lwr)
     end
     # `macroexpand` inside lowering can surface a `:toplevel`/`:module` (lowering leaves these intact)
     if isexpr(lwr, (:toplevel, :module))

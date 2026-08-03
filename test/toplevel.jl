@@ -856,9 +856,18 @@ module DirectSurface end
     @test_throws "boom" JuliaInterpreter.finish_and_return!(
         Frame(DirectSurface, Expr(:toplevel, :(error("boom")))), true)
 
-    # A statement that lowering rejects surfaces as an `ArgumentError`.
-    @test_throws "lowering returned an error" JuliaInterpreter.finish_and_return!(
-        Frame(DirectSurface, Expr(:toplevel, :(1 = 2))), true)
+    # A statement that lowering rejects surfaces as the native syntax error.
+    err_native = try Core.eval(DirectSurface, :(1 = 2)); nothing catch err; err end
+    err_interp = try
+        JuliaInterpreter.finish_and_return!(
+            Frame(DirectSurface, Expr(:toplevel, :(1 = 2))), true)
+        nothing
+    catch err
+        err
+    end
+    @test err_native isa ErrorException
+    @test typeof(err_interp) === typeof(err_native)
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
 
     # A bare literal statement is evaluated and returned.
     @test JuliaInterpreter.finish_and_return!(
@@ -959,4 +968,43 @@ end
     ex = Expr(:block, LineNumberNode(1, :x), :(MacroDeclTest.@decl))
     fr = Frame(MacroDeclTest, ex)
     @test JuliaInterpreter.finish_and_return!(fr, true) === nothing
+end
+
+@testset "lowering errors surface as native syntax errors" begin
+    # Frame-constructor path
+    ex = :(function ___lwr_err_f(; ;) end)
+    err_native = try Core.eval(@__MODULE__, ex); nothing catch err; err end
+    err_interp = try Frame(@__MODULE__, ex); nothing catch err; err end
+    @test err_native isa ErrorException
+    @test typeof(err_interp) === typeof(err_native)
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+    # per-statement path inside a :toplevel frame
+    err_interp = try
+        JuliaInterpreter.finish_and_return!(Frame(@__MODULE__, Expr(:toplevel, ex)), true)
+        nothing
+    catch err
+        err
+    end
+    @test typeof(err_interp) === typeof(err_native)
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+    # a raw Expr(:error) statement
+    raw = Expr(:error, "boom")
+    err_native = try Core.eval(@__MODULE__, raw); nothing catch err; err end
+    err_interp = try
+        JuliaInterpreter.finish_and_return!(Frame(@__MODULE__, Expr(:toplevel, raw)), true)
+        nothing
+    catch err
+        err
+    end
+    @test err_native isa ErrorException
+    @test typeof(err_interp) === typeof(err_native)
+    @test sprint(showerror, err_interp) == sprint(showerror, err_native)
+    # an :incomplete expression (a ParseError on Julia 1.12+, ErrorException earlier)
+    inc = Meta.parse("function ___lwr_err_g("; raise=false)
+    if Meta.isexpr(inc, :incomplete)
+        err_native = try Core.eval(@__MODULE__, inc); nothing catch err; err end
+        err_interp = try Frame(@__MODULE__, inc); nothing catch err; err end
+        @test err_native !== nothing
+        @test typeof(err_interp) === typeof(err_native)
+    end
 end
