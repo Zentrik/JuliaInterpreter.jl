@@ -199,8 +199,12 @@ interpreter special-cases" cannot drift from the interpreter's:
   builtins.
 - **Arguments from the generator**: in-scope generated values (structs,
   vectors, closures, tuples, symbols) mixed with adversarial literals, atomic
-  orderings, and type literals. Recipes (`PROBE_RECIPES`, ~120 argument shapes
-  over 43 builtins) give the high-value ones — `getfield`/`setfield!`/
+  orderings, and type literals. *Intrinsic* argument lists are the exception:
+  they are always shaped by name (integers to the integer ops, floats to the
+  float ops, width-valid pairs to the casts) because a wrong operand *kind* of
+  the right width corrupts the heap silently — see below. Recipes
+  (`PROBE_RECIPES`, ~120 argument shapes over ~45 builtins) give the
+  high-value ones — `getfield`/`setfield!`/
   `apply_type`/`fieldtype`/`isdefined`/`tuple`/`_apply_iterate`/`invoke`/
   `invokelatest`/the atomics field family/the global-binding family —
   *plausible* shapes some of the time, so probes exercise success paths and
