@@ -253,11 +253,43 @@ const PROBE_BANS = ProbeBan[
     ProbeBan(:_apply_iterate, :arbitrary, "compiled Julia ignores a non-`iterate` first argument and applies the second; the interpreter deliberately errors on it (src/builtins.jl). Unreachable from lowered code, so an arbitrary first argument is a permanent known divergence, not a finding. Recipes always pass `Base.iterate`."),
 ]
 
+# Version-robust intrinsic-arity guard. `atomic_fence` took one argument (the
+# memory ordering) on 1.11–1.13, and the prober renders exactly that. Julia
+# 1.14-DEV changed the intrinsic's signature, so `atomic_fence(:seq_cst)` is now
+# a wrong-arity intrinsic call — and a wrong-arity intrinsic *at toplevel* (the
+# shape render.jl emits) aborts compilation with an uncatchable "Internal error
+# during compilation of top-level scope" that escapes the program's guard and
+# kills the worker. Rather than hardcode a version, detect at load whether the
+# single-ordering call the prober emits still compiles; ban the callee outright
+# if it does not, so the prober self-calibrates to whatever Julia it runs on.
+# (Intrinsic signatures are internal and carry no stability guarantee, so this
+# is a harness-compatibility fix, not a Julia bug to report.)
+function _probe_intrinsic_callable(f, args...)
+    try
+        Base.invokelatest(@eval (() -> $(Expr(:call, f, map(QuoteNode, args)...))))
+        return true
+    catch
+        return false
+    end
+end
+
+const _RUNTIME_PROBE_BANS = let bans = ProbeBan[]
+    if @isdefined(Core) && isdefined(Core.Intrinsics, :atomic_fence) &&
+       !_probe_intrinsic_callable(GlobalRef(Core.Intrinsics, :atomic_fence), :sequentially_consistent)
+        push!(bans, ProbeBan(:atomic_fence, :all,
+            "atomic_fence's intrinsic arity differs on this Julia ($(VERSION)); the prober's single-ordering call is wrong-arity here and aborts toplevel compilation uncatchably. Auto-banned by load-time detection."))
+    end
+    bans
+end
+
 banmatches(b::ProbeBan, name::Symbol) =
     b.match isa Symbol ? b.match === name : occursin(b.match::Regex, String(name))
 
 function probeban(name::Symbol)
     for b in PROBE_BANS
+        banmatches(b, name) && return b
+    end
+    for b in _RUNTIME_PROBE_BANS
         banmatches(b, name) && return b
     end
     return nothing

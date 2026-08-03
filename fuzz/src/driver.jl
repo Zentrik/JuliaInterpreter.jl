@@ -31,7 +31,31 @@ end
 
 # Known, already-reported divergences go here so reruns surface only news.
 # Each entry is a predicate over Verdict.
-const SUPPRESSIONS = Function[]
+#
+# Environment-mismatch stopgap. The corpus axis splices real code, which can
+# redefine a constant/binding whose presence depends on which prelude
+# `using`/`import`s actually took effect. When that set differs between the
+# reference module and the interpreted module, `module Foo`/`const Foo = …`
+# redefines a constant on one side only, and the interpreter throws an
+# `invalid redefinition of constant` / `cannot declare …` where the reference
+# does not. That is an artifact of the corpus environment setup, NOT an
+# interpreter bug (the generated grammar excludes const/method redefinition for
+# exactly this reason, and minimal `module Foo`/redefinition cases agree
+# between the interpreter and `Core.eval`). The proper fix is the corpus
+# environment-equivalence gate (NEXT.md long-horizon list): record which prelude
+# statements took effect on each side and discard when they diverge. Until that
+# lands, suppress the recognizable redefinition-mismatch messages so they do not
+# flood `findings/`; suppressed cases are still counted in `stats.suppressed`.
+function env_redefinition_mismatch(v::Verdict)::Bool
+    (v.class === :interp_only_throw || v.class === :exception_divergence) || return false
+    d = v.detail
+    return occursin("invalid redefinition of constant", d) ||
+           occursin("redefinition of constant", d) ||
+           occursin("cannot assign a value to imported", d) ||
+           (occursin("cannot declare", d) && occursin("constant", d))
+end
+
+const SUPPRESSIONS = Function[env_redefinition_mismatch]
 
 suppressed(v::Verdict) = any(p -> p(v)::Bool, SUPPRESSIONS)
 
