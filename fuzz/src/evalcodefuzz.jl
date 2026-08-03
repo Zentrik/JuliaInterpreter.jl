@@ -91,7 +91,11 @@ function check_evalcode(rng::AbstractRNG, frame::Frame)
     target = pick(rng, cands)
     newval = writeprobe(rng, target.value)
     newval === nothing && return EvalOutcome(:ok, "", :none, nchecks)
-    before = Dict(v.name => v.value for v in cands if v.name !== target.name)
+    # Force the eltype: `Dict(gen)` infers it via grow_to!/dict_with_eltype,
+    # whose type-widening over arbitrary frame-local values crashed in Julia's
+    # `lookup_typevalue` on the campaign (a pathological local type). A fixed
+    # {Symbol,Any} eltype skips that path entirely.
+    before = Dict{Symbol,Any}(v.name => v.value for v in cands if v.name !== target.name)
     try
         eval_code(frame, string(target.name, " = ", repr(newval)))
     catch err
@@ -115,7 +119,7 @@ function check_evalcode(rng::AbstractRNG, frame::Frame)
                            "assigned `$(target.name) = $(repr(newval))` but eval_code read back " *
                            "$(repr(readback))", :none, nchecks)
     end
-    after = Dict(v.name => v.value for v in locals(frame))
+    after = Dict{Symbol,Any}(v.name => v.value for v in locals(frame))
     if haskey(after, target.name) && !isequal(after[target.name], newval)
         return EvalOutcome(:write_lost,
                            "assigned `$(target.name) = $(repr(newval))` but the frame's own " *
