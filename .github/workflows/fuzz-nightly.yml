@@ -94,13 +94,32 @@ jobs:
           name: fuzz-crash-journals-julia-${{ matrix.version }}
           path: fuzz/journal-*/crashed/
           if-no-files-found: ignore
-      - name: Fail on new findings
+      - name: Report new findings
+        # Each finding's meta.md carries the full shrunk program, the seed, and
+        # the divergence detail — everything needed to analyse it. Printing them
+        # here makes findings readable from the job log alone (via the GitHub
+        # API), so they can be triaged even when the uploaded artifacts are not
+        # reachable. The repro.jl is dumped too for a copy-paste reproducer.
+        # This runs before the fail gate so it always executes; the gate below
+        # is what turns the lane red.
         run: |
           ls -1 fuzz/findings | sort > "$RUNNER_TEMP/findings-after.txt"
-          new_findings=$(comm -13 "$RUNNER_TEMP/findings-before.txt" "$RUNNER_TEMP/findings-after.txt")
-          if [ -n "$new_findings" ]; then
+          comm -13 "$RUNNER_TEMP/findings-before.txt" "$RUNNER_TEMP/findings-after.txt" \
+            > "$RUNNER_TEMP/new-findings.txt"
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            echo "::group::FINDING $d"
+            echo "----- fuzz/findings/$d/meta.md -----"
+            cat "fuzz/findings/$d/meta.md" 2>/dev/null || echo "(no meta.md)"
+            echo "----- fuzz/findings/$d/repro.jl -----"
+            cat "fuzz/findings/$d/repro.jl" 2>/dev/null || echo "(no repro.jl)"
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/new-findings.txt"
+      - name: Fail on new findings
+        run: |
+          if [ -s "$RUNNER_TEMP/new-findings.txt" ]; then
             echo "New findings:"
-            echo "$new_findings"
+            cat "$RUNNER_TEMP/new-findings.txt"
             exit 1
           fi
           echo "No new findings."
