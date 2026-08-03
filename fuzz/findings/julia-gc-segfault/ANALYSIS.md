@@ -199,6 +199,72 @@ samples.
   crashing shard* with five clean shards alongside, so this is within
   expectation; the shard keeps running).
 
+### Crashes 5 and 6 (assert-build restart loop) — and a mechanism correction
+
+The restart loop produced two more crashes, fast (~10 min, then ~100 s):
+
+- **Crash 5** (`assert-run-1`, head preserved in `crashed/`): mark-phase
+  fault in `gc_mark_objarray`, faulting *inside*
+  `gc_assert_parent_validity` at gc-stock.c:1551 — the read of the child's
+  header word. The triggering allocation was again in `prepare_call`
+  (method lookup), matching crash 4's neighborhood.
+- **Crash 6** (`assert-run-2`): mark-phase fault in `gc_mark_obj8`
+  (gc-stock.c:1703) — marking the fields of an ordinary Julia *struct*,
+  again faulting on the child header read inside the validity assert.
+
+Two systematic observations force a correction to the "dangling pointer
+into a madvised page" story:
+
+1. **Freed GC pages cannot fault on read.** `jl_gc_free_page`
+   (gc-pages.c:166) releases pages with `MADV_FREE`/`MADV_DONTNEED`; the
+   mapping stays valid and reads return zeros or stale bytes. GC page
+   regions are not munmapped. So a stale pointer into a freed pool page
+   would read garbage silently — it would *not* SIGSEGV.
+2. **The si_codes say non-canonical, not unmapped.** Crashes 1, 4, 5, 6
+   all report `signal 11 (128)` (SI_KERNEL, the kernel's report for a
+   general-protection fault, e.g. a *non-canonical* x86-64 address), while
+   only crashes 2/3 report `signal 11 (1)` (SEGV_MAPERR — and there the
+   faulting access is to page *metadata derived from* the bad freelist
+   value, so a garbage freelist head produces exactly this).
+
+Together: the corrupt slots do not hold plausible-but-freed heap
+addresses. They hold **bit patterns that were never object pointers** —
+unboxed data or uninitialized memory sitting in slots the GC believes are
+references. The leading mechanisms are therefore:
+
+- **type confusion**: raw bits written into (or a bits-layout object
+  reinterpreted as) a boxed/reference layout — e.g. a `Memory`/struct
+  whose layout flags claim pointers where the writer stored data;
+- **missing zero-initialization**: a freshly allocated reference-layout
+  object reaching a safepoint with undef (junk) slots — the same *class*
+  as upstream #60651 (undef GC root from LICM), but in heap objects
+  rather than a stack root;
+- an **out-of-bounds write** scribbling bits across neighboring pool
+  cells (would also explain the trashed freelist links directly).
+
+All of these live in the runtime/codegen layer, not in anything
+expressible from pure Julia — the upstream attribution stands, but the
+"missed write barrier" phrasing in the crash-4 section above should be
+read with this correction in mind.
+
+**Build-rate caveat, sharpened:** the from-source build crashes far more
+often (3 crashes in ~25 min of soak) than the official juliaup binary did
+in this same container (0 crashes in >1 h of the identical workload
+today, though the official binary did crash 3× in this morning's
+campaign). Possible explanations: different compiler/flags making the
+latent bug more likely (plausible for an uninitialized-memory bug —
+allocation and register timing shift), or a miscompile of the runtime in
+this environment's gcc. Both crash populations matter for the upstream
+report; the official-binary crashes prove it is not an artifact of our
+rebuild.
+
+**In progress:** the restart loop now runs with `ulimit -c unlimited`;
+the first core dump will be analyzed with gdb to read the corrupt slot's
+actual bit pattern and its parent object's type — which distinguishes
+unboxed-data patterns (doubles/small ints ⇒ type confusion) from
+uninitialized junk, and is the single strongest piece of evidence we can
+attach short of an `rr` trace.
+
 ### Interim conclusion
 
 Four distinct fault sites — GC mark of an object array, pool allocator
