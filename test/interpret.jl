@@ -1867,3 +1867,47 @@ end
     fr = JuliaInterpreter.enter_call(resolvefc_probe)
     @test JuliaInterpreter.resolvefc(fr, GlobalRef(FCGlobalRefTarget, :csym)) === QuoteNode(:jl_get_world_counter)
 end
+
+using Core.Intrinsics: sdiv_int, udiv_int, srem_int, urem_int, checked_sdiv_int,
+    sle_int, slt_int, sext_int, ashr_int, ctlz_int, cttz_int, checked_smul_int,
+    checked_sadd_int, checked_ssub_int, shl_int, lshr_int, and_int, not_int,
+    add_int, trunc_int
+
+@testset "Bool intrinsics follow codegen (i1) semantics" begin
+    # the runtime intrinsic dispatcher treats Bool as a byte; codegen as i1 (true
+    # behaves as -1 in signed ops). The interpreter must match compiled results.
+    capture(f, args...) = try (:ok, f(args...)) catch err; (:err, typeof(err)) end
+    icapture(f, args...) = try
+        (:ok, JuliaInterpreter.finish_and_return!(JuliaInterpreter.enter_call(f, args...)))
+    catch err
+        (:err, typeof(err))
+    end
+    cases = [
+        ((a, b) -> sdiv_int(a, b), (true, false)),
+        ((a, b) -> udiv_int(a, b), (true, false)),
+        ((a, b) -> srem_int(a, b), (true, false)),
+        ((a, b) -> urem_int(a, b), (true, false)),
+        ((a, b) -> checked_sdiv_int(a, b), (true, true)),   # i1 -1 ÷ -1 overflows: DivideError
+        ((a, b) -> sle_int(a, b), (true, false)),           # signed: -1 <= 0
+        ((a, b) -> slt_int(a, b), (true, false)),
+        (b -> sext_int(Int64, b), (true,)),                 # sign-extends to -1
+        ((a, b) -> ashr_int(a, b), (true, true)),
+        (b -> ctlz_int(b), (true,)),
+        (b -> ctlz_int(b), (false,)),
+        (b -> cttz_int(b), (false,)),
+        ((a, b) -> checked_smul_int(a, b), (true, true)),   # overflow flags on i1
+        ((a, b) -> checked_sadd_int(a, b), (true, true)),
+        ((a, b) -> checked_ssub_int(a, b), (false, true)),
+        ((a, b) -> shl_int(a, b), (1.0f0, 2.0)),            # float shifted by mismatched width
+        ((a, b) -> lshr_int(a, b), (1.0f0, 2.0)),
+        ((a, b) -> ashr_int(a, b), (1.0f0, 2.0)),
+        # well-behaved Bool ops must keep their values
+        ((a, b) -> and_int(a, b), (true, false)),
+        (b -> not_int(b), (true,)),
+        ((a, b) -> add_int(a, b), (true, true)),
+        (b -> trunc_int(Bool, b), (Int64(2),)),
+    ]
+    for (f, args) in cases
+        @test icapture(f, args...) == capture(f, args...)
+    end
+end

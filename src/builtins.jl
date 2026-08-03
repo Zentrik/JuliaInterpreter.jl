@@ -631,6 +631,10 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
             # its `op` callback dispatches in the calling world; pin it to the frame's
             return Some{Any}(Base.invoke_in_world(frame.world, f, cargs...))
         end
+        if intrinsic_requires_codegen(f, cargs)
+            # Bool is i1 to codegen but a byte to the runtime dispatcher; see packagedef.jl
+            return Some{Any}(call_compiled_intrinsic(f, cargs))
+        end
         return Some{Any}(ccall(:jl_f_intrinsic_call, Any, (Any, Ptr{Any}, UInt32), f, cargs, length(cargs)))
     end
     if isa(f, typeof(kwinvoke))

@@ -136,6 +136,62 @@ const FMA_FLOAT64 = Ref(false)
 const FMA_FLOAT32 = Ref(false)
 const FMA_FLOAT16 = Ref(false)
 
+# The runtime intrinsic dispatcher (`jl_f_intrinsic_call`) models `Bool` as an 8-bit
+# value holding 0 or 1, while codegen models it as `i1`, where `true` behaves as -1
+# in signed operations - so results and thrown errors diverge between interpreted and
+# compiled execution for any intrinsic touching `Bool` (e.g. `sext_int(Int64, true)`
+# is -1 compiled but 1 via the runtime; `checked_sdiv_int(true, true)` overflows i1
+# and throws DivideError only when compiled). The same holds for a shift of a
+# floating-point value by a mismatched-width amount, which the runtime returns
+# unchanged but codegen shifts. Such calls are routed through a compiled wrapper
+# specialized on the concrete argument types, so codegen itself supplies the
+# semantics natively-compiled code has.
+function intrinsic_requires_codegen(f::Core.IntrinsicFunction, cargs::Vector{Any})
+    for a in cargs
+        (a isa Bool || a === Bool) && return true
+    end
+    if f === Core.Intrinsics.shl_int || f === Core.Intrinsics.lshr_int || f === Core.Intrinsics.ashr_int
+        return length(cargs) == 2 && cargs[1] isa Union{Float16,Float32,Float64} &&
+               typeof(cargs[1]) !== typeof(cargs[2])
+    end
+    return false
+end
+
+const compiled_intrinsics = Dict{Any,Any}()
+
+function call_compiled_intrinsic(f::Core.IntrinsicFunction, cargs::Vector{Any})
+    # Type and Symbol arguments are spliced into the wrapper as constants (codegen
+    # needs e.g. cvt target types and atomic orderings to be compile-time constants);
+    # other arguments become parameters, so the wrapper specializes on their types.
+    key = Any[f]
+    for a in cargs
+        constarg = a isa Type || a isa Symbol
+        push!(key, constarg ? a : typeof(a), constarg)
+    end
+    thunk = get(compiled_intrinsics, key, nothing)
+    if thunk === nothing
+        syms = Symbol[]
+        callargs = Any[f]
+        for a in cargs
+            if a isa Type
+                push!(callargs, a)
+            elseif a isa Symbol
+                push!(callargs, QuoteNode(a))
+            else
+                s = gensym(:arg)
+                push!(syms, s)
+                push!(callargs, s)
+            end
+        end
+        def = Expr(:function, Expr(:call, gensym(:compiled_intrinsic), syms...),
+                   Expr(:block, Expr(:call, callargs...)))
+        thunk = Core.eval(CompiledCalls, def)
+        compiled_intrinsics[key] = thunk
+    end
+    vals = Any[a for a in cargs if !(a isa Type || a isa Symbol)]
+    return Base.invokelatest(thunk, vals...)
+end
+
 function __init__()
     set_compiled_methods()
     COVERAGE[] = Base.JLOptions().code_coverage
