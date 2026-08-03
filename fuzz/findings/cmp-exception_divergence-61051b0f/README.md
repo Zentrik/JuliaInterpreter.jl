@@ -1,5 +1,11 @@
 # Compiled mode misses the `rethrow` / `current_exceptions` interception
 
+**Status: FIXED** — the interception now lives in `intercept_call`
+(src/interpret.jl), called by both the generic `evaluate_call!` and the
+`NonRecursiveInterpreter` override, with regression tests in
+test/interpret.jl ("compiled mode intercepts rethrow/current_exceptions").
+`minimal.jl` now prints agreeing rows for all three constructs.
+
 Found by the `native` engine (seed 747, `--modes cmp`) while running the
 campaign behind `fuzz/coverage.jl`. Triaged and minimized by hand; the
 generated program is in `meta.md`.

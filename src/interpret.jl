@@ -313,6 +313,8 @@ function evaluate_call!(interp::NonRecursiveInterpreter, frame::Frame, call_expr
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
 function evaluate_call!(::NonRecursiveInterpreter, frame::Frame, fargs::Vector{Any}, ::Bool)
+    ret = intercept_call(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     return native_call(fargs, frame)
 end
 
@@ -326,9 +328,15 @@ function evaluate_call!(interp::Interpreter, frame::Frame, call_expr::Expr, ente
     fargs = collect_args(interp, frame, call_expr)
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
-function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
+# Calls that must be answered from the interpreter's own state no matter which
+# interpreter is running. Exceptions caught by interpreted handlers never reach
+# the task's native exception stack — they live in `frame.framedata.exceptions` —
+# so `rethrow`/`current_exceptions` executed natively (as Compiled mode does for
+# every call) would see the wrong state and e.g. raise "rethrow() not allowed
+# outside a catch block" from a perfectly ordinary interpreted catch block.
+function intercept_call(frame::Frame, fargs::Vector{Any})
     if fargs[1] === Core.eval
-        return Core.eval(fargs[2], fargs[3])  # not a builtin, but worth treating specially
+        return Some{Any}(Core.eval(fargs[2], fargs[3]))  # not a builtin, but worth treating specially
     elseif fargs[1] === Base.rethrow
         if length(fargs) > 1
             exc = fargs[2]
@@ -364,10 +372,9 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         # (interpreted code may be running inside a native `catch` block).
         rethrow()
     elseif fargs[1] === Base.current_exceptions && length(fargs) == 1
-        # Exceptions caught by interpreted handlers never reach the task's native
-        # exception stack; they live in the frames' modeled stacks. Merge the native
-        # stack (outermost) with the caller chain's entries. The interpreter does not
-        # record per-exception backtraces, so those entries carry an empty backtrace.
+        # Merge the native stack (outermost) with the caller chain's entries. The
+        # interpreter does not record per-exception backtraces, so those entries carry
+        # an empty backtrace.
         stack = Any[entry for entry in invoke_in_world(frame.world, Base.current_exceptions)]
         blocks = Vector{Any}[]
         fr = frame
@@ -380,8 +387,14 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         for exs in blocks, exc in exs
             push!(stack, (exception = exc, backtrace = bt))
         end
-        return Base.ExceptionStack(stack)
+        return Some{Any}(Base.ExceptionStack(stack))
     end
+    return nothing
+end
+
+function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
+    ret = intercept_call(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     if fargs[1] === Core.invoke # invoke needs special handling
         argtypes = fargs[3]
         fargs_pruned = [fargs[2]; fargs[4:end]]

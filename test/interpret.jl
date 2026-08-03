@@ -1515,6 +1515,18 @@ end
     @test_throws ErrorException("boom") finish_and_return!(JuliaInterpreter.enter_call(rethrow_caller))
 end
 
+@testset "compiled mode intercepts rethrow/current_exceptions" begin
+    # Compiled mode executes calls natively, but an exception caught by an
+    # interpreted handler lives in the frame's modeled exception stack, not the
+    # task's, so these calls must be answered by the interpreter in every mode.
+    f_rethrow() = try; error("boom"); catch; rethrow(); end
+    f_rethrow_other() = try; error("boom"); catch; rethrow(ArgumentError("other")); end
+    f_currexc() = try; error("boom"); catch; length(current_exceptions()); end
+    @test_throws ErrorException("boom") @interpret interp=NonRecursiveInterpreter() f_rethrow()
+    @test_throws ArgumentError @interpret interp=NonRecursiveInterpreter() f_rethrow_other()
+    @test (@interpret interp=NonRecursiveInterpreter() f_currexc()) == 1
+end
+
 @testset "applicable respects the frame world" begin
     @eval module ApplicableWorld
     function target end
