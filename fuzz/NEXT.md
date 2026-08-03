@@ -37,22 +37,37 @@ newest Julia), `diag_stuck.jl` (why a stepping walk is stuck),
 `preserve-findings.sh` (force-commit findings, since `findings/` is
 gitignored).
 
-**Results so far: one JuliaInterpreter bug, found late and cheaply.** The
-differential axis in `cmp` mode (compiled mode) diverges on `rethrow()`,
-`rethrow(exc)` and `current_exceptions()` inside an interpreted `catch`: the
-interception that answers them from the frame's modelled exception stack sits
-on the generic `evaluate_call!`, and `NonRecursiveInterpreter` overrides
-exactly that method with a `native_call` bypass. Eight-line reproducer and a
-fix sketch in `findings/cmp-exception_divergence-61051b0f/`. Everything else
-the work produced:
+**Results so far: two JuliaInterpreter bugs.**
 
-- four generator bugs and five harness bugs, several of which were silently
-  destroying yield (see the lessons below) — the newest being `__fjnorm__`
-  observing a type by its *module-qualified* name, found by the split axis;
+- **Fixed**: the differential axis in `cmp` mode (compiled mode) diverged on
+  `rethrow()`, `rethrow(exc)` and `current_exceptions()` inside an
+  interpreted `catch` — the interception that answers them from the frame's
+  modelled exception stack sat on the generic `evaluate_call!`, which
+  `NonRecursiveInterpreter` overrode with a `native_call` bypass. Now hoisted
+  into `intercept_call`, shared by both interpreters, with regression tests;
+  eight-line reproducer in `findings/cmp-exception_divergence-61051b0f/`.
+- **Filed**: `findings/interp-invoke-arity-exception/` — `Core.invoke` with
+  fewer than two arguments raises `BoundsError` from inside the interpreter's
+  own `invoke` rewrite where compiled Julia raises `ArgumentError` (and
+  `ErrorException` vs. `TypeError` for a non-type second argument). Low
+  severity — wrong exception type on a malformed call — but a real
+  divergence, found by the builtins prober (item 4).
+
+Everything else the work produced:
+
+- six generator bugs and five harness bugs, several of which were silently
+  destroying yield (see the lessons below) — among them `__fjnorm__`
+  observing a type by its *module-qualified* name (found by the split axis)
+  and a scope-tracking slip that made the parse gate silently discard 4–8%
+  of every candidate stream (found while building the prober);
 - one genuine Julia compiler crash, which turned out to be a known 1.11
   regression already fixed in 1.12 (`findings/julia-codegen-abort-allocopt/`).
   It still bites: it aborts the *process*, so a shard that hits it writes no
-  coverage data at all (`coverage.jl` reports such shards explicitly).
+  coverage data at all (`coverage.jl` reports such shards explicitly). The
+  prober's soak turned up two further *reference-side* Julia defects the
+  denylist now steers around: wrong-arity intrinsic calls abort inside
+  codegen, and a float intrinsic handed a same-width integer
+  (`Core.Intrinsics.ceil_llvm(3)`) corrupts the heap without raising.
 
 One bug in ~10^4 candidates is not a yield estimate. The axes have not run at
 the scale where they would be expected to produce much — the literature's
@@ -212,23 +227,55 @@ minimum (or not at all). Item 1's confirm-on-divergence gate and item 5's
 per-fragment determinism certification are the fix; until then the budget
 bounds the damage.
 
-### 4. Replace `BUILTIN_PROBES` with a reflection-driven prober
+### 4. Replace `BUILTIN_PROBES` with a reflection-driven prober — **DONE**
 
-The 76 verbatim probe strings cover ~23 distinct builtins and never receive
-generated values. Meanwhile `src/builtins.jl` special-cases **79 builtins
-across 44 dispatch arms** — and that file is itself *generated* by
-`bin/generate_builtins.jl`, which enumerates every `Core.Builtin` by
-reflection. The fuzzer should consume the same enumeration: for each builtin
-and intrinsic, generate guarded calls with an arity sweep (0 through n+1)
-and arguments drawn from the TySum-directed generator — a mix of
-type-plausible and deliberately wrong — so probes finally see generated
-structs, vectors, closures and atomic orderings. Hand-curated knowledge
-shrinks from "author every probe" to an exceptions table of roughly a dozen
-entries: the SIGFPE intrinsics (`sdiv_int` on zero), unspecified-value
-contracts (out-of-range `unsafe_trunc`, fptosi of NaN — `determinism.md`
-§1's class U), and anything else whose contract says "unspecified". This
-scales across Julia versions automatically and turns item 2's never-hit-arm
-report into a to-do list the generator can act on.
+Landed as `fuzz/src/probes.jl`; the 76 verbatim strings are gone. The prober
+enumerates every builtin-valued name in `names(Core; all=true)`, every
+`names(Core.Intrinsics; all=true)` intrinsic and the Base-level entry points
+that are builtins on some versions — 269 spellings on 1.11.9, 210 of them
+probeable — takes arities from the same `T_FFUNC_VAL`/`T_IFUNC` tables
+`bin/generate_builtins.jl` uses, and draws arguments from the TySum-directed
+generator, so probes finally see generated structs, vectors, closures, atomic
+orderings and symbols. Curated knowledge is now three tables: `PROBE_BANS`
+(safety, reason string per entry), `PROBE_RECIPES` (~120 argument shapes over
+43 builtins, so probes reach success paths and not only the error arms) and
+`FIXED_PROBES` (the templates that are not a plain `callee(args...)` call).
+`metrics.jl` reports enumerated/allowed/denylisted counts plus probe density
+and callable coverage under the `builtins` policy; the selftest asserts an
+enumeration floor, that no denylisted callee is ever rendered, that a
+probe-heavy batch executes without killing the worker, and that recipe'd
+probes reach value-returning paths.
+
+What the work turned up, all documented in `DESIGN.md`'s known-classes
+section: raw `sdiv_int`/`udiv_int`/`srem_int`/`urem_int` die with SIGILL when
+compiled (the `checked_*` family does not — it raises DivideError, so it is
+kept); wrong-arity *intrinsic* calls abort inside codegen; the
+width-relational casts fail at compile time *outside* the program's `try`;
+`apply_type` with a huge Int parameter segfaults; unchecked `MemoryRef`s are
+wild reads/writes and `undef` `Memory` reads are nondeterministic; a `Type` in
+a module slot (`modifyglobal!`) makes inference fail internally and codegen
+emit `unreachable`; `Core._call_latest()`/`Core._apply_pure()` segfault on an
+empty argument list. Two genuine but *known-and-deliberate* interpreter
+divergences also surfaced (`_apply_iterate` with a non-`iterate` first
+argument, `compilerbarrier` with an unknown setting) — both unreachable from
+lowered code, both now confined to recipes.
+
+Closing evidence: 1500 probe-heavy candidates (native engine, `builtins`
+policy, both interpreter modes) through a restart-looping subprocess soak with
+the journal armed. Three process deaths, all reference-side Julia defects with
+no probe involved — two known `llvm-alloc-opt` aborts and one delayed
+`gc_mark_obj8` segfault that did not reproduce on replay; two divergences,
+both the `invoke` finding above. Generation stayed valid by construction
+throughout: 0 parse/lowering failures in 800 seeds × 7 policies, and 0 gate
+discards across the soak.
+
+One pre-existing generator bug fell out of this: the mutating-closure rule
+decremented `rtscopes` without incrementing it, so everything generated after
+a mutating closure believed it was at module toplevel. `while` fuel
+decrements then rendered as `global fuel -= 1` for a `let`-local counter,
+which does not lower — the parse gate silently discarded 4–8% of *all*
+candidates (17/400 at the default policy, 31/400 under `:exceptions`). Fixed;
+the rate is now 0/400 on every policy.
 
 ### 5. Determinism unlocks, the cheap half (`determinism.md` §9)
 
@@ -430,7 +477,7 @@ never observe a bare type; the split axis emitted `__obs__(M1.A5)` and produced
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # 253 assertions, ~75s
+julia --project=fuzz fuzz/run.jl --selftest              # ~289 assertions, ~2min
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/coverage.jl --n 20             # what a campaign reaches (smoke)
 julia --project=fuzz fuzz/coverage.jl --n 400 --shards 2 \

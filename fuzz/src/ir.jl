@@ -22,7 +22,8 @@
 #   :closure  meta = params::Vector{Symbol}                 kids = [bodyex]
 #   :closuremut meta = (params::Vector{Symbol}, cap::Symbol) kids = [updateex, retex]
 #   :guard    meta = nothing                                kids = [inner]  # try/catch wrapper
-#   :src      meta = verbatim source::String                kids = []   # builtin-table literal args
+#   :src      meta = verbatim source::String                kids = []   # fixed-template probes, literal args
+#   :probe    meta = callee spelling::String                kids = args # reflection-driven builtin/intrinsic call
 #   :splat    meta = nothing                                kids = [inner]  # renders (inner)... inside calls
 #   :prop     meta = fieldname::Symbol                      kids = [obj]    # (obj).field
 #   :aprop    meta = fieldname::Symbol                      kids = [obj]    # (@atomic (obj).field)

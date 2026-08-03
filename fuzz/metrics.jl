@@ -86,7 +86,9 @@ end
 # so counting statement kinds alone would report them as absent.
 function scanex!(counts, e)
     haskey(counts, e.kind) && (counts[e.kind] += 1)
-    e.kind === :src && (counts[:builtin] += 1)
+    # A probe is either a reflection-driven call (:probe) or one of the fixed
+    # templates (:src); both are "one builtin probe" for density purposes.
+    (e.kind === :src || e.kind === :probe) && (counts[:builtin] += 1)
     for k in e.kids
         scanex!(counts, k)
     end
@@ -163,3 +165,66 @@ for k in TRACKED
     k === :ctrl_in_fn && println("  -- feature interactions --")
     println("  ", rpad(k, 20), rpad(pct(withprog[k]), 15), counts[k])
 end
+
+# ---------------------------------------------------------------------------
+# The builtins prober (fuzz/src/probes.jl).
+#
+# Two numbers describe the *target set* — how much of the runtime's builtin and
+# intrinsic surface the enumeration reaches, and how much of it the safety
+# denylist has to withhold — and the rest describe what generation does with
+# it. Probe density is measured under the `builtins` policy specifically: that
+# policy exists to concentrate probes, so a collapse there is invisible in the
+# blended average.
+
+println()
+println("builtin/intrinsic prober")
+println("  enumerated:         ", FuzzJI.nprobe_enumerated(), " spellings")
+println("  allowed:            ", length(FuzzJI.PROBE_TARGETS),
+        " (builtins ", length(FuzzJI.PROBE_BUILTIN_TARGETS),
+        ", intrinsics ", length(FuzzJI.PROBE_INTRINSIC_TARGETS),
+        "); recipe-only: ", FuzzJI.nprobe_reciponly())
+println("  denylisted:         ", FuzzJI.nprobe_denied(),
+        " spellings over ", length(unique(n for (_, n, _) in FuzzJI.PROBE_DENIED)), " names")
+println("  recipes:            ", length(FuzzJI.PROBE_RECIPES), " builtins, ",
+        sum(length, values(FuzzJI.PROBE_RECIPES)), " argument shapes; ",
+        length(FuzzJI.FIXED_PROBES), " fixed templates")
+
+const PROBE_N = min(N, 500)
+probecounts = Int[]
+targets = Dict{String,Int}()
+for seed in 1:PROBE_N
+    p = FuzzJI.genprogram_policy(Xoshiro(seed), cfg, :builtins)
+    n = 0
+    function walkex(e)
+        if e.kind === :probe
+            n += 1
+            s = e.meta::String
+            targets[s] = get(targets, s, 0) + 1
+        elseif e.kind === :src
+            n += 1
+        end
+        for k in e.kids
+            walkex(k)
+        end
+    end
+    function walk(sts)
+        for st in sts
+            for e in st.exs
+                walkex(e)
+            end
+            for b in st.blocks
+                walk(b)
+            end
+        end
+    end
+    for sec in sections(p)
+        walk(sec)
+    end
+    push!(probecounts, n)
+end
+covered = length(targets)
+println("  policy=builtins, ", PROBE_N, " programs: probes/program mean ",
+        mean(probecounts), "  max ", maximum(probecounts),
+        "  P(>=1 probe) ", string(round(100count(>(0), probecounts) / PROBE_N; digits=1), "%"))
+println("  distinct callables reached: ", covered, "/", length(FuzzJI.PROBE_TARGETS),
+        " (", string(round(100covered / max(1, length(FuzzJI.PROBE_TARGETS)); digits=1), "%)"))

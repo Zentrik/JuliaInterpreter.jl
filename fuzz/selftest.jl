@@ -86,6 +86,80 @@ end
         @test nbad == 0
     end
 
+    @testset "builtin prober: enumeration is version-relative and complete" begin
+        # The floor guards against the enumeration silently collapsing (a
+        # renamed reflection API, a `names(...)` filter that stops matching):
+        # a prober that enumerates nothing looks exactly like a clean run.
+        @test FuzzJI.nprobe_enumerated() >= 150
+        @test length(FuzzJI.PROBE_TARGETS) >= 100
+        spellings = Set(t.spelling for t in FuzzJI.PROBE_TARGETS)
+        # Known targets, one per enumeration source: a Base-spelled builtin, a
+        # Core-spelled builtin, an intrinsic.
+        @test "getfield" in spellings
+        @test "Core.apply_type" in spellings
+        @test "Core.Intrinsics.add_int" in spellings
+        @test "Core.getfield" in spellings
+        # Arities come from the compiler's own tfunc tables, like
+        # bin/generate_builtins.jl's per-arity clauses do.
+        gf = FuzzJI.probetarget("Core.getfield")
+        @test gf !== nothing && (gf.minarg, gf.maxarg) == (2, 4)
+        # Every intrinsic must have a pinned arity: a wrong operand count is a
+        # codegen abort, not a catchable error (see probes.jl).
+        @test all(t -> t.maxarg < typemax(Int) && t.minarg <= t.maxarg,
+                  FuzzJI.PROBE_INTRINSIC_TARGETS)
+        # The denylist is load-bearing, so it must be populated and every entry
+        # must carry a reason a human can act on.
+        @test FuzzJI.nprobe_denied() >= 15
+        @test all(!isempty(r) for (_, _, r) in FuzzJI.PROBE_DENIED)
+        @test all(!isempty(b.reason) for b in FuzzJI.PROBE_BANS)
+        deniednames = Set(n for (_, n, _) in FuzzJI.PROBE_DENIED)
+        for n in (:sdiv_int, :udiv_int, :srem_int, :urem_int,   # uncatchable SIGILL
+                  :pointerref, :pointerset, :llvmcall, :cglobal, # raw addresses
+                  :finalizer)                                    # GC-scheduled
+            @test n in deniednames
+        end
+        # ... while the *checked* division family is deliberately kept: measured
+        # on 1.11.9 it raises DivideError even when compiled.
+        @test !(:checked_sdiv_int in deniednames)
+        @test FuzzJI.probetarget("Core.Intrinsics.checked_sdiv_int") !== nothing
+        # Recipe-only targets are unreachable without a recipe, so each needs one.
+        @test all(haskey(FuzzJI.PROBE_RECIPES, t.name)
+                  for t in FuzzJI.PROBE_TARGETS if t.reciponly)
+        @test FuzzJI.nprobe_reciponly() >= 3
+    end
+
+    @testset "builtin prober: no denylisted callee is ever rendered" begin
+        # Render probe-heavy programs across many seeds and check that not one
+        # denied name appears in call position. Matching excludes an
+        # identifier character before the name — so an allowed
+        # `checked_sdiv_int(...)` is not mistaken for a banned `sdiv_int(...)`,
+        # which is exactly what substring matching gets wrong — but *allows* a
+        # `.`, so a qualified `Core.Intrinsics.sdiv_int(...)` is still caught.
+        pats = [(String(n), Regex("(?<![A-Za-z0-9_])" * String(n) * "\\("))
+                for n in unique(n for (_, n, _) in FuzzJI.PROBE_DENIED)]
+        # The pattern must behave: banned name qualified => hit, allowed name
+        # that merely contains a banned one => miss.
+        divre = last(first(p for p in pats if first(p) == "sdiv_int"))
+        @test occursin(divre, "x = Core.Intrinsics.sdiv_int(1, 0)")
+        @test !occursin(divre, "x = Core.Intrinsics.checked_sdiv_int(1, 0)")
+        offenders = String[]
+        nguards = 0
+        for seed in 1:300
+            prog = FuzzJI.genprogram_policy(Xoshiro(seed), Cfg(), :builtins)
+            src = render(prog)
+            nguards += count(_ -> true, eachmatch(r"catch __e", src))
+            for (name, re) in pats
+                occursin(re, src) && push!(offenders, "seed $seed: $name")
+            end
+        end
+        isempty(offenders) || @error "denylisted callee rendered" offenders
+        @test isempty(offenders)
+        # The check is only meaningful if guarded probes were actually
+        # generated (guarded indexing/division share the wrapper, so this is a
+        # floor, not a probe count — metrics.jl reports the exact density).
+        @test nguards > 300
+    end
+
     @testset "comparator classifies synthetic outcomes" begin
         done(obs...) = Outcome(:done, :none, Any[obs...], "", "")
         threw(exc, obs...) = Outcome(:threw, exc, Any[obs...], "", "")
@@ -332,6 +406,84 @@ end
         # Divergences here are findings against JuliaInterpreter, not harness bugs;
         # they should be rare enough that the smoke test still validates the plumbing.
         @test ndiverge <= 5
+    end
+
+    @testset "probe-heavy programs execute without taking the worker down" begin
+        # Probes are the one rule family whose failure mode is a *dead process*
+        # rather than a finding: a raw machine divide, a wild memory read, an
+        # intrinsic call site codegen refuses to compile. This batch runs
+        # probe-heavy programs through the real differential runner, in
+        # process, so a denylist regression shows up here as a crashed
+        # selftest rather than as a mysteriously truncated campaign.
+        #
+        # The seed range is fixed and verified clean. It is deliberately small:
+        # a wider sweep belongs in a restart-looping campaign (longrun.sh, plus
+        # the crash-safe journal), because generated `@atomic` structs can hit
+        # the known Julia 1.11 llvm-alloc-opt abort
+        # (findings/julia-codegen-abort-allocopt) — a reference-side *Julia*
+        # bug, which kills any in-process batch no matter how good the
+        # denylist is.
+        nbadgate = 0; nran = 0; ndiverge = 0
+        for seed in 1:50
+            src = render(FuzzJI.genprogram_policy(Xoshiro(seed), Cfg(), :builtins))
+            r = run_all(src; nstmts=500_000, modes=(:rec, :cmp))
+            if r === nothing
+                nbadgate += 1
+                @error "probe-heavy program failed the parse/lowering gate" seed src
+                continue
+            end
+            nran += 1
+            ref, intruns = r
+            for (mode, out) in intruns
+                v = classify(ref, out)
+                if isfinding(v)
+                    ndiverge += 1
+                    @warn "probe divergence (a real finding — triage it!)" seed mode v.class v.detail
+                end
+            end
+        end
+        # Validity by construction has to hold for probes too: they are
+        # rendered source like everything else.
+        @test nbadgate == 0
+        @test nran == 50
+        @test ndiverge <= 2
+    end
+
+    @testset "recipe'd probes reach success paths, not just error arms" begin
+        # A prober that only ever produces MethodError/TypeError has tested the
+        # *guard*, not the builtin. Force recipes for the high-value builtins
+        # and require that a real share of the observations are values.
+        St = FuzzJI.St
+        ctx = FuzzJI.Ctx(Xoshiro(4), Cfg())
+        wanted = [:getfield, :tuple, :fieldtype, :isdefined, :apply_type, :setfield!,
+                  :_apply_iterate, :invoke, :swapfield!, :modifyfield!, :replacefield!,
+                  :setfieldonce!, :invokelatest, :memoryrefget, :getglobal, :typeassert,
+                  :svec, :ifelse, :applicable, :compilerbarrier]
+        body = St[]
+        for nm in wanted
+            ts = FuzzJI.probetargets(nm)
+            isempty(ts) && continue
+            for _ in 1:6
+                t = ts[rand(Xoshiro(hash((nm, length(body)))), 1:length(ts))]
+                push!(body, St(:observe; exs=[FuzzJI.genprobe_target(ctx, t; forcerecipe=true)]))
+            end
+        end
+        @test length(body) >= 100
+        prog = FuzzJI.Program(FuzzJI.St[], FuzzJI.St[], FuzzJI.St[], body)
+        src = render(prog)
+        r = run_both(src; nstmts=2_000_000)
+        @test r !== nothing
+        ref, int = r
+        v = classify(ref, int)
+        v.class === :agree || @warn "recipe probe divergence — triage me" v.class v.detail
+        @test v.class === :agree
+        thrown(o) = o isa Tuple && length(o) >= 1 && o[1] === :__thrown
+        nvalue = count(!thrown, ref.obs)
+        @info "recipe'd probes" observations = length(ref.obs) values = nvalue
+        # Half the recipes deliberately probe wrong arities and ordering
+        # violations, so the bar is "a substantial minority succeeds", not all.
+        @test nvalue >= div(length(ref.obs), 4)
+        @test nvalue >= 25
     end
 
     @testset "stepping axis agrees with plain interpretation" begin

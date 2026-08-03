@@ -79,6 +79,9 @@ All references `fuzz/src/...` at `0b326ce`.
   parametric structs, no inner constructors.
 - All 76 `BUILTIN_PROBES` are verbatim constant strings — probes never
   receive generated values, generated structs, or generated orderings.
+  *(Closed: `NEXT.md` item 4 replaced the list with the reflection-driven
+  prober in `src/probes.jl`, which sweeps arities over every enumerated
+  builtin and intrinsic and draws arguments from the generator.)*
 
 **Dilution** (possible but too rare to matter at n ≈ 10^3):
 

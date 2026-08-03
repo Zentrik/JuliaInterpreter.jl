@@ -53,6 +53,11 @@ function render(e::Ex)::String
         return "(try " * render(e.kids[1]) * " catch __e; (:__thrown, nameof(typeof(__e))) end)"
     elseif k === :src
         return e.meta::String
+    elseif k === :probe
+        # `spelling(args...)`. The spelling comes from the reflection
+        # enumeration in probes.jl, so it is always a resolvable callee on the
+        # Julia version generating the program; the caller wraps it in a :guard.
+        return (e.meta::String) * "(" * join(map(render, e.kids), ", ") * ")"
     elseif k === :splat
         return "(" * render(e.kids[1]) * ")..."
     elseif k === :prop
@@ -291,6 +296,14 @@ function __fjnorm__(x)
         # own prefix; the rest of the name (including type parameters, so
         # `Vector{Int}` and `Vector{Float64}` stay distinct) is preserved.
         return Symbol(replace(string(x), string(@__MODULE__, ".") => ""))
+    elseif x isa Pair
+        # Returned by modifyfield!/memoryrefmodify!; comparing the pair is
+        # strictly more oracle data than comparing the type name.
+        return (:__pair, __fjnorm__(first(x)), __fjnorm__(last(x)))
+    elseif x isa NamedTuple
+        return (:__nt, keys(x), map(__fjnorm__, Tuple(x)))
+    elseif x isa Core.SimpleVector
+        return (:__svec, map(__fjnorm__, Tuple(x)))
     else
         return Symbol(nameof(typeof(x)))
     end
