@@ -102,23 +102,46 @@ touches: statement heads, which builtin arms in `builtins.jl`, which
 
 Do stage one before stage two. It is cheap and it de-risks the rest.
 
-### 3. Shrinking for the step, evalcode and corpus axes
+### 3. ~~Shrinking for the step, evalcode and corpus axes~~ — **DONE**
 
-These three write findings **unshrunk** — `writefinding` is handed the same
-source twice. So the first real finding on the axes with the best
-bug-density argument arrives as a 60-line program with no minimization.
+All four axes now minimize a finding before writing it, and `meta.md` records
+the original alongside the shrunk program on every axis.
 
-The differential axis's IR shrinker (`shrink.jl`) does not transfer directly:
-it re-runs `run_both` and compares fingerprints. Each new axis needs its
-property threaded through instead — for `step`, "the same command walk still
-diverges/gets stuck"; for `evalcode`, "the same check still fails". Note the
-RNG stream matters for `step` (see `diag_stuck.jl`): the walk continues the
-same RNG the generator used, so a shrunk program must be replayed the same
-way or the command sequence changes.
+What it took, in case any of it needs revisiting:
 
-Close this before the next long unattended run, not after. Item 5's corpus
-upgrade raises the stakes: a value oracle on real code will produce its
-findings in real-code-sized fragments.
+- **The shrinker takes the property as an argument.** `shrink_ir(prog, keep)`
+  runs the same greedy removal/simplification/repair passes as before, but
+  `keep(src::String)::Bool` decides whether an edit survived. The differential
+  behaviour is `differential_keep` (re-run, classify, compare fingerprint) and
+  `shrink(prog, fp; ...)` is a thin wrapper over it, so nothing on that axis
+  changed.
+- **The step walk needed its own seed first.** The walk used to continue the
+  generator's RNG, which makes the command sequence a function of the
+  program's size — delete a statement and every later draw moves, so no shrunk
+  candidate can be replayed or judged. Each candidate now draws a `walkseed`
+  from the generator's stream and runs the walk on a fresh `Xoshiro(walkseed)`;
+  the seed is recorded in the finding and replayed verbatim on every candidate.
+  Same for the eval_code pause walk and the corpus stepping stage.
+  `diag_stuck.jl` mirrors the derivation and takes an explicit `WALKSEED`
+  third argument, which is how you replay a walk against a *shrunk* program.
+  Note the predicate requires the same verdict **class and fingerprint salt**,
+  not the same command trace: a shorter program has fewer pause points, so the
+  trace legitimately diverges.
+- **Corpus findings are real code, so ddmin, not the IR shrinker.**
+  `ddmin_source(src, keep)` deletes toplevel statements in shrinking chunks,
+  then recurses into block bodies. It is `crashmin.jl`'s loop lifted into
+  `shrink.jl`, moved from line to statement granularity, and `crashmin.jl` now
+  drives it too (with "the subprocess died by signal" as the property, and its
+  line-based loop kept as the fallback for a candidate that will not parse).
+- **Budget and bypass.** `ShrinkBudget` caps re-executions and wall clock per
+  finding, so one stubborn case cannot stall a campaign; `--noshrink` skips
+  shrinking on every axis, `--shrinkruns`/`--shrinksecs` move the caps.
+
+Left open: the corpus predicate re-runs a fragment that real code may make
+nondeterministic, so a flaky corpus finding can shrink to less than its true
+minimum (or not at all). Item 1's confirm-on-divergence gate and item 5's
+per-fragment determinism certification are the fix; until then the budget
+bounds the damage.
 
 ### 4. Replace `BUILTIN_PROBES` with a reflection-driven prober
 
@@ -281,7 +304,7 @@ explicitly: eval_code performs ~1076 checks across 56 distinct variables per
 ## Running things
 
 ```sh
-julia --project=fuzz fuzz/run.jl --selftest              # 108 assertions, ~40s
+julia --project=fuzz fuzz/run.jl --selftest              # 147 assertions, ~40s
 julia --project=fuzz fuzz/metrics.jl --n 500             # what the generator produces
 julia --project=fuzz fuzz/run.jl --engine step --n 2000
 julia --project=fuzz fuzz/run.jl --engine evalcode --n 1000
@@ -293,7 +316,9 @@ julia --project=fuzz fuzz/run.jl --engine corpus --n 1000
 Useful flags: `--big` (larger programs), `--fresh` (ignore existing findings
 when seeding dedup — otherwise a reported bucket masks new ones),
 `--policy NAME` on `metrics.jl` (measure one generation policy in isolation),
-`--journaldir` (required when running shards concurrently).
+`--journaldir` (required when running shards concurrently), `--noshrink` /
+`--shrinkruns N` / `--shrinksecs S` (skip or re-budget minimization; findings
+are shrunk on every axis by default).
 
 Run the selftest after any generator change. It is not a formality: it caught
 a generator bug this session that had raised smoke divergences from ≤5 to 13.

@@ -40,7 +40,9 @@ anything, which is the fast way to check whether a grammar change did what
 you meant. `--fresh` stops pre-seeding the dedup set from `findings/` (coarse
 buckets otherwise let an already-reported finding mask new ones), `--patience
 K` keeps a Supposition campaign going for K consecutive empty rounds, and
-`--nosync` drops the per-candidate journal fsync for throughput.
+`--nosync` drops the per-candidate journal fsync for throughput. `--noshrink`
+reports findings unminimized on every axis; `--shrinkruns N` / `--shrinksecs S`
+move the per-finding shrink budget.
 
 Findings land in `fuzz/findings/<class>-<fingerprint>/` as a standalone
 `repro.jl` (runs with `julia --project=fuzz repro.jl`) plus `meta.md` with the
@@ -66,7 +68,7 @@ Generator ──► Program IR ──► render ──► source text ──► 
                                                  ▼
                             Comparator / Classifier (observation streams)
                                                  ▼
-                       dedup (fingerprint) → shrink (greedy + repair) → report
+                  dedup (fingerprint) → shrink (predicate-driven) → report
 ```
 
 All of this lives in `fuzz/src/`; the package's own deps are untouched.
@@ -261,6 +263,12 @@ the stepped observation stream against the plain one.
 JuliaInterpreter function in the backtrace, so distinct internal errors don't
 collapse into one dedup bucket.
 
+Each candidate's walk runs on its own `Xoshiro(walkseed)`, independent of the
+generator's stream, so `(src, walkseed)` fully describes a run — that is what
+makes findings on this axis shrinkable and replayable against a *shrunk*
+program (see Shrinking, above). `walkseed` is recorded in every finding and can
+be replayed by hand with `fuzz/diag_stuck.jl SEED MAXCMDS WALKSEED`.
+
 One harness obligation worth knowing: the walk refreshes `frame.world` on
 toplevel frames before each command, mirroring what the interpreter's own
 toplevel loop does (`src/interpret.jl`) and what the differential executor
@@ -334,15 +342,72 @@ campaign that discards everything would otherwise report a perfect
 
 ### Shrinking (`shrink.jl`)
 
-Greedy passes: statement removal (any nesting depth), loop-bound zeroing,
-subexpression → inert default of the same summary. After every edit a
-**repair** pass replaces references to unbound names with defaults and
-cascades statement removals — but repair only needs to be *usually* valid:
-each candidate re-runs and is kept only if the finding's fingerprint is
-preserved, which is the soundness argument. The selftest plants a canary
-divergence (interpreter frames are visible in `stacktrace()` — a real,
-permanent difference) inside 50+ statements of noise and requires the
-shrinker to reduce it while preserving the fingerprint.
+**Every axis shrinks before it reports.** What differs between them is the
+*property* being preserved, so the shrinker takes it as an argument:
+`keep(src::String)::Bool`, "this source still exhibits the finding". The search
+strategy is shared; each axis supplies its own oracle.
+
+| axis | `keep` predicate | built by |
+|---|---|---|
+| `native` / `supposition` | re-run both sides, classify, same fingerprint | `differential_keep` |
+| `step` | replay the *same walk seed*, same verdict class + salt | `step_keep` |
+| `evalcode` | replay the same pause walk, same check kind | `evalcode_keep` |
+| `corpus` | re-run the fragment, same corpus verdict class | `corpus_keep` |
+
+Two search strategies, both budgeted:
+
+- **`shrink_ir(prog, keep)`** — greedy passes over the generator's IR:
+  statement removal (any nesting depth), loop-bound zeroing, subexpression →
+  inert default of the same summary. After every edit a **repair** pass
+  replaces references to now-unbound names with defaults and cascades
+  statement removals — but repair only needs to be *usually* valid: each
+  candidate is re-checked against `keep` and rejected if the property is gone,
+  which is the soundness argument. `shrink(prog, fp; ...)` is the differential
+  axis's entry point, a thin wrapper with `differential_keep`.
+- **`ddmin_source(src, keep)`** — delta debugging on *source text*, for
+  findings that never had generator IR: corpus fragments, and
+  journal-recovered crashes (`crashmin.jl` now drives this same function with
+  "the subprocess died by signal" as its property). Chunked deletion at
+  toplevel-statement granularity first — a spliced corpus case is several
+  fragments and usually only one matters — then recursion into block bodies,
+  because a surviving fragment is typically one large `function` or `@testset`.
+  Statement granularity rather than crashmin's original line granularity: a
+  multi-line `for` is one deletion candidate instead of a run of lines that
+  only sometimes cuts on a statement boundary.
+
+**Why the stepping axis needed a seed change first.** The command walk used to
+draw from the same RNG the generator had used. That makes the command sequence
+a function of the program's size, so deleting one statement changes every later
+draw — a shrunk program cannot be replayed and no edit can be judged. Each
+candidate now gets its own `walkseed` (drawn from the generator's stream, so a
+case still reproduces from its case seed, but consumed through a fresh
+`Xoshiro`), which is recorded in the finding's `meta.md`/`repro.jl` and replayed
+verbatim on every shrink candidate. The same applies to the eval_code pause walk
+and the corpus stepping stage.
+
+Replay does **not** promise an identical command trace: a shorter program has
+fewer pause points, so the same draws land on different statements. The
+predicate asks for the same verdict *class* and the same fingerprint salt (the
+stuck command for `step_stuck`, the innermost JuliaInterpreter function for an
+internal error, the divergent observation's shape for `step_divergence`) — which
+is what the report is about — never for trace equality.
+
+**Budget.** Shrinking one finding is capped by candidate re-executions *and*
+wall clock (`ShrinkBudget`), so a stubborn case cannot stall a campaign; both
+loops stop at the cap and return the best candidate so far. `--noshrink`
+bypasses shrinking on every axis, `--shrinkruns`/`--shrinksecs` move the caps.
+The stepping and eval_code predicates replay a whole command walk per candidate,
+so their defaults are lower than the differential axis's.
+
+The selftest covers the search independently of any oracle (a synthetic
+string-containment property over a padded program, plus a `ddmin_source`
+containment test and budget-cap assertions), keeps the original canary — a
+genuine divergence (interpreter frames are visible in `stacktrace()`) planted in
+a dozen inert statements, which must shrink to the one divergent observation
+while preserving its fingerprint —
+and drives one end-to-end step-axis shrink through a deliberately broken oracle
+stub, so `generate → step → classify → shrink → writefinding` is exercised
+without waiting for a live finding.
 
 ## Known false-positive classes found and closed during shakedown
 
@@ -403,9 +468,14 @@ and belong in `SUPPRESSIONS` if hit).
 - **M3.5 — corpus axis** (done): `--engine corpus` runs and splices real Julia
   source, with an oracle that compares failure mode only so nondeterministic
   code is usable.
+- **M3.6 — shrinking on every axis** (done): the greedy IR shrinker takes the
+  property as a `keep(src)::Bool` predicate, the stepping/eval_code/corpus
+  walks got their own replayable seeds, and corpus findings are minimized by a
+  statement-level delta debugger shared with `crashmin.jl`. See Shrinking,
+  above.
 - Still open, in priority order: semantic coverage (above), version-aware
-  triage of reference-side crashes, shrinking for the three newer axes, an
-  `ExprSplitter` axis, throughput, EMI, a nightly CI job. Structured
+  triage of reference-side crashes, an `ExprSplitter` axis, throughput, EMI,
+  a nightly CI job. Structured
   concurrency (`@sync`/`@async` with observations only from the root task) and
   a **pluggable lowerer** — the lowering step as an injectable function, so a
   JuliaLowering.jl configuration can flush out flisp-idiom assumptions in
