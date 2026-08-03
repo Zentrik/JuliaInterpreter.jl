@@ -49,6 +49,7 @@ using .FuzzJI
 function parseargs(args)
     o = Dict{String,Any}("engine" => "supposition", "n" => 1000, "seed" => 1,
                          "budget" => 300_000, "selftest" => false, "noshrink" => false,
+                         "nothreeway" => false,
                          "modes" => "both", "big" => false, "fresh" => false,
                          "patience" => 1, "nosync" => false, "noswarm" => false,
                          "nopolicy" => false, "maxcmds" => 4000, "nobreakpoints" => false,
@@ -77,6 +78,8 @@ function parseargs(args)
             o["selftest"] = true
         elseif a == "--noshrink"       # report findings unminimized (every axis)
             o["noshrink"] = true
+        elseif a == "--nothreeway"     # disable JI adjudication (compiled-only oracle)
+            o["nothreeway"] = true
         elseif a == "--shrinkruns"     # per-finding cap on candidate re-executions
             o["shrinkruns"] = parse(Int, args[i += 1])
         elseif a == "--shrinksecs"     # per-finding wall-clock cap, seconds
@@ -175,14 +178,14 @@ elseif o["engine"] == "supposition"
     res = supposition_campaign(; examples=o["n"], nstmts=o["budget"], doshrink=!o["noshrink"],
                                modes=modes, cfg=cfg, patience=o["patience"],
                                seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                               journaldir=o["journaldir"], shrinkopts...)
-    @info "supposition campaign complete" res.nfound res.nondet_discard
+                               journaldir=o["journaldir"], dothreeway=!o["nothreeway"], shrinkopts...)
+    @info "supposition campaign complete" res.nfound res.nondet_discard res.compiler_interp_divergence res.julia_engine_divergence
     exit(res.nfound == 0 ? 0 : 2)   # non-zero exit on new findings, for CI
 elseif o["engine"] == "native"
     stats = campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], doshrink=!o["noshrink"],
                      modes=modes, cfg=cfg, seeddisk=!o["fresh"], journalsync=!o["nosync"],
-                     journaldir=o["journaldir"], shrinkopts...)
-    @info "campaign complete" stats.cases stats.agreed stats.aborted stats.nondet_discard stats.discarded stats.findings stats.duplicates stats.suppressed
+                     journaldir=o["journaldir"], dothreeway=!o["nothreeway"], shrinkopts...)
+    @info "campaign complete" stats.cases stats.agreed stats.aborted stats.nondet_discard stats.compiler_interp_divergence stats.julia_engine_divergence stats.discarded stats.findings stats.duplicates stats.suppressed
     exit(stats.findings == 0 ? 0 : 2)
 elseif o["engine"] == "step"
     stats = step_campaign(; n=o["n"], baseseed=o["seed"], nstmts=o["budget"], cfg=cfg,

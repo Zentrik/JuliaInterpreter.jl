@@ -19,6 +19,14 @@ Base.@kwdef mutable struct Stats
     # from the failure-mode oracle to the full differential value oracle. Printed
     # next to ran/discarded_junk; a collapse means the gate broke, not the corpus.
     certified::Int = 0
+    # Three-way oracle (classify.jl, ji.jl): a C-vs-mode divergence that the
+    # built-in interpreter (JI) adjudicated as a compiler-vs-interpreter
+    # difference — the mode matched Julia's own interpreter, so it is NOT a
+    # JuliaInterpreter bug. Absorbing these is the whole point of the third engine.
+    compiler_interp_divergence::Int = 0
+    # Three-way oracle: compiled Julia and its own built-in interpreter disagreed
+    # (independent of the SUT) — a Julia finding, written to findings/julia/.
+    julia_engine_divergence::Int = 0
 end
 
 # Known, already-reported divergences go here so reruns surface only news.
@@ -92,16 +100,20 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                   journaldir::String=joinpath(@__DIR__, "..", "journal"),
                   cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true,
                   modes::Tuple=(:rec, :cmp), seeddisk::Bool=true, journalsync::Bool=true,
-                  shrinkruns::Int=400, shrinksecs::Real=600.0)
+                  shrinkruns::Int=400, shrinksecs::Real=600.0, dothreeway::Bool=true)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
     seen = Set{String}()
+    seen_julia = Set{String}()   # dedup for the C-vs-JI (Julia) finding stream
     # Pre-seed dedup with findings already on disk so restarts don't re-report.
     # Fingerprint buckets are coarse, so this also suppresses *unrelated* bugs
     # that happen to share a bucket with something already reported — pass
     # seeddisk=false (CLI --fresh) to hunt within already-reported buckets.
     seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
+    end
+    seeddisk && isdir(joinpath(outdir, "julia")) && for d in readdir(joinpath(outdir, "julia"))
+        push!(seen_julia, d)
     end
     t0 = time()
     try
@@ -118,12 +130,24 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
             end
             ref, intruns = r
             anyaborted = anyfinding = anynondet = false
+            # Julia built-in interpreter outcome for this candidate, computed
+            # lazily on the first C-vs-mode divergence (ji.jl). `missing` = not
+            # yet run; `nothing` = ran but unavailable (timeout/crash).
+            ji = missing
             for (mode, int) in intruns
                 # Confirm-on-divergence: a candidate finding only stays one if
                 # both sides reproduce themselves (classify.jl). Costs nothing
                 # unless `classify` already saw a divergence.
                 v = confirmed(classify(ref, int), src, ref, int;
                               nstmts, interp=modeinterp(mode))
+                # Three-way adjudication: ask Julia's own interpreter whether a
+                # confirmed C-vs-mode divergence is a real JuliaInterpreter bug
+                # (mode matches neither C nor JI) or a compiler-vs-interpreter
+                # difference (mode matches JI). JI runs at most once per candidate.
+                if dothreeway && isfinding(v) && !suppressed(v)
+                    ji === missing && (ji = run_ji(src; nstmts))
+                    v = threeway(v, ref, int, ji)
+                end
                 if v.class === :agree
                     continue
                 elseif v.class === :aborted
@@ -132,6 +156,12 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                     anynondet = true
                     stats.nondet_discard += 1
                     @debug "nondet_discard" mode seed detail = v.detail
+                elseif v.class === :compiler_interp_divergence
+                    # JuliaInterpreter matched Julia's own interpreter; only the
+                    # compiler differs. Not our bug — track it and roll the case
+                    # up as agreement (the interpreter behaved correctly).
+                    stats.compiler_interp_divergence += 1
+                    @debug "compiler_interp_divergence" mode seed detail = first(v.detail, 200)
                 elseif suppressed(v)
                     anyfinding = true
                     stats.suppressed += 1
@@ -165,12 +195,27 @@ function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
                     end
                 end
             end
+            # Free Julia-interpreter fuzzing: if JI ran (some mode diverged) and
+            # compiled Julia disagrees with its OWN interpreter, that's a Julia
+            # bug independent of the SUT. Report to findings/julia/.
+            if dothreeway && ji !== missing && engine_divergence(ref, ji)
+                jv = julia_verdict(ref, ji::Outcome)
+                jfp = string("julia-", fingerprint(jv))
+                if jfp in seen_julia
+                    stats.duplicates += 1
+                else
+                    push!(seen_julia, jfp)
+                    stats.julia_engine_divergence += 1
+                    jdir = writefinding(joinpath(outdir, "julia"), jfp, jv, seed, src, src)
+                    @info "  JULIA ENGINE DIVERGENCE (compiled vs built-in interpreter)" jdir detail = first(jv.detail, 200)
+                end
+            end
             # per-case rollup: a case counts once, worst class wins
             (anyfinding || anynondet) ? nothing : anyaborted ? (stats.aborted += 1) : (stats.agreed += 1)
             if progress > 0 && i % progress == 0
                 rate = round(stats.cases / (time() - t0); digits=1)
                 abortpct = round(100 * stats.aborted / max(1, stats.cases); digits=1)
-                @info "progress" i rate_per_s = rate abort_pct = abortpct stats.agreed stats.aborted stats.nondet_discard stats.discarded stats.findings stats.duplicates
+                @info "progress" i rate_per_s = rate abort_pct = abortpct stats.agreed stats.aborted stats.nondet_discard stats.compiler_interp_divergence stats.julia_engine_divergence stats.discarded stats.findings stats.duplicates
             end
         end
     finally

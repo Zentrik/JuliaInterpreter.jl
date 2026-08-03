@@ -70,10 +70,17 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
                               cfg::Cfg=Cfg(), doshrink::Bool=true,
                               modes::Tuple=(:rec, :cmp), patience::Int=1,
                               seeddisk::Bool=true, journalsync::Bool=true,
-                              shrinkruns::Int=400, shrinksecs::Real=600.0)
+                              shrinkruns::Int=400, shrinksecs::Real=600.0,
+                              dothreeway::Bool=true)
     seen = Set{String}()
+    seen_julia = Set{String}()
+    ci = Ref(0)    # compiler_interp_divergence (JI adjudicated as not-our-bug)
+    je = Ref(0)    # julia_engine_divergence (compiled vs built-in interpreter)
     seeddisk && isdir(outdir) && for d in readdir(outdir)
         push!(seen, d)
+    end
+    seeddisk && isdir(joinpath(outdir, "julia")) && for d in readdir(joinpath(outdir, "julia"))
+        push!(seen_julia, d)
     end
     # Journal every candidate before it runs: an uncatchable crash (e.g. a
     # generated program that traps compiled Julia's codegen) kills the worker,
@@ -152,11 +159,37 @@ function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=
             @warn "  not reported: neither the shrunk nor the original program confirmed on re-run" fp round
             continue
         end
+        # Three-way adjudication on the program about to be written: ask Julia's
+        # own interpreter whether this C-vs-mode divergence is a real
+        # JuliaInterpreter bug or a compiler-vs-interpreter difference.
+        if dothreeway
+            rr = run_both(reportsrc; nstmts, interp=modeinterp(mode))
+            if rr !== nothing
+                refr, intr = rr
+                ji = run_ji(reportsrc; nstmts)
+                if threeway(v, refr, intr, ji).class === :compiler_interp_divergence
+                    ci[] += 1
+                    @debug "compiler_interp_divergence (supposition)" round fp
+                    continue
+                end
+                if engine_divergence(refr, ji)
+                    jv = julia_verdict(refr, ji::Outcome)
+                    jfp = string("julia-", fingerprint(jv))
+                    if !(jfp in seen_julia)
+                        push!(seen_julia, jfp)
+                        je[] += 1
+                        writefinding(joinpath(outdir, "julia"), jfp, jv, -1, reportsrc, reportsrc)
+                        @info "  JULIA ENGINE DIVERGENCE" jfp detail = first(jv.detail, 200)
+                    end
+                end
+            end
+        end
         push!(seen, fp)
         nfound += 1
         dir = writefinding(outdir, fp, v, -1, origsrc, reportsrc; mode)
         @info "  reported" dir nstatements_supposition = nstatements(prog) nstatements_polished = nstatements(shrunk) shrunk_confirmed = (reportsrc == render(shrunk))
     end
     close(j)
-    return (; nfound, nondet_discard = nondet[])
+    return (; nfound, nondet_discard = nondet[],
+              compiler_interp_divergence = ci[], julia_engine_divergence = je[])
 end

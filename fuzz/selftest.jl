@@ -13,7 +13,8 @@ using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                toplevel_assigned_names, comparable_value, corpus_certify, corpus_value_run,
                corpus_value_keep,
                Ex, St, Program, lit, IntT, SymT, sections,
-               outcomeeq, confirm, confirmed, confirmsrc, confirmreport, nondetverdict
+               outcomeeq, confirm, confirmed, confirmsrc, confirmreport, nondetverdict,
+               run_ji, threeway, engine_divergence, julia_verdict
 using Supposition: example, @check, Data   # Data must be in scope for @check-expanded code
 # The standalone reproducer library every findings/*/repro.jl includes. Loaded
 # here so the artifact a human triages is covered by the suite too.
@@ -1187,6 +1188,55 @@ end
         # The agree path must not pay for a re-run: an unparseable source would
         # force a :nondet_ref discard if the gate ever ran on a non-finding.
         @test confirmed(FuzzJI.agree(), "((( not julia", ref, int; nstmts=1).class === :agree
+    end
+
+    @testset "three-way adjudication with the built-in interpreter" begin
+        o(st, exc, obs...) = Outcome(st, exc, Any[obs...], "", "")
+        vd = classify(o(:done, :none, 1), o(:done, :none, 2))   # a value_divergence
+        @test vd.class === :value_divergence
+        C  = o(:done, :none, 1)          # compiled reference
+        # (a) mode matches JI (Julia's own interpreter) but not C -> not our bug
+        modeM = o(:done, :none, 2)
+        JI_match = o(:done, :none, 2)
+        @test threeway(vd, C, modeM, JI_match).class === :compiler_interp_divergence
+        # (b) mode matches neither C nor JI -> a real JuliaInterpreter bug (unchanged)
+        JI_other = o(:done, :none, 3)
+        @test threeway(vd, C, modeM, JI_other).class === :value_divergence
+        # (c) JI unavailable -> never hide the divergence; report as-is
+        @test threeway(vd, C, modeM, nothing).class === :value_divergence
+        # (d) Julia's own engines disagree (C vs JI) -> a Julia finding
+        @test engine_divergence(C, o(:done, :none, 9))
+        @test !engine_divergence(C, o(:done, :none, 1))
+        @test !engine_divergence(C, nothing)
+        @test julia_verdict(C, o(:done, :none, 9)).class === :julia_engine_divergence
+        # neither adjudication class is written through the JuliaInterpreter path
+        @test !isfinding(threeway(vd, C, modeM, JI_match))
+        @test !isfinding(julia_verdict(C, o(:done, :none, 9)))
+
+        # (e) run_ji actually runs Julia's built-in interpreter and its stream
+        # matches the compiled reference on a deterministic program.
+        detsrc = "let\n    __obs__(1 + 2)\n    __obs__(\"ab\")\nend\n"
+        rb = run_both(detsrc; nstmts=200_000)
+        @test rb !== nothing
+        jio = run_ji(detsrc)
+        @test jio isa Outcome            # available on a trivial program
+        @test outcomeeq(rb[1], jio)      # agrees with compiled on deterministic code
+
+        # (f) the class-U case the third engine exists for: an invalid atomic
+        # ordering inside a loop is ErrorException compiled but the runtime
+        # ConcurrencyViolationError under the built-in interpreter, matching what
+        # any interpreter (including JuliaInterpreter) produces.
+        clU = "let\n    fuel = 3\n    while fuel > 0\n        fuel -= 1\n    end\n    __obs__((try Core.Intrinsics.atomic_fence(:bogus_zzz) catch e; nameof(typeof(e)) end))\nend\n"
+        rbU = run_both(clU; nstmts=500_000)
+        if rbU !== nothing
+            refU, intU = rbU
+            vU = classify(refU, intU)
+            jiU = run_ji(clU)
+            if vU.class === :value_divergence && jiU isa Outcome
+                # rec matches the built-in interpreter, so this is adjudicated away
+                @test threeway(vU, refU, intU, jiU).class === :compiler_interp_divergence
+            end
+        end
     end
 
     @testset "triage: exit-status attribution and verdicts" begin
