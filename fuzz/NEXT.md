@@ -14,6 +14,74 @@ landed**: the confirm-on-divergence gate and `fuzz/triage.jl`. Item 2
 
 ---
 
+## Session handoff — 2026-08-04 (read this first)
+
+This session ran a long `-O1` campaign plus CI runs and turned the "few
+similar issues" concern into concrete fixes. Everything below is committed on
+`claude/fuzzing-effectiveness-review-92ph29`; **PR #1** (branch → master) is
+open and green-gated but **not merged** — left for human review.
+
+### What landed (real interpreter/debugger bugs, each with a regression test)
+
+1. **Module-redefinition shadowing** — `find_or_create_module`
+   (`src/construct.jl`). `module F` shadowing a `using`-imported binding threw
+   a spurious `invalid redefinition of constant`. Commit `7d05ccf`.
+2. **Method-def type-shadowing** — `evaluate_methoddef` (`src/interpret.jl`).
+   A method defined on a `using`-imported *type* created a fresh function that
+   shadowed it; later use as a type threw `invalid type for argument` /
+   `invalid subtyping`. Commit `3a323e8`.
+3. **compilerbarrier setting-validation** — `src/builtins.jl` + generator. The
+   interpreter silently accepted an invalid barrier setting native rejects.
+   Commit `3a323e8`.
+4. **Debugger `is_leaf` crash** — `src/commands.jl`. A breakpoint firing inside
+   a kwarg value left a non-leaf frame, crashing the next `debug_command`.
+   Commit `b5e7fa7`.
+5. **invoke non-tuple arity** — raises `TypeError` for an invoke signature arg
+   that isn't a tuple type. Commit `9b839d6` (finding `value_divergence-2c10d219`).
+
+Fixes 1–3 came from **rooting out the old `env_binding_mismatch` corpus
+suppression**: that whole "corpus environment false-positive" class turned out
+to contain real bugs, so the suppression was **removed entirely** — every
+member was either fixed above or verified a non-divergence.
+
+### Infrastructure that landed
+
+- **Nightly-Julia fuzzing lane unblocked** (self-calibrating `atomic_fence`
+  ban) — first-ever nightly fuzzing runs in CI (`.github/workflows/fuzz-nightly.yml`).
+- **Supposition selftest flake fixed** — the support gate is no longer stochastic.
+
+### CI / campaign state at handoff
+
+- **CI run #8** (branch): selftest gate **green on all three lanes** (1.12,
+  pre/1.13-rc1, nightly/1.14-DEV). Selftest 437/437. 1.12 + pre campaigns ran
+  fresh-seed and came back **regression-clean** (no fixed-bug signature
+  reappeared).
+- **Nightly CI campaign** hit the ~6h runner timeout and was **cancelled
+  before reporting** — findings artifact uploaded but not analyzed in-log.
+  Budget is too long for the 6h limit (see follow-ups).
+- **Local `-O1` campaign** (~350 batches): 345 clean exits, 5 `gc-stock.c` GC
+  deaths (the known upstream `-O1` Julia GC crash, ~1/30 — documented in
+  `findings/julia-gc-segfault/`, not ours).
+
+### Open follow-ups (none blocking; ranked, for the next agent)
+
+1. **Call axis is 0-for-6+ on real bugs.** Every divergence has been a harness
+   artifact (PRNG/clock/global state). Either add three-way JI-vs-C
+   adjudication or a per-call global reset, or downweight the axis. Highest
+   signal-to-effort question here.
+2. **Corpus axis:** filter out fragments that introspect
+   backtraces/stacktraces — they self-certify then diverge on frame details
+   that say nothing about the interpreter.
+3. **Nightly CI campaign budget** exceeds the 6h runner limit — shorten `--n`
+   in `fuzz-nightly.yml` so it reports before cancellation.
+4. **step/corpus `repro.jl`** should replay the walk/prelude rather than call
+   `reprorun` — current repros under-reproduce.
+5. **Unanalyzed at handoff, worth a look:** `step_divergence-540b8b2b`; the
+   nightly run #8 findings artifact; and `370cc475` — a candidate **upstream
+   Julia UB** (corrupted exception from a too-few-args builtin at `-O1`).
+
+---
+
 ## Where things stand
 
 Six axes exist. Five of them cover surfaces that had no systematic testing
