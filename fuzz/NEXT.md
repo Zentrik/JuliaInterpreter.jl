@@ -69,9 +69,33 @@ Numbers (julia 1.12.6): selftest **501/501** (three new testsets: generation
 floors, hand-built agreement incl. stepping walks, generator-entry). Blended
 default-policy rates at 400 seeds: destructure 56%, destrparam 22%,
 kwfundef 37%, kw-ref-default 17%, gendef 20%. Program size moved
-34.4 → 35.7 statements (mean). Parse/lowering gate: **0 discards in 400
-seeds** before and after. Coverage: see the per-function before/after in the
-session's commit message; re-run `fuzz/coverage.jl` for the full picture.
+34.4 → 36.6 statements (mean). Parse/lowering gate: **0 discards in 400
+seeds** (and 0/200 on every policy) before and after. Smokes: native 300/300
+agreed (both modes), step 200/200 agreed, `:sg` included — 0 findings.
+
+Coverage before/after (before = the committed `coverage-report.md`, 1.11.9,
+4000 runs, 5 engines; after = 800 candidate-runs, native+step rec, 1.12.6):
+
+- `maybe_step_through_arg_destructuring!` (323–372): 10 hit / 26 cold (the
+  whole destructuring loop) → **fully hit**.
+- `is_indexed_iterate_call`: never-hit → **hit**.
+- `get_source(::GeneratedFunctionStub)`: never-hit → **3 of 4 lines hit**
+  (only the `eval(b)` fallback stays cold; generators return CodeInfo here).
+- `maybe_step_through_kwprep!` (main def): partially hit both sides; the
+  1.12-only tuple-detection branch now runs, and the NamedTuple/apply_type
+  branch is warm. The deep advance/no-kw sub-branches were cold in this
+  modest sample but are confirmed reachable (a single `:s` into a method
+  making a kw call parks directly on the `Core.kwcall` statement).
+- Bonus: `prepare_framecode`'s generated arms (`get_staged`) down to 2 cold
+  lines; `maybe_step_through_wrapper!` down to 3.
+
+Follow-up worth knowing: on 1.12 a **toplevel** kw call lowers its names
+tuple as `Core.tuple(:kw1)` (a call) rather than the literal
+`(:kw1,)` tuple `maybe_step_through_kwprep!` pattern-matches, so at toplevel
+the prep-skip does not engage and `:s` can pause inside the NamedTuple
+constructor. Method-scope kw calls match fine. Cosmetic stepping-UX gap in
+the interpreter, in the function whose own comment says it must be re-tweaked
+per compiler change — a candidate small fix for a future session.
 
 ---
 
