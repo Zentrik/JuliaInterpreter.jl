@@ -584,6 +584,16 @@ end
         end
         # the type-name strip must remove exactly the module's own prefix
         @test Base.invokelatest(fnorm, Base.invokelatest(getglobal, fresh, :ZQ)) === :ZQ
+        # ... and the String branch strips it from *observed strings* too:
+        # `string(v)` of a program-defined struct embeds the qualified type name
+        # (nightly finding step_divergence-7e03896b)
+        for (m, norm) in ((verbatim, vnorm), (fresh, fnorm))
+            s = Base.invokelatest(Core.eval, m, :(string(ZQ(7))))
+            @test Base.invokelatest(norm, s) == "ZQ(7)"
+        end
+        # end to end: two engines in differently named modules agree on it
+        r = run_both("struct ZQS; x::Int64; end\n__obs__(string(ZQS(3)))\n"; nstmts=100_000)
+        @test r !== nothing && classify(r[1], r[2]).class === :agree
         # __obs__ returns nothing and pushes the normalized value onto __OBS__
         vobs = Base.invokelatest(getglobal, verbatim, :__obs__)
         fobs = Base.invokelatest(getglobal, fresh, :__obs__)

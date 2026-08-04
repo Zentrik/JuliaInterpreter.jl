@@ -391,7 +391,13 @@ const __OBS__ = Any[]
 const __VTIME__ = Ref(0)
 __vtime__() = (__VTIME__[] += 1)
 function __fjnorm__(x)
-    if x isa Union{Number, String, Symbol, Char, Nothing}
+    if x isa String
+        # `string(v)` of a program-defined struct embeds its module-qualified
+        # type name (`Main.FJ95.S1(...)`) — the same manufactured divergence
+        # the Type branch below strips, one level down, inside a String the
+        # program observed (nightly finding step_divergence-7e03896b).
+        return replace(x, string(@__MODULE__, ".") => "")
+    elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(__fjnorm__, x)

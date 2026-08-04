@@ -17,7 +17,11 @@ const __OBS__ = Any[]
 const __VTIME__ = Ref(0)
 __vtime__() = (__VTIME__[] += 1)
 function __fjnorm__(x)
-    if x isa Union{Number, String, Symbol, Char, Nothing}
+    if x isa String
+        # strings can embed this module's own qualified type names via
+        # `string(structvalue)` — strip, same trick as the Type branch below
+        return replace(x, string(@__MODULE__, ".") => "")
+    elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(__fjnorm__, x)
@@ -273,7 +277,7 @@ end
 # program, exactly as the campaign compared them. Defaults mirror
 # `step_campaign`'s.
 function reprostep(src::AbstractString, walkseed::Integer;
-                   nstmts::Int=300_000, maxcmds::Int=4000, usebreakpoints::Bool=true)
+                   nstmts::Int=600_000, maxcmds::Int=4000, usebreakpoints::Bool=true)
     FJ = _repro_fuzzji()
     ex = Base.invokelatest(FJ.parsegate, String(src))
     if ex === nothing
@@ -300,7 +304,7 @@ end
 # An eval_code finding is (src, walkseed): the seed replays the pause walk and
 # probe selection. Defaults mirror `evalcode_campaign`'s.
 function reproevalcode(src::AbstractString, walkseed::Integer;
-                       nstmts::Int=300_000, pausesper::Int=25)
+                       nstmts::Int=600_000, pausesper::Int=25)
     FJ = _repro_fuzzji()
     o = Base.invokelatest(FJ.evalcode_probe, String(src);
                           walkseed=Int(walkseed), nstmts, pausesper)

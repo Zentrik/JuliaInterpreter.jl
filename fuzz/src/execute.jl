@@ -137,7 +137,12 @@ const HARNESS_LOAD_PATH = copy(LOAD_PATH)
 # Behavioral equivalence with SETUP_SRC evaluated verbatim is asserted by the
 # selftest ("freshmodule prelude matches SETUP_SRC").
 function fjnorm(@nospecialize(x), prefix::String)
-    if x isa Union{Number, String, Symbol, Char, Nothing}
+    if x isa String
+        # `string(v)` of a program-defined struct embeds its module-qualified
+        # type name — strip this module's own prefix, same trick as the Type
+        # branch (nightly finding step_divergence-7e03896b).
+        return replace(x, prefix => "")
+    elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(el -> fjnorm(el, prefix), x)
