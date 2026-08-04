@@ -1277,7 +1277,7 @@ sides; distinct instantiated wrapper names — see `TL_PLACEHOLDER`). Returns
 `nothing` if the program was discarded before comparison (unparseable, or
 invalid Julia).
 """
-function split_case(src::String; nstmts::Int=300_000, maxfrags::Int=4000,
+function split_case(src::String; nstmts::Int=600_000, maxfrags::Int=4000,
                     interp::Interpreter=RecursiveInterpreter(), toplevel::Bool=false)
     ex = split_parsegate(src)
     ex === nothing && return nothing
@@ -1296,7 +1296,7 @@ Campaign form: one reference run, one interpreted run per mode (`:rec` |
 `:cmp`), the same sharing the differential axis's `run_all` does. Verdicts are
 produced by classifying each `(ref, spl)` pair with `classify_split`.
 """
-function split_case_all(src::String; nstmts::Int=300_000, maxfrags::Int=4000,
+function split_case_all(src::String; nstmts::Int=600_000, maxfrags::Int=4000,
                         modes::Tuple=(:rec, :cmp), toplevel::Bool=false)
     ex = split_parsegate(src)
     ex === nothing && return nothing
@@ -1350,7 +1350,7 @@ as the parent module, the only construction that reaches
 `find_or_create_module`'s package-resolution arm; see `TL_PLACEHOLDER` for the
 isolation contract.
 """
-function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
+function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=600_000,
                         outdir::String=joinpath(@__DIR__, "..", "findings"),
                         journaldir::String=joinpath(@__DIR__, "..", "journal"),
                         cfg::SplitCfg=SplitCfg(), progress::Int=100,
