@@ -1647,6 +1647,10 @@ end
     # well-formed splatted calls are unaffected
     ok_splat() = +((1, 2, 3)...)
     @test finish_and_return!(JuliaInterpreter.enter_call(ok_splat)) == 6
+    # a *builtin* callee must still take the expanded-builtin recursion branch
+    # through the QuoteNode (maybe_recurse_expanded_builtin unwraps it)
+    nested_builtin() = Core._apply_iterate(iterate, Core.tuple, (1, 2))
+    @test finish_and_return!(JuliaInterpreter.enter_call(nested_builtin)) == (1, 2)
 end
 
 @testset "invoke selects its method in the frame world" begin

@@ -12,7 +12,9 @@ end
 const kwinvoke = Core.kwfunc(Core.invoke)
 
 function maybe_recurse_expanded_builtin(interp::Interpreter, frame::Frame, new_expr::Expr)
-    f = new_expr.args[1]
+    fex = new_expr.args[1]
+    # expand paths QuoteNode-wrap the evaluated callee (see _apply_iterate/_call_latest)
+    f = fex isa QuoteNode ? fex.value : fex
     if supertype(typeof(f)) === Core.Builtin || isa(f, Core.IntrinsicFunction)
         return maybe_evaluate_builtin(interp, frame, new_expr, true)
     else
@@ -27,7 +29,8 @@ function recurse_expanded_builtin_latest(interp::Interpreter, frame::Frame, new_
     oldworld = frame.world
     frame.world = world
     try
-        f = new_expr.args[1]
+        fex = new_expr.args[1]
+        f = fex isa QuoteNode ? fex.value : fex
         if supertype(typeof(f)) === Core.Builtin || isa(f, Core.IntrinsicFunction)
             return invoke_in_world(world, maybe_evaluate_builtin, interp, frame, new_expr, true)
         end
