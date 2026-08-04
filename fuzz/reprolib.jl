@@ -237,16 +237,23 @@ function reprocorpus(src::AbstractString; seed=REPRO_CORPUS_SEED)
     return !agree
 end
 
-# --- enter_call-axis repro (`--engine call` findings) ----------------------
+# --- walk-replaying repros (call, step, evalcode, corpus failure-mode) ------
 #
-# A call finding is (src, callseed): the seed replays target selection,
-# argument synthesis and the debug_command walk. Synthesis is harness logic a
-# standalone copy would drift from, so this one repro loads FuzzJI from its
-# home next to this file instead of duplicating it.
+# These findings are (src, seed) pairs: the seed replays target selection,
+# argument synthesis, and/or the debug_command walk. That logic lives in the
+# harness and a standalone copy would drift from it, so these repros load
+# FuzzJI from its home next to this file instead of duplicating it. (The step,
+# evalcode and failure-mode corpus repros previously fell back to `reprorun`,
+# which never steps — so they under-reproduced their findings by construction;
+# NEXT.md handoff item 4.)
+
+function _repro_fuzzji()
+    isdefined(Main, :FuzzJI) || Base.include(Main, joinpath(@__DIR__, "src", "FuzzJI.jl"))
+    return getfield(Main, :FuzzJI)
+end
 
 function reprocall(src::AbstractString, callseed::Integer)
-    isdefined(Main, :FuzzJI) || Base.include(Main, joinpath(@__DIR__, "src", "FuzzJI.jl"))
-    FJ = getfield(Main, :FuzzJI)
+    FJ = _repro_fuzzji()
     r = Base.invokelatest(FJ.call_program, String(src); callseed=Int(callseed))
     if r === nothing
         println("program failed the parse gate — nothing to compare")
@@ -259,6 +266,77 @@ function reprocall(src::AbstractString, callseed::Integer)
     println(isempty(r.verdicts) ? "NO DIVERGENCE (bug may be fixed, or is walk-dependent)" :
                                   "DIVERGENCE REPRODUCED")
     return !isempty(r.verdicts)
+end
+
+# A step finding is (src, walkseed): replay the same random `debug_command`
+# walk — breakpoint actions included — against plain interpretation of the same
+# program, exactly as the campaign compared them. Defaults mirror
+# `step_campaign`'s.
+function reprostep(src::AbstractString, walkseed::Integer;
+                   nstmts::Int=300_000, maxcmds::Int=4000, usebreakpoints::Bool=true)
+    FJ = _repro_fuzzji()
+    ex = Base.invokelatest(FJ.parsegate, String(src))
+    if ex === nothing
+        println("program failed the parse gate — nothing to compare")
+        return false
+    end
+    plain = Base.invokelatest(FJ.run_interp, ex; nstmts,
+                              interp=JuliaInterpreter.RecursiveInterpreter())
+    st = Base.invokelatest(FJ.step_program, String(src);
+                           walkseed=Int(walkseed), maxcmds, usebreakpoints)
+    if st === nothing
+        println("stepping run discarded — nothing to compare")
+        return false
+    end
+    v = Base.invokelatest(FJ.classify_step, plain, st)
+    println("plain interpretation: ", plain.status,
+            "  stepped: ", st.status, " after ", st.ncommands, " command(s)")
+    println("verdict: ", v.class, isempty(v.detail) ? "" : string(" — ", first(v.detail, 400)))
+    found = Base.invokelatest(FJ.isfinding, v)::Bool
+    println(found ? "DIVERGENCE REPRODUCED" : "NO DIVERGENCE (bug may be fixed, or is walk-dependent)")
+    return found
+end
+
+# An eval_code finding is (src, walkseed): the seed replays the pause walk and
+# probe selection. Defaults mirror `evalcode_campaign`'s.
+function reproevalcode(src::AbstractString, walkseed::Integer;
+                       nstmts::Int=300_000, pausesper::Int=25)
+    FJ = _repro_fuzzji()
+    o = Base.invokelatest(FJ.evalcode_probe, String(src);
+                          walkseed=Int(walkseed), nstmts, pausesper)
+    if o === nothing
+        println("program was discarded — nothing to compare")
+        return false
+    end
+    v = Base.invokelatest(FJ.evalverdict, o)
+    println("verdict: ", v.class, isempty(v.detail) ? "" : string(" — ", first(v.detail, 400)))
+    found = Base.invokelatest(FJ.isfinding, v)::Bool
+    println(found ? "DIVERGENCE REPRODUCED" : "NO DIVERGENCE (bug may be fixed, or is walk-dependent)")
+    return found
+end
+
+# A failure-mode corpus finding (mode `corpus`, as opposed to the certified
+# `corpusvalue` handled by `reprocorpus` above) is real code plus a stepping
+# walkseed: replay the reference-then-interpret-then-step pipeline the campaign
+# ran. Defaults mirror `corpus_campaign`'s.
+function reprocorpusstep(src::AbstractString, walkseed::Integer;
+                         nstmts::Int=60_000, maxcmds::Int=1500)
+    FJ = _repro_fuzzji()
+    sp = Base.invokelatest(FJ.corpus_split, String(src))
+    if sp === nothing
+        println("no non-import statements — nothing to run")
+        return false
+    end
+    case, prelude = sp
+    r = Base.invokelatest(FJ.corpus_run, case, prelude; nstmts)
+    o = r.status === :ok ?
+        Base.invokelatest(FJ.corpus_step, case, r.prelude, Xoshiro(Int(walkseed)); maxcmds) : r
+    v = Base.invokelatest(FJ.corpusverdict, o)
+    println("plain run: ", r.status, "  final: ", o.status)
+    println("verdict: ", v.class, isempty(v.detail) ? "" : string(" — ", first(v.detail, 400)))
+    found = Base.invokelatest(FJ.isfinding, v)::Bool
+    println(found ? "DIVERGENCE REPRODUCED" : "NO DIVERGENCE (bug may be fixed, or is walk-dependent)")
+    return found
 end
 
 # --- ExprSplitter-axis repro (`--engine split` findings) -------------------

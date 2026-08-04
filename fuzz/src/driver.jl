@@ -62,10 +62,16 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
     mkpath(dir)
     # The split axis's verdicts are mostly about the *module tree*, so its
     # reproducer has to compare that too — `reprorun` only diffs observations.
-    # The call axis replays argument synthesis + the walk from its callseed.
+    # The call/step/evalcode/corpus axes replay their argument synthesis and/or
+    # walk from the recorded seed: `reprorun` never steps, so falling back to it
+    # (as these axes once did) under-reproduces any walk-dependent finding.
+    ws = something(walkseed, 0)
     reprocall = mode === :cmp   ? "reprorun(SRC; compiled=true)" :
                 mode === :split ? "reprosplit(SRC)" :
-                mode === :call  ? "reprocall(SRC, $(something(walkseed, 0)))" :
+                mode === :call  ? "reprocall(SRC, $ws)" :
+                mode === :step  ? "reprostep(SRC, $ws)" :
+                mode === :evalcode ? "reproevalcode(SRC, $ws)" :
+                mode === :corpus ? "reprocorpusstep(SRC, $ws)" :
                 mode === :corpusvalue ? "reprocorpus(SRC)" : "reprorun(SRC)"
     # The stepping/eval_code/corpus axes drive their own walk from `walkseed`;
     # without it the reported source alone does not describe the run.
