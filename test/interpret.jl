@@ -1632,6 +1632,7 @@ end
     @test finish_and_return!(JuliaInterpreter.enter_call(ok_cl)) == 5
 end
 end
+end
 
 @testset "invoke selects its method in the frame world" begin
     @eval module InvokeWorld
