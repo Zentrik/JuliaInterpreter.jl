@@ -3,6 +3,7 @@
 
 using Test
 using Dates   # for the corpus import-repair assertions
+using Logging # NullLogger around the deliberate "Replacing module" fixture
 using .FuzzJI
 using .FuzzJI: Xoshiro, classify, Outcome, Verdict, fingerprint, isfinding,
                nstatements, Cfg, run_both, run_all, shrink, genprogram, render,
@@ -1395,6 +1396,190 @@ end
         @test diverging == true
         @test occursin("DIVERGENCE REPRODUCED", out)
         @test occursin("ZRB.q", out)                 # the missing binding is named
+    end
+
+    @testset "ExprSplitter axis: Compiled-mode split run" begin
+        # The campaign drives every case through both interpreter configurations
+        # (splitfuzz.jl `split_campaign` docstring). The Compiled-mode leg must
+        # agree on the same known-agree batch the :rec leg does...
+        nbad = ndiscarded = 0
+        for seed in 1:25
+            src = FuzzJI.gensplit(Xoshiro(seed))
+            r = FuzzJI.split_case(src; nstmts=300_000, maxfrags=4000,
+                                  interp=modeinterp(:cmp))
+            r === nothing && (ndiscarded += 1; continue)
+            if isfinding(r[1])
+                nbad += 1
+                @warn "Compiled-mode split divergence (a real finding — triage it!)" seed r[1].class r[1].detail src
+            end
+        end
+        @test nbad == 0
+        @test ndiscarded == 0
+        # ... while genuinely running: fragments and module tree non-trivial.
+        o = FuzzJI.split_interp(Meta.parseall(FuzzJI.gensplit(Xoshiro(3)));
+                                nstmts=300_000, maxfrags=4000, interp=modeinterp(:cmp))
+        @test o.status === :done
+        @test o.nfrags >= 3
+        @test !isempty(o.state)
+        # Mutation catch: the oracle must have teeth in this mode too. Drop one
+        # definition on the interpreted side; the module-tree comparison has to
+        # see the missing binding.
+        ref = FuzzJI.split_ref(Meta.parseall("const za = 1\nconst zb = 2\n"))
+        spl = FuzzJI.split_interp(Meta.parseall("const za = 1\n");
+                                  nstmts=300_000, maxfrags=4000, interp=modeinterp(:cmp))
+        vmut = FuzzJI.classify_split(ref, spl)
+        @test vmut.class === :split_missing_effect
+        @test occursin("zb", vmut.detail)
+        # `split_case_all` is the campaign's shape: one shared reference run,
+        # one interpreted outcome per mode, each classifiable against it.
+        r = FuzzJI.split_case_all(FuzzJI.gensplit(Xoshiro(5)); nstmts=300_000,
+                                  maxfrags=4000, modes=(:rec, :cmp))
+        @test r !== nothing
+        refall, runs = r
+        @test first.(runs) == [:rec, :cmp]
+        @test all(FuzzJI.classify_split(refall, spl).class === :agree for (_, spl) in runs)
+        # Mode/parent tags keep the four configurations in separate dedup
+        # namespaces, with :split keeping its historical untagged-mode name.
+        @test FuzzJI.splitmodetag(false, :rec) === :split
+        @test FuzzJI.splitmodetag(false, :cmp) === :splitcmp
+        @test FuzzJI.splitmodetag(true, :rec) === :splittl
+        @test FuzzJI.splitmodetag(true, :cmp) === :splittlcmp
+    end
+
+    @testset "ExprSplitter axis: Base.__toplevel__ parent end to end" begin
+        # `find_or_create_module`'s package-resolution arm is reachable only
+        # with `Base.__toplevel__` as the parent (splitfuzz.jl, TL_PLACEHOLDER
+        # comment). First, the arm itself: a module evaluated there becomes a
+        # *root* module registered in `Base.loaded_modules`, and a second
+        # resolution of the same name must find it through that table.
+        find_or_create_module = JuliaInterpreter.find_or_create_module
+        modex = :(module FJTLSelfT1 end)
+        m1, _ = find_or_create_module(Base.__toplevel__, modex)
+        try
+            @test parentmodule(m1) === m1              # root module: only this arm makes those
+            @test FuzzJI.tl_lookup(:FJTLSelfT1) === m1 # registered under PkgId(name)
+            m2, _ = find_or_create_module(Base.__toplevel__, modex)
+            @test m2 === m1                            # resolved via Base.loaded_modules
+        finally
+            FuzzJI.tl_cleanup([:FJTLSelfT1])
+        end
+        @test FuzzJI.tl_lookup(:FJTLSelfT1) === nothing  # cleanup unregisters
+        m3, _ = find_or_create_module(Base.__toplevel__, modex)
+        @test m3 !== m1                                # fresh after cleanup, no stale reuse
+        FuzzJI.tl_cleanup([:FJTLSelfT1])
+
+        # Generator validity: parseable, deterministic, and top-level forms are
+        # modules only (anything else would evaluate into Base.__toplevel__
+        # itself — shared state, unisolatable).
+        nbadgen = 0
+        for seed in 1:60
+            src = FuzzJI.gensplit_toplevel(Xoshiro(seed))
+            occursin(FuzzJI.TL_PLACEHOLDER, src) || (nbadgen += 1; @error "no wrapper" seed src)
+            ex = try
+                Meta.parseall(src)
+            catch err
+                nbadgen += 1
+                @error "toplevel split generator parse failure" seed err src
+                continue
+            end
+            for st in ex.args
+                st isa LineNumberNode && continue
+                ismod = st isa Expr && (st.head === :module ||
+                        (st.head === :macrocall && length(st.args) == 4 &&
+                         st.args[4] isa Expr && (st.args[4]::Expr).head === :module))
+                ismod || (nbadgen += 1; @error "non-module top form in toplevel case" seed st)
+            end
+        end
+        @test nbadgen == 0
+        @test FuzzJI.gensplit_toplevel(Xoshiro(9)) == FuzzJI.gensplit_toplevel(Xoshiro(9))
+        # The execution gate enforces the module-only restriction even for
+        # sources the generator did not produce (the shrinker can strip a
+        # wrapper's `module` line, leaving bare statements that would evaluate
+        # into Base.__toplevel__ itself): such variants are discards, and the
+        # binding must never be created in the shared parent.
+        @test FuzzJI.split_case("const zzstray = 1\n"; toplevel=true) === nothing
+        @test !isdefined(Base.__toplevel__, :zzstray)
+        @test FuzzJI.split_case_all("module FJTLW1 end\nzzstray2 = 2\n"; toplevel=true) === nothing
+        @test !isdefined(Base.__toplevel__, :zzstray2)
+        # Instantiation renames every wrapper, differently per call (the
+        # process-unique-per-run rule that keeps `Base.loaded_modules` sound).
+        t = FuzzJI.gensplit_toplevel(Xoshiro(9))
+        i1, i2 = FuzzJI.tl_instantiate(t, "R"), FuzzJI.tl_instantiate(t, "I")
+        @test !occursin(FuzzJI.TL_PLACEHOLDER, i1)
+        @test i1 != i2
+
+        # End to end, both interpreter modes, same oracle: zero findings, zero
+        # discards, and the runs must be non-trivial (fragments consumed, TL-
+        # prefixed module tree collected).
+        nbad = ndiscarded = 0
+        sawstate = false
+        for seed in 1:25
+            src = FuzzJI.gensplit_toplevel(Xoshiro(seed))
+            r = FuzzJI.split_case_all(src; nstmts=300_000, maxfrags=4000,
+                                      modes=(:rec, :cmp), toplevel=true)
+            r === nothing && (ndiscarded += 1; continue)
+            ref, runs = r
+            for (mode, spl) in runs
+                v = FuzzJI.classify_split(ref, spl)
+                if isfinding(v)
+                    nbad += 1
+                    @warn "__toplevel__ split divergence (a real finding — triage it!)" seed mode v.class v.detail src
+                end
+                spl.status === :done && spl.nfrags >= 2 && haskey(spl.state, "TL1") &&
+                    (sawstate = true)
+            end
+        end
+        @test nbad == 0
+        @test ndiscarded == 0
+        @test sawstate
+        # Re-running the same seed in one process must stay agreement: a stale
+        # registered module from the first run would be resolved by the second
+        # through the very arm under test (the shrinker re-runs a case dozens of
+        # times, so this is the regression check for isolation rules 1–3).
+        for _ in 1:2
+            r = FuzzJI.split_case(FuzzJI.gensplit_toplevel(Xoshiro(11)); toplevel=true)
+            @test r !== nothing && r[1].class === :agree
+        end
+        @test !any(startswith(k.name, "FJTL") for k in keys(Base.loaded_modules))
+
+        # Oracle teeth at this seam: a wrapper the interpreted side never
+        # populated shows up in the module tree...
+        reftl = FuzzJI.split_ref_tl("module FJTLW1\nconst za = 1\nconst zb = 2\nend\n")
+        spltl = FuzzJI.split_interp_tl("module FJTLW1\nconst za = 1\nend\n";
+                                       nstmts=300_000, maxfrags=4000)
+        vmut = FuzzJI.classify_split(reftl, spltl)
+        @test vmut.class === :split_missing_effect
+        @test occursin("TL1.zb", vmut.detail)
+        # ... and a wrapper module missing entirely is a TL-root divergence.
+        @test FuzzJI.statediff(Dict{String,Any}("TL1" => :__submodule__),
+                               Dict{String,Any}("TL1" => :__absent_module__)) !== nothing
+
+        # The reproducer covers this configuration too. Agreement first; then a
+        # genuine, stable divergence: two same-named wrappers, where native
+        # evaluation *replaces* the registered module while the package-
+        # resolution arm *reuses* it — the fresh-module axis's documented
+        # divergence #1 at process scope, which is exactly why the generator
+        # gives every wrapper a unique name. (NullLogger: the native side warns
+        # "Replacing module", by design.)
+        function quiet2(f)
+            path, io = mktemp()
+            r = try
+                redirect_stdout(f, io)
+            finally
+                close(io)
+            end
+            return (r, read(path, String))
+        end
+        agreeing, _ = quiet2(() -> reprosplit(FuzzJI.gensplit_toplevel(Xoshiro(3)); toplevel=true))
+        @test agreeing == false
+        diverging, out = Logging.with_logger(Logging.NullLogger()) do
+            quiet2(() -> reprosplit("module FJTLW1\nconst zq = 7\nend\nmodule FJTLW1\nconst zr = 8\nend\n";
+                                    toplevel=true))
+        end
+        @test diverging == true
+        @test occursin("DIVERGENCE REPRODUCED", out)
+        @test occursin("TL1.zq", out)   # the binding only the reusing side kept
+        @test !any(startswith(k.name, "FJTL") for k in keys(Base.loaded_modules))
     end
 
     @testset "canary: pipeline detects a genuine known divergence" begin

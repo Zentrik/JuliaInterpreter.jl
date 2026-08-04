@@ -642,11 +642,21 @@ after a throwing statement exists on the interpreted side only) is why module
 state is not compared on the throwing path. All three are documented at their
 constants in `splitfuzz.jl`.
 
-Not done for this axis: shrinking (writes `original == shrunk`, see item 3),
-Compiled-mode (`NonRecursiveInterpreter`) runs, and `Base.__toplevel__` as the
-parent module — `find_or_create_module`'s package-resolution arm
-(`find_toplevel_module_id`, `Base.loaded_modules`) is only reachable from
-there and is still untested by any axis.
+Since closed for this axis: **Compiled-mode runs** (every case now runs the
+interpreted side in both `:rec` and `:cmp` against one shared reference —
+see `split_campaign`'s docstring for why run-both beat a per-case draw) and
+**`Base.__toplevel__` as the parent module** — a gated quarter of cases
+(`SPLIT_TL_FRACTION`) now reaches `find_or_create_module`'s package-resolution
+arm (`find_toplevel_module_id`, `Base.loaded_modules`), previously untested by
+any axis. The isolation contract (process-unique per-run wrapper names,
+side-tagged, `FJTL`-prefixed, unregistered after each run) is documented at
+`TL_PLACEHOLDER` in splitfuzz.jl; the third known-legitimate divergence
+(reuse-vs-replace) exists at process scope there too and is designed out the
+same way — unique names — with the reproducer testset keeping a fixture of it.
+Calibration after the extension: 6000 cases (4000 campaign-mix at the 25%
+`__toplevel__` fraction + 2000 forced-`__toplevel__`), both modes each, zero
+findings, zero discards. Still not done: shrinking (writes
+`original == shrunk`, see item 3).
 
 Ordering between items 4–5 is soft. Item 5 has the strongest
 breadth-of-tested-code argument. A session should pick by which question it

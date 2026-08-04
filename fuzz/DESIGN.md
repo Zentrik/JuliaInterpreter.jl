@@ -605,6 +605,39 @@ name); and `module`/bare `global`/define-and-invoke-a-macro inside a
 `begin`/`if`, all of which Julia itself rejects, so `ExprSplitter`'s greater
 permissiveness there is about invalid input rather than about the interpreter.
 
+Every case runs the interpreted side in **both interpreter modes** against one
+shared reference run — `:rec` (RecursiveInterpreter) and `:cmp` (Compiled mode,
+NonRecursiveInterpreter), the same sharing `run_all` does on the differential
+axis. Run-both beats a per-case draw here because generation, parsing and the
+reference (the expensive, shared half) are paid once and the axis's
+definition-heavy programs make the second interpreted run cheap, while a draw
+would halve each mode's effective case rate. Findings are tagged `split-`,
+`splitcmp-`, `splittl-`, `splittlcmp-` per (parent, mode) configuration.
+
+A gated quarter of cases (`SPLIT_TL_FRACTION`, drawn first from the case RNG so
+the whole case stays a pure function of the seed) is built with
+**`Base.__toplevel__` as the parent module** — the parent Julia gives package
+files, and the *only* construction that reaches `find_or_create_module`'s
+package-resolution arm (`find_toplevel_module_id`, the `Base.loaded_modules`
+scan). `__toplevel__` is process-global shared state: a module evaluated there
+becomes a self-parented root module registered in `Base.loaded_modules` under
+its name, native re-evaluation *replaces* the registration while the resolution
+arm *reuses* it, and nothing is ever collected. Isolation (the full contract is
+at `TL_PLACEHOLDER` in splitfuzz.jl): the generator emits wrapper names as
+placeholders and every execution — each side, every shrinker re-run —
+substitutes a process-unique, side-tagged name, so no run can resolve another
+run's (or the other side's) module through the arm under test, and the
+`FJTL`-prefixed names can never collide with, shadow, or mutate a real loaded
+package; both sides use the same parent, `Base.__toplevel__`; each run
+unregisters its modules afterwards (`Base.unreference_module`). State is
+compared under stable `TL<k>` prefixes, so the differing wrapper names never
+enter the oracle. These cases are restricted to `module`/`baremodule` top-level
+forms (any other statement would evaluate into `Base.__toplevel__` itself —
+unisolatable, and unrealistic: a `__toplevel__` parent only ever occurs for
+package files, which *are* module blocks), with ordinary generated bodies and
+no `__obs__` (a root module has no harness prelude above it — the module tree,
+this axis's strong oracle, carries the comparison alone).
+
 ### The corpus axis (`corpus.jl`)
 
 `--engine corpus`. A grammar only emits constructs someone wrote a rule for;

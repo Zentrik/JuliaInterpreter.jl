@@ -409,14 +409,114 @@ function repro_state!(out::Dict{String,Any}, m::Module, prefix::String, seen::Se
 end
 repro_state(m::Module) = repro_state!(Dict{String,Any}(), m, "", Set{Module}())
 
-function reprosplit(src::AbstractString)
-    ex = Meta.parseall(String(src))
+# --- `Base.__toplevel__`-parent support (findings tagged `splittl-`) --------
+#
+# Those cases evaluate top-level `module` blocks with `Base.__toplevel__` as the
+# parent — the only construction that reaches `find_or_create_module`'s
+# package-resolution arm. The finding's SRC is a *template* whose wrapper
+# modules are named `FJTLW1`, `FJTLW2`, …; each run substitutes process-unique,
+# side-tagged names, because a module evaluated into `Base.__toplevel__` is
+# registered globally in `Base.loaded_modules` under its name: reusing a name
+# across runs (or across the two sides) would make the interpreted path resolve
+# and reuse a stale module through the very arm under test. Mirrors
+# fuzz/src/splitfuzz.jl's `tl_instantiate`/`tl_modstate`/`tl_cleanup` (this file
+# stays standalone on purpose).
+
+const REPRO_TL_NONCE = Ref(0)
+
+function repro_tl_wrappernames(ex::Expr)
+    out = Symbol[]
+    for st in ex.args
+        st isa Expr || continue
+        m = st.head === :module ? st :
+            (st.head === :macrocall && length(st.args) == 4 && st.args[4] isa Expr &&
+             (st.args[4]::Expr).head === :module) ? st.args[4]::Expr : nothing
+        m === nothing && continue
+        push!(out, m.args[end-1]::Symbol)
+    end
+    return out
+end
+
+repro_tl_lookup(name::Symbol) =
+    Base.@lock Base.require_lock get(Base.loaded_modules, Base.PkgId(String(name)), nothing)
+
+function repro_tl_state(wnames::Vector{Symbol})
+    out = Dict{String,Any}()
+    for (k, n) in enumerate(wnames)
+        prefix = string("TL", k)
+        m = repro_tl_lookup(n)
+        if m === nothing
+            out[prefix] = :__absent_module__
+        else
+            out[prefix] = :__submodule__
+            repro_state!(out, m, prefix, Set{Module}())
+        end
+    end
+    return out
+end
+
+function repro_tl_cleanup(wnames::Vector{Symbol})
+    isdefined(Base, :unreference_module) || return nothing
+    for n in wnames
+        try
+            Base.unreference_module(Base.PkgId(String(n)))
+        catch
+        end
+    end
+    return nothing
+end
+
+function reprosplit(src::AbstractString; compiled::Bool=false, toplevel::Bool=false)
+    interp = compiled ? JuliaInterpreter.NonRecursiveInterpreter() :
+                        JuliaInterpreter.RecursiveInterpreter()
     runside(m, f) = try
         f(m)
         (:done, nothing)
     catch err
         (:threw, err)
     end
+    if toplevel
+        # Both sides share the parent `Base.__toplevel__`; names differ by side.
+        refsrc = replace(String(src), "FJTLW" => string("FJTL", REPRO_TL_NONCE[] += 1, "RW"))
+        intsrc = replace(String(src), "FJTLW" => string("FJTL", REPRO_TL_NONCE[] += 1, "IW"))
+        refex, intex = Meta.parseall(refsrc), Meta.parseall(intsrc)
+        refnames, intnames = repro_tl_wrappernames(refex), repro_tl_wrappernames(intex)
+        refout = runside(Base.__toplevel__, m -> for st in refex.args
+            st isa LineNumberNode || Core.eval(m, st)
+        end)
+        refst = repro_tl_state(refnames)
+        repro_tl_cleanup(refnames)
+        intout = runside(Base.__toplevel__,
+                         m -> for (mod, frag) in Base.invokelatest(ExprSplitter, m, intex)
+            Base.invokelatest(JuliaInterpreter.finish_and_return!, interp,
+                              Base.invokelatest(Frame, mod, frag), true)
+        end)
+        intst = repro_tl_state(intnames)
+        repro_tl_cleanup(intnames)
+        for (label, out) in (("compiled (reference)", refout),
+                             ("ExprSplitter + Frame", intout))
+            println("=== ", label, " (parent: Base.__toplevel__) ===")
+            println("outcome: ", out[1], out[2] === nothing ? "" : " ($(sprint(showerror, out[2])))")
+        end
+        diffs = String[]
+        for path in sort(collect(union(keys(refst), keys(intst))))
+            hr, hi = haskey(refst, path), haskey(intst, path)
+            if !hr || !hi
+                push!(diffs, string(path, ": ", hr ? "eval=$(refst[path])" : "<absent on the eval side>",
+                                    " / ", hi ? "split=$(intst[path])" : "<absent on the split side>"))
+            elseif !isequal(refst[path], intst[path]) || typeof(refst[path]) !== typeof(intst[path])
+                push!(diffs, string(path, ": eval=", refst[path], " split=", intst[path]))
+            end
+        end
+        println("=== module state (", length(refst), " names on the eval side, ",
+                length(intst), " on the split side) ===")
+        isempty(diffs) ? println("identical") : foreach(d -> println("  ", d), diffs)
+        agree = isempty(diffs) && refout[1] === intout[1] &&
+                (refout[1] !== :threw || typeof(refout[2]) === typeof(intout[2]))
+        println(agree ? "NO DIVERGENCE (bug may be fixed, or is budget-dependent)" : "DIVERGENCE REPRODUCED")
+        return !agree
+    end
+    ex = Meta.parseall(String(src))
     mref = repro_freshmodule(:SplitRef)
     refout = runside(mref, m -> for st in ex.args
         st isa LineNumberNode || Core.eval(m, st)
@@ -425,7 +525,7 @@ function reprosplit(src::AbstractString)
     # program's own macros are newer than this function's world.
     mint = repro_freshmodule(:SplitInterp)
     intout = runside(mint, m -> for (mod, frag) in Base.invokelatest(ExprSplitter, m, ex)
-        Base.invokelatest(JuliaInterpreter.finish_and_return!,
+        Base.invokelatest(JuliaInterpreter.finish_and_return!, interp,
                           Base.invokelatest(Frame, mod, frag), true)
     end)
     obs(m) = copy(Base.invokelatest(getglobal, m, :__OBS__))

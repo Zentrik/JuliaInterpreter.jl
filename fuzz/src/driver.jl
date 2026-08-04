@@ -68,6 +68,9 @@ function writefinding(outdir::String, fp::String, v::Verdict, seed::Int,
     ws = something(walkseed, 0)
     reprocall = mode === :cmp   ? "reprorun(SRC; compiled=true)" :
                 mode === :split ? "reprosplit(SRC)" :
+                mode === :splitcmp ? "reprosplit(SRC; compiled=true)" :
+                mode === :splittl ? "reprosplit(SRC; toplevel=true)" :
+                mode === :splittlcmp ? "reprosplit(SRC; compiled=true, toplevel=true)" :
                 mode === :call  ? "reprocall(SRC, $ws)" :
                 mode === :step  ? "reprostep(SRC, $ws)" :
                 mode === :evalcode ? "reproevalcode(SRC, $ws)" :

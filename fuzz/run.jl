@@ -31,7 +31,10 @@
 #     baremodules, unsplittable blocks, toplevel macros, docstrings, odd
 #     declarations) run through ExprSplitter + Frame and compared against
 #     Core.eval on failure mode, observation stream, and the resulting module
-#     tree. Targets construct.jl. --splitdepth bounds module nesting,
+#     tree. Every case runs in both interpreter modes (:rec and :cmp) against
+#     one shared reference, and a gated quarter of cases uses Base.__toplevel__
+#     as the parent module (find_or_create_module's package-resolution arm).
+#     Targets construct.jl. --splitdepth bounds module nesting,
 #     --maxfrags the iteration budget.
 #   step — the debugger axis: drives each generated program through a random
 #     debug_command walk instead of running it, asserting that stepping
