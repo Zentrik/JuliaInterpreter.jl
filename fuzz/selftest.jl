@@ -887,6 +887,49 @@ end
         @test FuzzJI.classify_call(int1, flt1, "f/1").class === :call_value_divergence
     end
 
+    @testset "call axis: per-run global reset closes the unreset-state class" begin
+        # A callee that advances a global and returns a value that coincidentally
+        # agrees for the first two (native) runs but not the third. Before the
+        # per-run reset this *certified* — both native runs returned 0 — and the
+        # interpreted run then legitimately threw on the advanced state, reported
+        # as a false call_only_throw (the 0-for-6 harness-artifact class,
+        # `call-call_only_throw-1dc96bf0` the last member).
+        src = """
+        global gcount = 0
+        function f1()
+            global gcount += 1
+            gcount <= 2 ? 0 : error("third call")
+        end
+        """
+        r = FuzzJI.call_program(src; callseed=1, maxcalls=1)
+        @test r !== nothing && r.ncalls == 1
+        @test isempty(r.verdicts)
+        # In-place mutation under a const binding (never reassignable, but its
+        # contents are) resets too, via inplace_restore!.
+        src2 = """
+        const CV = Int[]
+        function f2()
+            push!(CV, 1)
+            length(CV) <= 2 ? 0 : error("third call")
+        end
+        """
+        r2 = FuzzJI.call_program(src2; callseed=1, maxcalls=1)
+        @test r2 !== nothing && r2.ncalls == 1
+        @test isempty(r2.verdicts)
+        # ... as does field mutation of a const-bound mutable struct.
+        src3 = """
+        mutable struct MS; x::Int; end
+        const gms = MS(0)
+        function f3()
+            gms.x += 1
+            gms.x <= 2 ? 0 : error("third call")
+        end
+        """
+        r3 = FuzzJI.call_program(src3; callseed=1, maxcalls=1)
+        @test r3 !== nothing && r3.ncalls == 1
+        @test isempty(r3.verdicts)
+    end
+
     @testset "stepping oracle detects a planted divergence" begin
         # Prove the step oracle can actually fail: compare a program's real
         # observations against a deliberately wrong stepped stream, and against
@@ -951,6 +994,16 @@ end
         @test FuzzJI.calleename(:(Base.Foo.bar)) === :bar
         @test FuzzJI.calleename(:(f{Int})) === :f
         @test FuzzJI.calleename(GlobalRef(Base, :rm)) === :rm
+        # Fragments that introspect backtraces/stack frames self-certify (the
+        # two compiled runs agree) and then diverge on interpreter-frame details
+        # that say nothing about the interpreter
+        # (corpusvalue-interp_only_throw-390a4eeb): never admitted.
+        @test !FuzzJI.corpus_ok(:(bt = stacktrace(catch_backtrace())))
+        @test !FuzzJI.corpus_ok(:(try error() catch; global bt = Base.catch_backtrace() end))
+        @test FuzzJI.introspects_frames(:(f(x) = length(stacktrace())))
+        @test FuzzJI.introspects_frames(:(st = current_exceptions()))
+        @test !FuzzJI.introspects_frames(:(mystacktrace(path)))
+        @test FuzzJI.corpus_ok(:(mystacktrace(path)))
         # Method definitions on another module's function register globally and
         # would leak between cases.
         @test FuzzJI.defines_foreign_method(:(Base.foo(x) = 1))

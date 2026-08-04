@@ -99,6 +99,23 @@ const UNSAFE_MACROS = Set{Symbol}([
     Symbol("@allocated"), Symbol("@ccall"), Symbol("@cfunction"), Symbol("@test_throws"),
 ])
 
+# Names that introspect the *execution machinery itself* — backtraces and stack
+# frames. A fragment asserting on `stacktrace(catch_backtrace())` sees compiled
+# frames on the reference and interpreter frames (extra depth, different file/
+# line) under JuliaInterpreter; both are correct, so any divergence is an
+# artifact of observing the machinery, not an interpreter bug. Worse, such a
+# fragment can *self-certify*: the two compiled certification runs agree with
+# each other and the case graduates to the value oracle, where the interpreted
+# run then "diverges" on frame details — `corpusvalue-interp_only_throw-390a4eeb`
+# was exactly this (a `@test bt[1].line == topline + 4` lifted from Julia's test
+# suite). Interpreter-visible frame effects are a *known, permanent* divergence
+# (the selftest's `:stackprobe` canary proves the pipeline detects it), so these
+# fragments carry no signal on any corpus oracle: filter them at admission,
+# same call-position AST check as UNSAFE_NAMES.
+const FRAME_INTROSPECTION_NAMES = Set{Symbol}([
+    :stacktrace, :backtrace, :catch_backtrace, :catch_stack, :current_exceptions,
+])
+
 # The callee of a call expression, reduced to a bare name: `f`, `Mod.f`, and
 # `f{T}` all answer `:f`, so a qualified or parameterized spelling cannot slip
 # past the check.
@@ -155,6 +172,21 @@ function defines_foreign_method(ex)
     return f isa Expr && f.head === :.        # Base.foo, Mod.bar, ...
 end
 
+# Same call-position AST walk as `calls_unsafe`, for the frame-introspection
+# names: `f = stacktrace; f()` still defeats it, but the qualified and
+# parameterized spellings do not.
+function introspects_frames(@nospecialize(ex))::Bool
+    ex isa Expr || return false
+    if ex.head === :call || ex.head === :.
+        n = calleename(ex.head === :call ? ex.args[1] : ex)
+        n !== nothing && n in FRAME_INTROSPECTION_NAMES && return true
+    end
+    for a in ex.args
+        introspects_frames(a) && return true
+    end
+    return false
+end
+
 function corpus_ok(ex)::Bool
     ex isa LineNumberNode && return false
     ex isa Expr || return false
@@ -163,6 +195,7 @@ function corpus_ok(ex)::Bool
     ex.head in (:module, :import, :using, :export, :toplevel) && return false
     defines_foreign_method(ex) && return false
     calls_unsafe(ex) && return false
+    introspects_frames(ex) && return false
     # Very large fragments cost interpretation time out of proportion to what
     # they add, and are usually whole test suites rather than units of code.
     exprsize(ex) > 600 && return false

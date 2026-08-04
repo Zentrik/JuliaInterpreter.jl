@@ -255,6 +255,143 @@ function classify_call(ref::CallOutcome, int::CallOutcome, callrepr::String)::Ve
                    ref.excname, :none, 0, :none, :none)
 end
 
+# --- per-run state reset -----------------------------------------------------
+#
+# The three runs of a call (native #1, native #2, interpreted) share one module,
+# so any state a callee reads AND advances — `global g = ...` reassignment from
+# a function body, `setfield!` on a global mutable struct, `setindex!` on a
+# global vector, the inline PRNG — carries over from run to run. Double-call
+# certification catches that only *probabilistically*: it needs the two native
+# outcomes to differ, and state-dependent outcomes routinely coincide (a clamp,
+# a parity, an early return) while the third, interpreted run sees yet another
+# state and legitimately diverges. Every one of the call axis's first six
+# divergences was this harness artifact, not an interpreter bug (NEXT.md,
+# `call-call_only_throw-1dc96bf0` the last of them).
+#
+# The fix is to make the comparison a true differential: snapshot the module's
+# mutable surface once, after the definition pass, and restore it before EVERY
+# run. Two kinds of binding, two restore strategies:
+#
+#   - non-const globals: rebind to a fresh `deepcopy` of the snapshot. Covers
+#     reassignment and in-place mutation alike. (A closure global's captured
+#     state is inside the deepcopy, so it resets too.)
+#   - const bindings of in-place-mutable values (`const` can never be
+#     *reassigned* by program code since 1.12, but a vector/struct/Ref bound to
+#     one can still be mutated): restore the contents in place, keeping object
+#     identity, for the shapes the generator produces — Ref, Vector, Dict, Set,
+#     mutable struct. This also subsumes the harness's own `__LCG__`/`__VTIME__`
+#     Refs and `__OBS__`.
+#
+# What this cannot reach — state captured by a *const-bound closure*, or a
+# shape `inplace_restore!` declines — is left to certification, which remains
+# the backstop for any residual call-count sensitivity.
+
+struct GlobalSnap
+    name::Symbol
+    isconst::Bool
+    value::Any     # pristine deepcopy, taken after the definition pass
+end
+
+inplace_restorable(@nospecialize(v)) =
+    v isa Base.RefValue || v isa Vector || v isa AbstractDict || v isa AbstractSet ||
+    (ismutable(v) && isstructtype(typeof(v)) && !(v isa String))
+
+function snapshotglobals(m::Module)
+    snaps = GlobalSnap[]
+    # invokelatest throughout: the bindings were created by `Core.eval` *during*
+    # this call, so they are newer than the world this function runs in —
+    # a plain `names(m; all=true)` here simply does not list them (verified:
+    # snapshot silently came back without the program's globals), and `isconst`
+    # consults the same world-bounded binding partitions.
+    for n in Base.invokelatest(names, m; all=true)
+        n === nameof(m) && continue
+        startswith(String(n), "#") && continue
+        Base.invokelatest(isdefined, m, n) || continue
+        v = try
+            Base.invokelatest(getglobal, m, n)
+        catch
+            continue
+        end
+        (v isa Module || v isa Type) && continue
+        isc = Base.invokelatest(Base.isconst, m, n)::Bool
+        # A const binding of an immutable value cannot change at all: nothing to
+        # snapshot. A const binding we could not restore in place is skipped for
+        # the same reason snapshotting it would be pointless.
+        isc && !inplace_restorable(v) && continue
+        c = try
+            deepcopy(v)
+        catch
+            continue
+        end
+        push!(snaps, GlobalSnap(n, isc, c))
+    end
+    return snaps
+end
+
+# Restore `cur`'s contents to equal `snap` without rebinding, preserving the
+# identity closures and aliases hold. Returns false (leaving `cur` as-is) for a
+# shape it cannot faithfully restore.
+function inplace_restore!(@nospecialize(cur), @nospecialize(snap))::Bool
+    typeof(cur) === typeof(snap) || return false
+    try
+        if cur isa Base.RefValue
+            cur[] = deepcopy(snap[])
+        elseif cur isa Vector
+            # empty! + resize! leaves every slot unassigned, so the snapshot's
+            # own unassigned slots (push!-grown, never stored) round-trip.
+            empty!(cur)
+            resize!(cur, length(snap))
+            for i in eachindex(snap)
+                isassigned(snap, i) && (cur[i] = deepcopy(snap[i]))
+            end
+        elseif cur isa AbstractDict
+            empty!(cur)
+            for (k, v) in snap
+                cur[deepcopy(k)] = deepcopy(v)
+            end
+        elseif cur isa AbstractSet
+            empty!(cur)
+            for x in snap
+                push!(cur, deepcopy(x))
+            end
+        elseif ismutable(cur) && isstructtype(typeof(cur))
+            T = typeof(cur)
+            for i in 1:fieldcount(T)
+                if isdefined(snap, i)
+                    order = Base.isfieldatomic(T, i) ? :sequentially_consistent : :not_atomic
+                    setfield!(cur, i, deepcopy(getfield(snap, i)), order)
+                elseif isdefined(cur, i)
+                    return false   # a field cannot be made undef again
+                end
+            end
+        else
+            return false
+        end
+        return true
+    catch
+        return false
+    end
+end
+
+function restoreglobals!(m::Module, snaps::Vector{GlobalSnap})
+    for s in snaps
+        cur = try
+            Base.invokelatest(getglobal, m, s.name)
+        catch
+            continue
+        end
+        if s.isconst
+            inplace_restore!(cur, s.value)
+        else
+            try
+                Base.invokelatest(setglobal!, m, s.name, deepcopy(s.value))
+            catch
+            end
+        end
+    end
+    return nothing
+end
+
 # --- per-candidate driver ----------------------------------------------------
 
 struct CallRun
@@ -286,31 +423,12 @@ function call_program(src::String; callseed::Int, maxcalls::Int=6, maxcmds::Int=
         end
     end
     fjnorm = Base.invokelatest(getglobal, m, :__fjnorm__)
-    # Mutable harness state the program's functions read AND advance: the
-    # inline PRNG (`__LCG__`, rendered into the program) and the virtual clock.
-    # Snapshot it once and restore it before EVERY run of a call — native #1,
-    # native #2, and the interpreted run — so all three observe identical
-    # state. Without this, a PRNG-reading function's value legitimately differs
-    # per call, and double-call certification only catches that
-    # *probabilistically*: the first campaign minutes produced a false
-    # `call_value_divergence` where both native samples landed in a
-    # `max(x, 0)` clamp (both negative products → both 0, certified) and the
-    # interpreted call drew the next PRNG value. Restoring the state makes the
-    # comparison a true differential; certification still guards the
-    # *program's own* globals, where the same masking risk remains and is
-    # accepted.
-    refs = Pair{Symbol,Any}[]
-    for nm in (:__LCG__, :__VTIME__)
-        r = try
-            Base.invokelatest(getglobal, m, nm)
-        catch
-            continue
-        end
-        r isa Ref && push!(refs, nm => (r, r[]))
-    end
-    resetstate!() = for (_, (r, v0)) in refs
-        r[] = v0
-    end
+    # Snapshot the module's whole mutable surface — the program's own globals as
+    # well as the harness PRNG/clock — and restore it before EVERY run of a
+    # call, so native #1, native #2 and the interpreted run all observe
+    # identical state (see the per-run state reset section above).
+    snaps = snapshotglobals(m)
+    resetstate!() = restoreglobals!(m, snaps)
     rng = Xoshiro(callseed)
     pairs = Tuple{Any,Method}[]
     for f in latesttargets(m)
