@@ -7,8 +7,9 @@ tell; worth filing against JuliaLang/julia.
 
 This resolves the "candidate upstream Julia UB" left unanalyzed in
 `fuzz/NEXT.md` (finding `call-call_value_divergence-370cc475`, the corrupted
-exception / `showerror` segfault the triage bot hit), and explains three of the
-2026-08-04 nightly-run findings on Julia 1.12.6 in one stroke:
+exception / `showerror` segfault the triage bot hit), two of the class-U
+findings the agent filed in the `fuzz/findings/julia/` stream, and three of
+the 2026-08-04 nightly-run findings on Julia 1.12.6 — all one bug:
 
 - `370cc475`: `Core._svec_ref(x)` (1 arg) — native claimed `UndefVarError`,
   interp `ArgumentError`; triage bot saw a "corrupted exception" whose
@@ -17,6 +18,14 @@ exception / `showerror` segfault the triage bot hit), and explains three of the
   `TypeError`.
 - `5f97b637`: `Core._svec_ref(::String, ::Symbol)` — native `UndefVarError`,
   interp `TypeError`.
+- `julia/julia-julia_engine_divergence-1ca00f6b`: `Core._svec_ref()` (0 args)
+  — compiled `BoundsError`, runtime/interp `ArgumentError`.
+- `julia/julia-julia_engine_divergence-5ada7c05`: `Core._svec_ref(a, b, c)`
+  (3 args, on untyped globals in a compiled top-level thunk) — compiled
+  `UndefVarError`, runtime/interp `ArgumentError`. Replayed end-to-end via its
+  committed `repro.jl` and reduced to the 4-line `repro_undefvar_label.jl`.
+  (The third `julia/`-stream finding, `a56e191f`, is the separate
+  `atomic_fence` intrinsic error-type nuance already triaged in `6deeb299`.)
 
 ## Root cause (in Julia's compiler, not in codegen and not in this package)
 
@@ -61,12 +70,25 @@ unsound:
      `-O2` on 1.12.6 (`repro_segfault.jl`, 9 lines, no `unsafe`, no
      `compilerbarrier`).
 
+3. **Union-split mislabeling — where the `UndefVarError` claims come from.**
+   When the `try` block can also throw something real (e.g. non-const global
+   reads, whose exct is `UndefVarError`), the catch variable is inferred
+   `Union{BoundsError, UndefVarError}` — `BoundsError` from the wrong exct,
+   with the true `ArgumentError`/`TypeError` **excluded** from the union.
+   `nameof(typeof(e))` then compiles to a union-split
+   (`isa(e, BoundsError) ? :BoundsError : :UndefVarError`); the runtime
+   `ArgumentError` fails the `isa`, falls into the else branch, and is
+   reported as `:UndefVarError`. `code_typed` on `repro_undefvar_label.jl`'s
+   `f` shows exactly this IR. `builtin_exct` is consulted even when the call's
+   arity (0, 1, or 3) is outside the tfunc's declared 2..2 range, so every
+   malformed-call shape is affected.
+
 This also explains the earlier triage-bot observations on `370cc475`
 ("native exception type varies by call site", "corrupted exception",
-"showerror segfaulted"): the claimed type is whatever inference folded, the
-real object is whatever the runtime threw, and the crash depends on the
-relative layouts and heap contents — classic type-confusion symptoms, not
-randomness.
+"showerror segfaulted"): the claimed type is whatever inference folded or
+union-split, the real object is whatever the runtime threw, and the crash
+depends on the relative layouts and heap contents — classic type-confusion
+symptoms, not randomness.
 
 Why the harness kept surfacing it: the fuzz programs observe
 `nameof(typeof(__e))` inside compiled native code (folded → `:BoundsError`, or
