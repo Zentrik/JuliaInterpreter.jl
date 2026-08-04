@@ -24,14 +24,22 @@ function Base.nameof(frame::Frame)
     isa(s, Method) ? s.name : nameof(s)
 end
 
-# `Core.Typeof`, not `isa(x, Type) ? Type{x} : typeof(x)`: the two agree
-# through Julia 1.13, but on 1.14 (TypeEgal, JuliaLang/julia#61915) type-valued
-# arguments dispatch through `Core.TypeEgal` and a hand-built `Type{x}`
-# signature resolves calls like `getproperty(::Type, :name)` to the wrong
-# method (observed: `FieldError: Core.TypeEgal has no field name`, plus
-# mis-dispatch-induced stack overflows). `Core.Typeof` is the dispatch-accurate
-# spelling on every version.
-_Typeof(x) = Core.Typeof(x)
+# On 1.14 (TypeEgal, JuliaLang/julia#61915) type-valued arguments dispatch
+# through `Core.TypeEgal`, and the hand-built `Type{x}` signature resolves
+# calls like `getproperty(::Type, :name)` to the wrong method (observed:
+# `FieldError: Core.TypeEgal has no field name`, plus mis-dispatch-induced
+# stack overflows) — there `Core.Typeof` is the dispatch-accurate spelling.
+# The gate is deliberate: on 1.12 the two definitions return identical values
+# on every input probed, yet swapping in `Core.Typeof` unconditionally makes
+# the test suite's malformed-invoke testset corrupt later *parsing* in the
+# same process (Pkg.test-reproducible ParseError at EOF of test/interpret.jl;
+# bisected to that testset's evaluation). Mechanism not yet understood — do
+# not widen this gate without re-running the full suite on the older versions.
+@static if VERSION >= v"1.14.0-DEV"
+    _Typeof(x) = Core.Typeof(x)
+else
+    _Typeof(x) = isa(x, Type) ? Type{x} : typeof(x)
+end
 
 function to_function(@nospecialize(x), world::UInt)
     isa(x, GlobalRef) ? invoke_in_world(world, getglobal, x.mod, x.name) : x
