@@ -642,6 +642,39 @@ both the `invoke` finding above. Generation stayed valid by construction
 throughout: 0 parse/lowering failures in 800 seeds × 7 policies, and 0 gate
 discards across the soak.
 
+**Cold-arm follow-up (the 15 never-hit dispatch arms from
+`coverage-report.md`) — closed on 1.12.6.** Re-measured with 300 probe-heavy
+(`:builtins` policy) candidates under `--code-coverage`, both interpreter
+modes, 0 divergences: the four global-binding atomics
+(`swapglobal!`/`modifyglobal!`/`replaceglobal!`/`setglobalonce!`), the four
+`memoryref*` atomics, `_compute_sparams` and `_call_in_world_total` are
+already **hit** on 1.12.6 — their 1.11.9 coldness was the default-profile
+campaign's low probe density, not a prober gap (recipes existed; a probe-heavy
+batch reaches them). Newly probeable this session: `_equiv_typedef`
+(ban corrected from `:all` to recipe-only — it is a *read-only* equivalence
+predicate, unreachable from generated code because lowering only calls it on
+struct redefinition; recipes pass vetted types) and
+`Core.Intrinsics.atomic_pointermodify` (new `:fixed` ban scope + two
+`FIXED_PROBES` templates that create their own `Ref` and hold it with
+`GC.@preserve` across the call — a per-argument recipe cannot root the
+pointee). Success-path recipes added for `_compute_sparams` /
+`_call_in_world_total` (`which(...)` + real argument values; the sweep's junk
+raises a symmetric TypeError). `genprobe` also gives the curated
+(recipe-carrying) targets a dedicated 25% draw share: under the uniform draw
+each of ~150 builtin spellings expects only ~2-3 draws per 300-candidate
+batch, and consecutive batches were measured missing `memoryrefsetonce!` and
+then `_compute_sparams`/`_call_in_world_total` by sampling noise alone. Left
+cold, each with a reason: `llvmcall`
+(measured permanent divergence — see DESIGN.md known-classes; dynamic
+invocation returns its last argument interpreted-in-a-function while the
+reference errors), `_apply_pure` (`@static`-absent on 1.12: not a
+`Core.Builtin` there, so the arm is compiled out — not a gap), and the
+`kwinvoke` tail (structurally unreachable on 1.12: `kwfunc(invoke) ===
+Core.kwcall` is not a `Core.Builtin`, so it exits the dispatcher at the
+builtin check, and every existing builtin has an arm, so nothing ever falls
+through to the `isa(f, typeof(kwinvoke))` test — verified by enumerating
+`names(Core; all=true)` against the arm list).
+
 One pre-existing generator bug fell out of this: the mutating-closure rule
 decremented `rtscopes` without incrementing it, so everything generated after
 a mutating closure believed it was at module toplevel. `while` fuel

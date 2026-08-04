@@ -271,8 +271,14 @@ interpreter special-cases" cannot drift from the interpreter's:
 - **A safety denylist** (`PROBE_BANS`) with a reason string per entry, because
   a bad probe does not produce a finding — it kills the worker or poisons the
   oracle. `:all` entries are never rendered; `:arbitrary` entries are
-  reachable only through a vetted recipe. See "known false-positive and
-  worker-death classes" below for the measurements behind them.
+  reachable only through a vetted recipe; `:fixed` entries are reachable only
+  through a vetted `FIXED_PROBES` template, for the case where safety needs an
+  *enclosing construct* that per-argument recipes cannot express — the one
+  instance is `atomic_pointermodify`, whose template creates its own `Ref` and
+  holds it live with `GC.@preserve` across the call (a Ref built inside an
+  argument expression would be unrooted, i.e. collectible, by the time the
+  intrinsic runs). See "known false-positive and worker-death classes" below
+  for the measurements behind them.
 - **Optimizer barriers on probe arguments** (`render.jl`, the `:probe` branch;
   `probe_arg_mustbeliteral` in `probes.jl`). Every probe argument is wrapped in
   `Base.compilerbarrier(:const, …)` — which passes the value through unchanged
@@ -861,6 +867,20 @@ without waiting for a live finding.
   rather than news. When probing a builtin whose *compiled* form is a codegen
   special case, expect this class and check what real lowering can actually
   emit before believing the divergence.
+- **`llvmcall` is this class taken to its limit, and is unprobeable.**
+  Measured on 1.12.6 while chasing its cold dispatch arm: at *toplevel* a
+  dynamic call (barriered or literal arguments alike) raises the same
+  catchable `ErrorException` on both engines — but inside a *function body*,
+  the interpreted side's dynamic intrinsic call **returns the last argument**
+  (`llvmcall(<barriered "ret i64 %0">, Int64, Tuple{Int64}, 3)` evaluates to
+  `3` under `RecursiveInterpreter`) while the compiled reference raises
+  `ErrorException`, and junk operands (`llvmcall(1, 2, 3)`) throw a
+  `TypeError` that escapes the program's own `try` on the interpreted side
+  only. Behavior differs by engine *and* by toplevel-vs-function context, so
+  no template exists that both engines agree on; add literal well-formed IR
+  and the compiled side executes real LLVM the interpreter cannot mirror, and
+  malformed literal IR aborts the process inside LLVM. Denied outright; its
+  dispatch arm in `src/builtins.jl` is documented cold.
 - **Constant operands the reference folds to a compile-time error** (the
   numeric-intrinsic and atomic-ordering "phase" class-U). A probe with all
   constant arguments lets the compiled reference constant-fold the call, and

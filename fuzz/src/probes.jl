@@ -15,7 +15,11 @@
 #                  segfault, OOM) or poisons the oracle (unspecified results,
 #                  nondeterministic scheduling, corrupted shared runtime
 #                  state). `:all` means never rendered; `:arbitrary` means the
-#                  callable is reachable *only* through a vetted recipe.
+#                  callable is reachable *only* through a vetted recipe;
+#                  `:fixed` means it is reachable *only* through a vetted
+#                  FIXED_PROBES template (needed when safety requires an
+#                  enclosing construct — e.g. GC-rooting a pointee across the
+#                  call — that per-argument recipes cannot express).
 #   PROBE_RECIPES  yield. Plausible argument shapes for the high-value
 #                  builtins, so probes exercise success paths and not only the
 #                  MethodError/TypeError arms.
@@ -84,11 +88,15 @@ barespelling(n::Symbol) = Base.isidentifier(n) ? String(n) : "(" * String(n) * "
 # exist costs nothing and keeps the version-relative promise.
 const EXTRA_BASE_TARGETS = Symbol[:invokelatest, :invoke_in_world, :isdefinedglobal]
 
-# Returns (allowed, denied): every enumerated spelling lands in exactly one, so
-# the metrics counts add up (enumerated = allowed + denylisted).
+# Returns (allowed, denied, fixedonly): every enumerated spelling lands in
+# exactly one, so the metrics counts add up (enumerated = allowed + denylisted
+# + fixed-only). Fixed-only names are kept out of `denied` on purpose: the
+# selftest's "no denylisted callee is ever rendered" invariant stays exact,
+# while their vetted FIXED_PROBES templates are allowed to render them.
 function enumerate_probes()
     out = ProbeTarget[]
     denied = Tuple{String,Symbol,String}[]
+    fixedonly = Tuple{String,Symbol,String}[]
     seen = Set{String}()
     function add!(n::Symbol, spelling::String, f, kind::Symbol)
         spelling in seen && return
@@ -96,6 +104,10 @@ function enumerate_probes()
         b = probeban(n)
         if b !== nothing && b.scope === :all
             push!(denied, (spelling, n, b.reason))
+            return
+        end
+        if b !== nothing && b.scope === :fixed
+            push!(fixedonly, (spelling, n, b.reason))
             return
         end
         lo, hi, known = tfunc_arity(f)
@@ -152,7 +164,7 @@ function enumerate_probes()
         f = try getfield(Base, n) catch; continue end
         add!(n, "Base." * String(n), f, :extra)
     end
-    return out, denied
+    return out, denied, fixedonly
 end
 
 # ---------------------------------------------------------------------------
@@ -167,7 +179,8 @@ end
 
 struct ProbeBan
     match::Any      # Symbol (exact name) or Regex (matched against the name)
-    scope::Symbol   # :all — never rendered | :arbitrary — recipe-only
+    scope::Symbol   # :all — never rendered | :arbitrary — recipe-only |
+                    # :fixed — vetted FIXED_PROBES template(s) only
     reason::String
 end
 
@@ -189,9 +202,29 @@ const PROBE_BANS = ProbeBan[
     # division probe the raw intrinsics cannot be.
 
     # -- raw memory / addresses --------------------------------------------
+    # atomic_pointermodify is the one pointer intrinsic with a cold dispatch
+    # arm the interpreter special-cases (world-pinning its `op` callback), so
+    # it gets the narrowest possible exception: a FIXED_PROBES template that
+    # creates its own Ref, roots it with GC.@preserve across the call, keeps
+    # the ordering literal, and reads the result back out. A *recipe* cannot
+    # do this — arguments are evaluated one by one, so a Ref created inside
+    # the pointer argument is unrooted (collectible) by the time the intrinsic
+    # runs, which is exactly the wild-write class the pointer ban exists for.
+    # Verified on 1.12.6: identical results compiled and interpreted (rec and
+    # cmp), at toplevel and inside a compiled function body.
+    ProbeBan(:atomic_pointermodify, :fixed, "raw-address atomic: an arbitrary value in the pointer slot is a wild read/write like the rest of the pointer family, and per-argument recipes cannot GC-root a pointee across the call. Exercised only by the vetted FIXED_PROBES templates (own Ref + GC.@preserve + literal ordering; verified divergence-free on 1.12.6, toplevel and function context)."),
     ProbeBan(r"pointer", :all, "interprets its argument as a raw address (pointerref/pointerset/atomic_pointer*): a generated Int in the pointer slot is an arbitrary read or write — segfault or silent heap corruption, never a finding."),
     ProbeBan(r"_ptr$", :all, "pointer arithmetic (add_ptr/sub_ptr): meaningful only on raw addresses, one dereference from unsafe, and the values are class-X (engine-dependent)."),
-    ProbeBan(:llvmcall, :all, "compiles LLVM IR supplied as an argument; malformed IR aborts the process inside LLVM."),
+    # llvmcall's dispatch arm stays cold by design. Malformed literal IR aborts
+    # the process inside LLVM, and the dynamic (non-constant-argument) call is
+    # a measured permanent-divergence class on 1.12.6: inside an interpreted
+    # function a barriered `llvmcall("ret i64 %0", Int64, Tuple{Int64}, 3)`
+    # *returns 3* while the compiled reference raises ErrorException, and junk
+    # operands (`llvmcall(1, 2, 3)`) throw a TypeError that escapes the
+    # program's own `try` on the interpreted side only. Behavior differs by
+    # engine AND by toplevel-vs-function context, so no template exists that
+    # both engines agree on — not even the error arm is probeable.
+    ProbeBan(:llvmcall, :all, "compiles LLVM IR supplied as an argument: malformed IR aborts the process inside LLVM, and a dynamic call is a measured permanent divergence on 1.12.6 (interpreted returns a value / throws through the guard where the compiled reference raises ErrorException, depending on context). Unprobeable; its dispatch arm is documented cold."),
     ProbeBan(:cglobal, :all, "resolves a raw symbol address: the result is a Ptr (class X) and the call needs literal syntax to lower at all."),
     ProbeBan(r"^memoryref", :arbitrary, "MemoryRef family: with an unchecked (boundscheck=false) reference an out-of-range index is a wild read/write. Reachable only via recipes, which always pass a literal `true`."),
     ProbeBan(:memorynew, :all, "allocation size comes straight from an argument; typemax(Int) is in the literal menu, so the probe becomes an OOM/abort rather than a finding."),
@@ -211,7 +244,17 @@ const PROBE_BANS = ProbeBan[
     # -- mutation of shared runtime state ----------------------------------
     ProbeBan(:_setsuper!, :all, "re-parents a type object in place: with a real DataType argument it corrupts the shared runtime for every later candidate in the worker."),
     ProbeBan(:_typebody!, :all, "completes a type definition in place; a partially-initialized type is a process-wide, silent corruption. Ordinary generated `struct` definitions already reach this arm through lowering."),
-    ProbeBan(:_equiv_typedef, :all, "type-definition internal (see _typebody!); reached anyway by every generated struct definition."),
+    # _equiv_typedef is NOT like its neighbors: it is a read-only equivalence
+    # *predicate* over two type definitions, and — unlike _structtype/_typebody!
+    # — generated programs never actually reach it, because lowering only calls
+    # it when a struct name is being REdefined and every generated struct is
+    # defined once in a fresh module (its dispatch arm measured cold across
+    # 4000 candidate-runs, coverage-report.md). Measured on 1.12.6, compiled
+    # and interpreted, toplevel and function context: real DataTypes return a
+    # Bool, junk arguments (Ints) return false rather than crashing, repeated
+    # calls leave the runtime healthy. Recipe-only regardless, so the shapes
+    # stay vetted Type/struct-type arguments.
+    ProbeBan(:_equiv_typedef, :arbitrary, "type-definition equivalence predicate: read-only (measured 1.12.6 — junk args return false, no runtime mutation), but unreachable from generated code (lowering calls it only on struct REdefinition), so recipes are the only way its arm executes. Kept recipe-only so the argument shapes stay vetted types."),
     ProbeBan(:_structtype, :all, "creates a type inside a module; reached anyway by every generated struct definition, and a hand-built one can be left incomplete."),
     ProbeBan(:_abstracttype, :all, "creates a type inside a module (see _structtype)."),
     ProbeBan(:_primitivetype, :all, "creates a type inside a module (see _structtype)."),
@@ -746,6 +789,42 @@ const PROBE_RECIPES = Dict{Symbol,Vector{Function}}(
     :_expr => Function[
         ctx -> Ex[psrc(":call"), psrc(":+"), psrc("1"), psrc("2")],
     ],
+    # RECIPE-ONLY (see the ban): a pure equivalence predicate over two type
+    # definitions, unreachable from generated code because lowering calls it
+    # only on struct REdefinition. Vetted Type arguments only; identical Bool
+    # results measured on 1.12.6 compiled and interpreted, both modes.
+    :_equiv_typedef => Function[
+        ctx -> Ex[psrc("Int"), psrc("Int")],
+        ctx -> Ex[psrc("Int"), psrc("Float64")],
+        ctx -> Ex[psrc(pick(ctx.rng, PROBE_TYPE_LITERALS)),
+                  psrc(pick(ctx.rng, PROBE_TYPE_LITERALS))],
+        function (ctx)
+            isempty(ctx.structs) && return Ex[psrc("Base.RefValue{Int}"), psrc("Base.RefValue{Int}")]
+            s = pick(ctx.rng, ctx.structs)
+            return Ex[nameref(s.name), nameref(s.name)]
+        end,
+    ],
+    # Success path for the sweep-reachable internals below: the sweep's junk
+    # arguments raise a symmetric TypeError (measured 1.12.6, both engines),
+    # which exercises only the error arm; these shapes return real values —
+    # an (empty) sparams svec, and the applied function's result.
+    :_compute_sparams => Function[
+        ctx -> Ex[psrc("which(first, Tuple{Vector{Int}})"), psrc("[1, 2]")],
+        ctx -> Ex[psrc("which(identity, Tuple{Any})"), genleaf(ctx, IntT)],
+        ctx -> Ex[psrc("which(zero, Tuple{Type{Int}})"), psrc("Int")],
+        ctx -> Ex[probearg(ctx), probearg(ctx)],       # symmetric TypeError arm
+    ],
+    # The world argument is drawn at run time on each side; only the *applied
+    # call's* result is observed, so both engines agree. A junk world is a
+    # symmetric TypeError; the single-argument call raises a catchable
+    # ArgumentError on both sides (measured 1.12.6 — unlike _call_latest/
+    # _apply_pure, whose empty argument list segfaults, see probearity).
+    :_call_in_world_total => Function[
+        ctx -> Ex[psrc("Base.get_world_counter()"), psrc("+"),
+                  genleaf(ctx, IntT), genleaf(ctx, IntT)],
+        ctx -> Ex[psrc("Base.get_world_counter()"), psrc("identity"), probearg(ctx)],
+        ctx -> Ex[psrc("Base.get_world_counter()"), psrc("Core.tuple")],
+    ],
     # RECIPE-ONLY, class U: in-range finite values only. Out-of-range or NaN
     # input is an *unspecified* result and would be a permanent false positive.
     :fptosi => Function[
@@ -968,6 +1047,16 @@ const FIXED_PROBES = String[
     "typeof(typeof(1))",
     "1 isa DataType",
     "getindex((1, 2, 3))",
+    # atomic_pointermodify (a cold dispatch arm; the interpreter world-pins its
+    # `op` callback) on a pointer the probe itself creates AND roots: the Ref
+    # is held live by GC.@preserve across the call, the ordering stays a
+    # literal, and the pointee/Pair is read back as the observed value. This is
+    # the `:fixed` ban scope in action — a per-argument recipe cannot root the
+    # pointee, so this template is the only sanctioned spelling. Verified on
+    # 1.12.6: identical results compiled and interpreted (rec and cmp),
+    # toplevel and inside a compiled function body.
+    "let r = Ref(7); GC.@preserve r begin p = Base.unsafe_convert(Ptr{Int}, r); Core.Intrinsics.atomic_pointermodify(Base.compilerbarrier(:const, p), Base.compilerbarrier(:const, +), Base.compilerbarrier(:const, 1), :monotonic) end; r[] end",
+    "let r = Ref(3); GC.@preserve r Core.Intrinsics.atomic_pointermodify(Base.compilerbarrier(:const, Base.unsafe_convert(Ptr{Int}, r)), Base.compilerbarrier(:const, max), Base.compilerbarrier(:const, 11), :sequentially_consistent) end",
 ]
 
 # ---------------------------------------------------------------------------
@@ -976,11 +1065,28 @@ const FIXED_PROBES = String[
 const _PROBE_ENUMERATION = enumerate_probes()
 const PROBE_TARGETS = _PROBE_ENUMERATION[1]
 const PROBE_DENIED = _PROBE_ENUMERATION[2]
+# `:fixed`-scope names: never swept, never recipe'd, exercised only by their
+# vetted FIXED_PROBES templates. Kept separate from PROBE_DENIED so the
+# "no denylisted callee is ever rendered" invariant stays exact.
+const PROBE_FIXEDONLY = _PROBE_ENUMERATION[3]
 const PROBE_BUILTIN_TARGETS = [t for t in PROBE_TARGETS if t.kind !== :intrinsic]
 const PROBE_INTRINSIC_TARGETS = [t for t in PROBE_TARGETS if t.kind === :intrinsic]
+# The recipe-carrying targets are the curated set: everything recipe-only
+# (the field/global atomics, the memoryref family, apply_type, the type
+# internals) plus the sweep-reachable builtins that earned a success-path
+# recipe (`_compute_sparams`, `_call_in_world_total`, getfield, invoke, …) —
+# exactly the arms the `builtins` policy exists to keep warm.
+# They get a dedicated draw share in `genprobe`: under the uniform draw each
+# of ~150 builtin spellings expects only ~2-3 draws per few-hundred-candidate
+# probe-heavy batch, so individual arms go cold by sampling noise (measured
+# across consecutive 300-candidate batches: memoryrefsetonce! missed one,
+# _compute_sparams/_call_in_world_total missed another).
+const PROBE_CURATED_TARGETS =
+    [t for t in PROBE_TARGETS if t.reciponly || haskey(PROBE_RECIPES, t.name)]
 
-nprobe_enumerated() = length(PROBE_TARGETS) + length(PROBE_DENIED)
+nprobe_enumerated() = length(PROBE_TARGETS) + length(PROBE_DENIED) + length(PROBE_FIXEDONLY)
 nprobe_denied() = length(PROBE_DENIED)
+nprobe_fixedonly() = length(PROBE_FIXEDONLY)
 nprobe_reciponly() = count(t -> t.reciponly, PROBE_TARGETS)
 
 function probetarget(spelling::AbstractString)
@@ -1030,6 +1136,13 @@ function genprobe(ctx::Ctx)::Ex
     rng = ctx.rng
     if isempty(PROBE_TARGETS) || rand(rng) < 0.15
         return Ex(:guard, AnyT(), nothing, [psrc(pick(rng, FIXED_PROBES))])
+    end
+    # A dedicated share for the curated (recipe-carrying) targets, so every
+    # hand-curated arm is expected several times per few-hundred-candidate
+    # probe-heavy batch instead of hoping the uniform draw below lands on it
+    # (see PROBE_CURATED_TARGETS).
+    if !isempty(PROBE_CURATED_TARGETS) && rand(rng) < 0.25
+        return genprobe_target(ctx, pick(rng, PROBE_CURATED_TARGETS))
     end
     # Builtins carry the 44 hand-written dispatch arms in src/builtins.jl;
     # intrinsics all funnel through one arm, so they are worth less per draw.

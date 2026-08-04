@@ -136,6 +136,27 @@ end
         @test all(haskey(FuzzJI.PROBE_RECIPES, t.name)
                   for t in FuzzJI.PROBE_TARGETS if t.reciponly)
         @test FuzzJI.nprobe_reciponly() >= 3
+        # Fixed-only names (`:fixed` ban scope) are exercised solely through
+        # vetted FIXED_PROBES templates: never enumerated as sweep/recipe
+        # targets, never in PROBE_DENIED (so the render check below keeps its
+        # exact meaning), each with a reason and at least one template.
+        fixednames = Set(n for (_, n, _) in FuzzJI.PROBE_FIXEDONLY)
+        @test :atomic_pointermodify in fixednames
+        @test all(!isempty(r) for (_, _, r) in FuzzJI.PROBE_FIXEDONLY)
+        for n in fixednames
+            @test isempty(FuzzJI.probetargets(n))
+            @test !(n in deniednames)
+            @test any(occursin(String(n) * "(", t) for t in FuzzJI.FIXED_PROBES)
+        end
+        # _equiv_typedef graduated from the deny list to recipe-only (its arm
+        # is unreachable from generated code — lowering calls it only on
+        # struct redefinition); the mutating type-definition internals around
+        # it must stay denied.
+        @test !isempty(FuzzJI.probetargets(:_equiv_typedef))
+        @test all(t -> t.reciponly, FuzzJI.probetargets(:_equiv_typedef))
+        for n in (:_typebody!, :_setsuper!, :_structtype, :_abstracttype, :_primitivetype)
+            @test n in deniednames
+        end
     end
 
     @testset "builtin prober: no denylisted callee is ever rendered" begin
@@ -700,7 +721,16 @@ end
         wanted = [:getfield, :tuple, :fieldtype, :isdefined, :apply_type, :setfield!,
                   :_apply_iterate, :invoke, :swapfield!, :modifyfield!, :replacefield!,
                   :setfieldonce!, :invokelatest, :memoryrefget, :getglobal, :typeassert,
-                  :svec, :ifelse, :applicable, :compilerbarrier]
+                  :svec, :ifelse, :applicable, :compilerbarrier,
+                  # the formerly-cold dispatch arms (coverage-report.md):
+                  # the atomic global-binding and memoryref families, and the
+                  # internals that graduated to recipes. probetargets() is
+                  # empty for names this Julia doesn't have, so the loop
+                  # below skips them where they don't exist.
+                  :swapglobal!, :modifyglobal!, :replaceglobal!, :setglobalonce!,
+                  :memoryrefswap!, :memoryrefmodify!, :memoryrefreplace!,
+                  :memoryrefsetonce!, :_equiv_typedef, :_compute_sparams,
+                  :_call_in_world_total]
         body = St[]
         for nm in wanted
             ts = FuzzJI.probetargets(nm)
