@@ -473,7 +473,7 @@ Generate programs, run each normally, then drive the same program through a
 random `debug_command` walk and compare. Findings are reported through the same
 `writefinding` path as the differential axis.
 """
-function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
+function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=600_000,
                        outdir::String=joinpath(@__DIR__, "..", "findings"),
                        journaldir::String=joinpath(@__DIR__, "..", "journal"),
                        cfg::Cfg=Cfg(), progress::Int=50, maxcmds::Int=4000,

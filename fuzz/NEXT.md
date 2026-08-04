@@ -312,8 +312,17 @@ measured:
   (cheap inline PRNG instead of interpreted Base Random) is in
   `determinism.md` §3 / the grammar section of DESIGN.md. Lesson for every
   future grammar feature: **check the abort-rate delta in `--modes rec`
-  before believing the feature is being tested at all** — `dict` programs
-  abort at ~70% when present too, so the same audit applies there.
+  before believing the feature is being tested at all**.
+  [2026-08-04 correction: the "dict programs abort at ~70% too" claim that
+  used to close this bullet was re-measured after the inline-PRNG fix and is
+  GONE — 0/76 dict programs abort at default policy, 1.9% under
+  `:determinism` (the dict-densest policy); the aborts were the co-occurring
+  rng draws all along. Dict programs also uniquely reach the staged-function
+  framecode path (`construct.jl`/`get_staged`) and the `Base.memhash`
+  ccall-lowering path (`optimize.jl`), so the feature earns its keep in rec
+  mode. The default rec budget was raised 300k → 600k anyway — measured 0.0%
+  throughput cost, clears the 1.9% loop-heavy tail. The audit rule stands;
+  it is exactly the measurement that cleared dicts.]
 - **Throughput** (`throughput-report.md`): the hidden per-candidate cost was
   each module's own `__fjnorm__` re-specializing per candidate; shared
   helpers landed for a measured **1.68× on native both-modes** (2.43/s) and

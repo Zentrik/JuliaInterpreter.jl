@@ -24,7 +24,7 @@ using .FuzzJI: Xoshiro, genprogram, render, run_both, classify, fingerprint, isf
 
 function parseargs(args)
     o = Dict{String,Any}("seed" => nothing, "mode" => "rec", "big" => false,
-                         "attempts" => 4000, "budget" => 300_000, "out" => nothing)
+                         "attempts" => 4000, "budget" => 600_000, "out" => nothing)
     i = 1
     while i <= length(args)
         a = args[i]

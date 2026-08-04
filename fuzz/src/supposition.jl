@@ -64,7 +64,7 @@ classify.jl) *inside* the property, so a nondeterministic candidate is a
 never chases a moving target. The count of such discards is returned next to
 the finding count.
 """
-function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=300_000,
+function supposition_campaign(; rounds::Int=20, examples::Int=2000, nstmts::Int=600_000,
                               outdir::String=joinpath(@__DIR__, "..", "findings"),
                               journaldir::String=joinpath(@__DIR__, "..", "journal"),
                               cfg::Cfg=Cfg(), doshrink::Bool=true,

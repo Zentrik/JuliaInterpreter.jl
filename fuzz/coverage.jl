@@ -69,7 +69,7 @@ function parseargs(args)
     o = Dict{String,Any}("n" => 200, "seed" => 1, "shards" => 1, "modes" => "both",
                          "engine" => "native", "out" => joinpath(FUZZDIR, "coverage-report.md"),
                          "keep" => false, "slowdown" => false, "big" => false,
-                         "budget" => 300_000, "extra" => String[], "reuse" => false,
+                         "budget" => 600_000, "extra" => String[], "reuse" => false,
                          "accumulate" => false, "note" => "")
     i = 1
     while i <= length(args)

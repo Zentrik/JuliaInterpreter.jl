@@ -123,7 +123,7 @@ end
 # Mode tag prefix for dedup/report dirs (:rec is the historical untagged form).
 tagfp(mode::Symbol, fp::String) = mode === :rec ? fp : string(mode, "-", fp)
 
-function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=300_000,
+function campaign(; n::Int=1000, baseseed::Int=1, nstmts::Int=600_000,
                   outdir::String=joinpath(@__DIR__, "..", "findings"),
                   journaldir::String=joinpath(@__DIR__, "..", "journal"),
                   cfg::Cfg=Cfg(), progress::Int=200, doshrink::Bool=true,

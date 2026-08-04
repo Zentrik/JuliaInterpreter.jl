@@ -56,7 +56,7 @@ using .FuzzJI
 
 function parseargs(args)
     o = Dict{String,Any}("engine" => "supposition", "n" => 1000, "seed" => 1,
-                         "budget" => 300_000, "selftest" => false, "noshrink" => false,
+                         "budget" => 600_000, "selftest" => false, "noshrink" => false,
                          "nothreeway" => false,
                          "modes" => "both", "big" => false, "fresh" => false,
                          "patience" => 1, "nosync" => false, "noswarm" => false,

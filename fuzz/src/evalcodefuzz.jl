@@ -157,7 +157,7 @@ Like the stepping axis, the pause walk and the write probes draw from a fresh
 `(src, walkseed)` a complete description of the run, and hence what makes the
 axis shrinkable.
 """
-function evalcode_probe(src::String; walkseed::Int, nstmts::Int=300_000, pausesper::Int=25)
+function evalcode_probe(src::String; walkseed::Int, nstmts::Int=600_000, pausesper::Int=25)
     ex = parsegate(src)
     ex === nothing && return nothing
     rng = Xoshiro(walkseed)
@@ -222,7 +222,7 @@ end
 Generate programs, step each to a series of random pause points, and run the
 `eval_code` checks at every pause.
 """
-function evalcode_campaign(; n::Int=300, baseseed::Int=1, nstmts::Int=300_000,
+function evalcode_campaign(; n::Int=300, baseseed::Int=1, nstmts::Int=600_000,
                            outdir::String=joinpath(@__DIR__, "..", "findings"),
                            journaldir::String=joinpath(@__DIR__, "..", "journal"),
                            cfg::Cfg=Cfg(), progress::Int=50, pausesper::Int=25,
