@@ -19,8 +19,9 @@ __vtime__() = (__VTIME__[] += 1)
 function __fjnorm__(x)
     if x isa String
         # strings can embed this module's own qualified type names via
-        # `string(structvalue)` — strip, same trick as the Type branch below
-        return replace(x, string(@__MODULE__, ".") => "")
+        # `string(structvalue)` — strip, same trick as the Type branch below —
+        # and Ptr/MemoryRef repr embeds per-run heap addresses: normalize
+        return replace(x, string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0")
     elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple

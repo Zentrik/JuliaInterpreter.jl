@@ -140,8 +140,10 @@ function fjnorm(@nospecialize(x), prefix::String)
     if x isa String
         # `string(v)` of a program-defined struct embeds its module-qualified
         # type name — strip this module's own prefix, same trick as the Type
-        # branch (nightly finding step_divergence-7e03896b).
-        return replace(x, prefix => "")
+        # branch — and `repr` of a Ptr/MemoryRef embeds the heap address,
+        # which legitimately differs per run: normalize it to `@0x0`
+        # (both from finding step_divergence-7e03896b).
+        return replace(x, prefix => "", r"@0x[0-9a-fA-F]+" => "@0x0")
     elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple

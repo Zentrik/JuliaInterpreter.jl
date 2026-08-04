@@ -445,8 +445,11 @@ function __fjnorm__(x)
         # `string(v)` of a program-defined struct embeds its module-qualified
         # type name (`Main.FJ95.S1(...)`) — the same manufactured divergence
         # the Type branch below strips, one level down, inside a String the
-        # program observed (nightly finding step_divergence-7e03896b).
-        return replace(x, string(@__MODULE__, ".") => "")
+        # program observed. And `repr` of a Ptr/MemoryRef embeds the heap
+        # address (`Ptr{Int64} @0x00007f...`), which legitimately differs
+        # between the two engines' runs — normalize the address to `@0x0`
+        # (both from finding step_divergence-7e03896b).
+        return replace(x, string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0")
     elseif x isa Union{Number, Symbol, Char, Nothing}
         return x
     elseif x isa Tuple
