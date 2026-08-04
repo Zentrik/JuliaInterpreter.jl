@@ -89,15 +89,20 @@ mkdir -p "$LOGDIR"
 DEADLINE=$(( $(date +%s) + DURATION ))
 
 # Per-batch case counts, chosen so a batch is minutes rather than hours: the
-# loop can only react to the deadline between batches. $2 is the batch number,
-# used by the alternating misc shard.
+# loop can only react to the deadline between batches, and a batch that outruns
+# the per-batch timeout below is killed mid-flight — losing its tail and (before
+# the exit-124 check below existed) leaving a spurious "crash" journal behind.
+# Sized to finish inside the 1800 s timeout at measured rates
+# (throughput-report.md): native ~2.4/s ⇒ 3500 ≈ 24 min, corpus ~3 s/case ⇒
+# 450 ≈ 23 min (800 could never finish and was killed at 30 min every batch).
+# $2 is the batch number, used by the alternating misc shard.
 batch_args() {
     case "$1" in
-        native)     echo "--engine native --n 4000 --modes both" ;;
+        native)     echo "--engine native --n 3500 --modes both" ;;
         native-big) echo "--engine native --n 1500 --modes both --big" ;;
         step|step2) echo "--engine step --n 1500" ;;
         evalcode)   echo "--engine evalcode --n 1200" ;;
-        corpus)     echo "--engine corpus --n 800 --maxsplice 4" ;;
+        corpus)     echo "--engine corpus --n 450 --maxsplice 4" ;;
         split)      echo "--engine split --n 3000" ;;
         call)       echo "--engine call --n 1500" ;;
         misc)       # split and evalcode alternate on one core (downweighted)
@@ -133,9 +138,25 @@ run_shard() {
         echo "=== $name batch $batch seed=$seed $(date -u +%H:%M:%S) ===" >> "$log"
         # --nosync: the fsync per candidate is a disk round trip, and the
         # journal write itself (which is what recovers a crash) still happens.
-        timeout 1800 $JULIA_CMD --project=fuzz fuzz/run.jl $args \
+        #
+        # -k 30: escalate to SIGKILL if julia does not die from the TERM within
+        # 30 s. Without it a julia wedged somewhere TERM cannot reach (observed
+        # on the nightly CI lane: the campaign step ran 5h48 against a 3 h
+        # DURATION until the runner's 6 h limit cancelled the whole job before
+        # any findings were reported) runs unbounded and the deadline check
+        # below never gets another look.
+        timeout -k 30 1800 $JULIA_CMD --project=fuzz fuzz/run.jl $args \
             --seed "$seed" --nosync --noshrink --journaldir "$jdir" >> "$log" 2>&1
-        echo "--- exit $? ---" >> "$log"
+        rc=$?
+        echo "--- exit $rc ---" >> "$log"
+        # Exit 124 is the batch timeout doing its job: julia honored the TERM,
+        # nothing crashed, and the candidate that happened to be in flight is
+        # not crash evidence — preserving it (which the top of the next loop
+        # iteration would do) buries the real crashes in one spurious entry per
+        # oversized batch. Every other nonzero exit keeps its journal: 137
+        # (TERM ignored, KILLed) is a genuine hang worth the evidence, and
+        # signal deaths are the crashes the journal exists for.
+        [ "$rc" -eq 124 ] && rm -f "$jdir/current.jl"
         seed=$((seed + 100000))
     done
     echo "=== $name done after $batch batches ===" >> "$log"
