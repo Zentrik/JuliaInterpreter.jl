@@ -346,9 +346,18 @@ randomness produced `src`; `(src, walkseed)` is therefore a complete description
 of the run, which is what makes the axis replayable and hence shrinkable.
 """
 function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveInterpreter(),
-                      maxcmds::Int=4000, usebreakpoints::Bool=false)
+                      maxcmds::Int=4000, usebreakpoints::Bool=false,
+                      ex::Union{Nothing,Expr}=nothing)
     rng = Xoshiro(walkseed)
-    ex = parsegate(src)
+    # `ex` lets a caller that already ran the parse gate on this same source
+    # (the campaign and the shrink predicate both do, for the plain run) hand
+    # the tree over instead of paying the gate twice per candidate (~13 ms of a
+    # ~180 ms case, measured 2026-08-04). Sharing is behavior-identical:
+    # parsegate is a pure function of src, and nothing downstream mutates the
+    # AST (ExprSplitter copies module exprs and only walks the rest; Frame
+    # lowers into fresh objects) — the same sharing run_all already does
+    # between run_ref and run_interp.
+    ex === nothing && (ex = parsegate(src))
     ex === nothing && return nothing
     m = freshmodule()
     cmds = Symbol[]
@@ -487,7 +496,7 @@ function step_keep(fp::String; walkseed::Int, nstmts::Int, maxcmds::Int,
         ex = parsegate(src)
         ex === nothing && return false
         plain = run_interp(ex; nstmts, interp=RecursiveInterpreter())
-        st = step_program(src; walkseed, maxcmds, usebreakpoints)
+        st = step_program(src; walkseed, maxcmds, usebreakpoints, ex)
         st === nothing && return false
         v = classify_step(plain, st)
         return isfinding(v) && fingerprint(v) == fp
@@ -540,7 +549,7 @@ function step_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=600_000,
             # changes the answer, and any interp-vs-compiled divergence is the
             # other axis's job to report.
             plain = run_interp(ex; nstmts, interp=RecursiveInterpreter())
-            st = step_program(src; walkseed, maxcmds, usebreakpoints)
+            st = step_program(src; walkseed, maxcmds, usebreakpoints, ex)
             if st === nothing
                 stats.discarded += 1
                 continue
