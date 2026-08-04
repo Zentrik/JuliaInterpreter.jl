@@ -916,6 +916,16 @@ end
     let frame = JuliaInterpreter.enter_call(f_log2)
         @test (@test_logs (:error, "this error is ok") debug_command(frame, :c)) === nothing
     end
+
+    # A malformed `invoke` whose signature argument is a Type but not a *tuple*
+    # type must raise the same `TypeError` compiled Julia does, not the bare
+    # `ErrorException("expected tuple type")` the interpreter's own
+    # `signature_type` call produced before it deferred this shape (found by
+    # the differential fuzzer).
+    ferr(x::Int) = x + 1
+    @test_throws TypeError @interpret invoke(ferr, Char, 3)
+    # A well-formed invoke still resolves and runs under the interpreter.
+    @test @interpret(invoke(ferr, Tuple{Int}, 3)) === 4
 end
 
 struct A396
@@ -1456,6 +1466,27 @@ end
 end
 end
 
+@testset "invoke type-conformance is enforced" begin
+    # `invoke(f, types, args...)` requires the actual args to conform to `types`;
+    # a non-conforming call is a TypeError under compilation. The interpreter's
+    # `invoke` path must not silently run the selected method on out-of-type
+    # arguments (which would return a wrong value or throw an unrelated error).
+    conf_wrap(f, x) = invoke(f, Tuple{Float64}, x)
+    # -3 is an Int, not <: Float64: must raise TypeError, matching compiled invoke.
+    @test_throws TypeError @interpret conf_wrap(abs, -3)
+    @test_throws TypeError @interpret interp=NonRecursiveInterpreter() conf_wrap(abs, -3)
+    # identity would silently return the Int unchanged if the check were skipped.
+    conf_identity(x) = invoke(identity, Tuple{Float64}, x)
+    @test_throws TypeError @interpret conf_identity(3)
+    # Conforming calls (exact and via abstract widening) still work.
+    conf_ok(f, x) = invoke(f, Tuple{Float64}, x)
+    @test (@interpret conf_ok(abs, -3.0)) == 3.0
+    conf_real(f, x) = invoke(f, Tuple{Real}, x)
+    @test (@interpret conf_real(abs, -3)) == 3
+    conf_add(x, y) = invoke(+, Tuple{Int,Int}, x, y)
+    @test (@interpret conf_add(2, 3)) == 5
+end
+
 @testset "NewvarNode undefines a reused slot" begin
     function newvar_reuse(flags)
         out = Bool[]
@@ -1494,6 +1525,18 @@ end
     @test_throws ErrorException("boom") finish_and_return!(JuliaInterpreter.enter_call(rethrow_caller))
 end
 
+@testset "compiled mode intercepts rethrow/current_exceptions" begin
+    # Compiled mode executes calls natively, but an exception caught by an
+    # interpreted handler lives in the frame's modeled exception stack, not the
+    # task's, so these calls must be answered by the interpreter in every mode.
+    f_rethrow() = try; error("boom"); catch; rethrow(); end
+    f_rethrow_other() = try; error("boom"); catch; rethrow(ArgumentError("other")); end
+    f_currexc() = try; error("boom"); catch; length(current_exceptions()); end
+    @test_throws ErrorException("boom") @interpret interp=NonRecursiveInterpreter() f_rethrow()
+    @test_throws ArgumentError @interpret interp=NonRecursiveInterpreter() f_rethrow_other()
+    @test (@interpret interp=NonRecursiveInterpreter() f_currexc()) == 1
+end
+
 @testset "applicable respects the frame world" begin
     @eval module ApplicableWorld
     function target end
@@ -1519,6 +1562,43 @@ end
     finally
         delete!(JuliaInterpreter.compiled_methods, m_fb)
     end
+end
+
+@testset "malformed invoke raises the native error" begin
+    # A malformed Core.invoke must raise the same exception native invoke does,
+    # not a BoundsError from the interpreter's own invoke rewrite indexing a
+    # missing argument, nor an ErrorException from signature_type on a non-type.
+    too_few() = Core.invoke(abs)
+    nontype() = Core.invoke(abs, 1, 2)
+    @test_throws ArgumentError finish_and_return!(JuliaInterpreter.enter_call(too_few))
+    @test_throws TypeError finish_and_return!(JuliaInterpreter.enter_call(nontype))
+    # well-formed invoke is unaffected
+    wellformed() = Core.invoke(abs, Tuple{Int}, -3)
+    @test finish_and_return!(JuliaInterpreter.enter_call(wellformed)) == 3
+end
+
+@static if isdefinedglobal(Core, :invokelatest)
+@testset "malformed invokelatest raises the native error" begin
+    # invokelatest() with no function argument must raise the native
+    # ArgumentError, not a BoundsError from the interpreter's expand path
+    # indexing args[1] (invokelatest became a builtin in 1.12).
+    no_fn() = Core.invokelatest()
+    @test_throws ArgumentError finish_and_return!(JuliaInterpreter.enter_call(no_fn))
+    ok() = Base.invokelatest(*, 6, 7)
+    @test finish_and_return!(JuliaInterpreter.enter_call(ok)) == 42
+    # A non-callable first argument (a Symbol) must raise a MethodError like the
+    # native call — the expand path put the evaluated value bare in function
+    # position, where a Symbol was re-read as a name and threw UndefVarError.
+    sym_il() = Base.invokelatest(:b)
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_il))
+end
+@static if isdefinedglobal(Core, :_call_latest) && Core._call_latest isa Core.Builtin
+@testset "malformed _call_latest raises the native error" begin
+    sym_cl() = Core._call_latest(:b)          # Symbol is not callable
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_cl))
+    ok_cl() = Core._call_latest(+, 2, 3)
+    @test finish_and_return!(JuliaInterpreter.enter_call(ok_cl)) == 5
+end
 end
 
 @testset "invoke selects its method in the frame world" begin
@@ -1741,4 +1821,20 @@ end
                                  Expr(:new_opaque_closure, Tuple{}, Union{}, Any, ocm)
     @eval oc_from_raw_expr() = $ocex
     @test (@interpret Main.oc_from_raw_expr())() == 1
+end
+
+@testset "compilerbarrier setting validation" begin
+    # `Core.compilerbarrier(setting, x)` must validate `setting` like native Julia.
+    # The interpreter previously delegated to a compiled call where the optimizer
+    # elides the barrier, so an invalid setting was silently accepted (returned `x`)
+    # where native eval throws. Found by differential fuzzing. NB: a bare literal
+    # `@interpret Core.compilerbarrier(:b, 1)` bypasses the interpreter (and can
+    # SIGILL via a compiled `unreachable`), so route through an interpreted helper.
+    cbcall(s, x) = Core.compilerbarrier(s, x)
+    @test_throws ErrorException @interpret cbcall(:b, 1)
+    @test_throws ErrorException @interpret cbcall(:foo, 1)
+    @test_throws TypeError @interpret cbcall(1, 1)
+    @test (@interpret cbcall(:const, 1)) == 1
+    @test (@interpret cbcall(:type, (9, -100))) == (9, -100)
+    @test (@interpret cbcall(:conditional, 1)) == 1
 end

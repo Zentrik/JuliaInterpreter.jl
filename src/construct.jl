@@ -126,19 +126,27 @@ function find_or_create_module(parentmod::Module, ex::Expr)
     mod = nothing
     if invokelatest(isdefinedglobal, parentmod, newname)
         found = invokelatest(getglobal, parentmod, newname)
-        found isa Module || throw(ErrorException("invalid redefinition of constant $(newname)"))
-        # Reuse a module's self-binding (`Base.Base === Base`), a loaded package when it
-        # loads itself (`parentmod === Base.__toplevel__`), or a genuine submodule of
-        # `parentmod` (re-revision of a module we created). A nested `module newname` that
-        # merely shares a loaded package's name is a fresh local module that shadows the
-        # package, matching `include` (Revise issue #747).
+        # Only an existing *module* is a reuse candidate. A non-module binding of
+        # `newname` (an implicit `using`-import like `Distributed.Future`, or an
+        # owned `const`/`global`) is not a redefinition error here: native toplevel
+        # `Core.eval` shadows a `using`-import with a fresh submodule and, under
+        # Julia's own rules, decides whether an owned binding may be redefined. So
+        # for a non-module `found` we fall through to the `Core.eval` below rather
+        # than throwing, matching native evaluation exactly (previously this raised
+        # a spurious `invalid redefinition of constant`; found by differential fuzzing).
+        #
+        # When `found` IS a module, reuse a module's self-binding (`Base.Base === Base`),
+        # a loaded package when it loads itself (`parentmod === Base.__toplevel__`), or a
+        # genuine submodule of `parentmod` (re-revision of a module we created). A nested
+        # `module newname` that merely shares a loaded package's name is a fresh local
+        # module that shadows the package, matching `include` (Revise issue #747).
         # The self-binding reuse knowingly diverges from `include` for a genuinely nested
         # `module A` inside `module A` (plain evaluation creates a fresh child `A.A`):
         # that input is syntactically indistinguishable from re-interpreting `A`'s own
         # definition, the primary use of this machinery, so we re-enter `parentmod`.
         # Creating a fresh child here would also clobber `parentmod`'s self-binding.
-        if (found === parentmod || parentmod === Base.__toplevel__ ||
-            parentmodule(found) === parentmod)
+        if found isa Module && (found === parentmod || parentmod === Base.__toplevel__ ||
+                                parentmodule(found) === parentmod)
             mod = found
         end
     elseif parentmod === Base.__toplevel__

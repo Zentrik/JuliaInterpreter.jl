@@ -567,10 +567,19 @@ function maybe_step_through_nkw_meta!(frame::Frame)
 end
 
 function more_calls_on_current_line(frame::Frame)
-    _, curr_line = whereis(frame)
+    # `whereis` returns nothing when a pc carries no line info (a toplevel
+    # surface statement, a compiler-generated statement); with no current line
+    # there is nothing to compare against, so there are no "more calls on it".
+    loc = whereis(frame)
+    loc === nothing && return false
+    _, curr_line = loc
     curr_pc = frame.pc + 1
     while curr_pc <= length(frame.framecode.src.code)
-        _, new_line = whereis(frame, curr_pc)
+        newloc = whereis(frame, curr_pc)
+        # A statement with no line info isn't a call to stop at; skip it and keep
+        # scanning the same line rather than crashing on the missing tuple.
+        newloc === nothing && (curr_pc += 1; continue)
+        _, new_line = newloc
         new_line == curr_line || return false
         stmt = pc_expr(frame, curr_pc)
         is_call(stmt) && !is_assignment_write_call(stmt) && return true
@@ -629,11 +638,25 @@ integer program counter (normal execution), a `BreakpointRef` (a breakpoint was 
 """
 function debug_command(interp::Interpreter, frame::Frame, cmd::Symbol, rootistoplevel::Bool=false;
                        line::Union{Nothing,Integer}=nothing)
+    # A breakpoint can fire while `maybe_step_through_kwprep!` steps through keyword-arg
+    # setup (a kwarg value is itself a call to a breakpointed function), which leaves
+    # `frame` non-leaf with a callee paused at the breakpoint. Returning that frame as
+    # the command result violates the `is_leaf(frame)` invariant that `step_expr!`
+    # asserts (a following command crashes) and silently drops the breakpoint. Detect
+    # it and surface a normal pause at the leaf; returns the `debug_command` result
+    # tuple to propagate, or `nothing` if no breakpoint fired. Found by differential fuzzing.
+    function kwprep_breakpoint!(interp::Interpreter, frame::Frame, istoplevel::Bool)
+        is_leaf(frame) && return nothing
+        lf = leaf(frame)
+        return maybe_reset_frame!(interp, frame, BreakpointRef(lf.framecode, lf.pc), istoplevel)
+    end
     function nicereturn!(interp::Interpreter, frame::Frame, @nospecialize(pc), rootistoplevel::Bool)
         if pc === nothing || isa(pc, BreakpointRef)
             return maybe_reset_frame!(interp, frame, pc, rootistoplevel)
         end
         maybe_step_through_kwprep!(interp, frame, rootistoplevel && is_toplevel_frame(frame))
+        kwbp = kwprep_breakpoint!(interp, frame, rootistoplevel)
+        kwbp === nothing || return kwbp
         return frame, frame.pc
     end
 
@@ -673,9 +696,13 @@ function debug_command(interp::Interpreter, frame::Frame, cmd::Symbol, rootistop
             # Keyword calls begin with NamedTuple construction, which is not a
             # useful step target. Skip it before searching for the next call.
             is_si || maybe_step_through_kwprep!(interp, frame, istoplevel)
+            kwbp = kwprep_breakpoint!(interp, frame, rootistoplevel)
+            kwbp === nothing || return kwbp
             pc = maybe_next_call!(interp, frame, istoplevel)
             (isa(pc, BreakpointRef) || pc === nothing) && return maybe_reset_frame!(interp, frame, pc, rootistoplevel)
             is_si || maybe_step_through_kwprep!(interp, frame, istoplevel)
+            kwbp = kwprep_breakpoint!(interp, frame, rootistoplevel)
+            kwbp === nothing || return kwbp
             pc = frame.pc
             stmt0 = stmt = pc_expr(frame, pc)
             is_return(stmt0) && return maybe_reset_frame!(interp, frame, nothing, rootistoplevel)

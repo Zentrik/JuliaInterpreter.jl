@@ -313,6 +313,8 @@ function evaluate_call!(interp::NonRecursiveInterpreter, frame::Frame, call_expr
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
 function evaluate_call!(::NonRecursiveInterpreter, frame::Frame, fargs::Vector{Any}, ::Bool)
+    ret = intercept_call(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     return native_call(fargs, frame)
 end
 
@@ -326,9 +328,15 @@ function evaluate_call!(interp::Interpreter, frame::Frame, call_expr::Expr, ente
     fargs = collect_args(interp, frame, call_expr)
     return evaluate_call!(interp, frame, fargs, enter_generated)
 end
-function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
+# Calls that must be answered from the interpreter's own state no matter which
+# interpreter is running. Exceptions caught by interpreted handlers never reach
+# the task's native exception stack — they live in `frame.framedata.exceptions` —
+# so `rethrow`/`current_exceptions` executed natively (as Compiled mode does for
+# every call) would see the wrong state and e.g. raise "rethrow() not allowed
+# outside a catch block" from a perfectly ordinary interpreted catch block.
+function intercept_call(frame::Frame, fargs::Vector{Any})
     if fargs[1] === Core.eval
-        return Core.eval(fargs[2], fargs[3])  # not a builtin, but worth treating specially
+        return Some{Any}(Core.eval(fargs[2], fargs[3]))  # not a builtin, but worth treating specially
     elseif fargs[1] === Base.rethrow
         if length(fargs) > 1
             exc = fargs[2]
@@ -364,10 +372,9 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         # (interpreted code may be running inside a native `catch` block).
         rethrow()
     elseif fargs[1] === Base.current_exceptions && length(fargs) == 1
-        # Exceptions caught by interpreted handlers never reach the task's native
-        # exception stack; they live in the frames' modeled stacks. Merge the native
-        # stack (outermost) with the caller chain's entries. The interpreter does not
-        # record per-exception backtraces, so those entries carry an empty backtrace.
+        # Merge the native stack (outermost) with the caller chain's entries. The
+        # interpreter does not record per-exception backtraces, so those entries carry
+        # an empty backtrace.
         stack = Any[entry for entry in invoke_in_world(frame.world, Base.current_exceptions)]
         blocks = Vector{Any}[]
         fr = frame
@@ -380,10 +387,24 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
         for exs in blocks, exc in exs
             push!(stack, (exception = exc, backtrace = bt))
         end
-        return Base.ExceptionStack(stack)
+        return Some{Any}(Base.ExceptionStack(stack))
     end
+    return nothing
+end
+
+function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, enter_generated::Bool)
+    ret = intercept_call(frame, fargs)
+    isa(ret, Some{Any}) && return ret.value
     if fargs[1] === Core.invoke # invoke needs special handling
+        # A malformed `invoke` — too few arguments, or a second argument that is
+        # not a type/Method/CodeInstance — must raise the same error native
+        # `invoke` does (ArgumentError / TypeError), not a BoundsError from
+        # indexing `fargs[3]` or an ErrorException from `signature_type`. Defer,
+        # matching the "let native invoke raise it" pattern used below.
+        length(fargs) < 3 && return invoke(fargs[2:end]...)
         argtypes = fargs[3]
+        (argtypes isa Type || argtypes isa Method || argtypes isa Core.CodeInstance) ||
+            return invoke(fargs[2:end]...)
         fargs_pruned = [fargs[2]; fargs[4:end]]
         sig = Tuple{mapany(_Typeof, fargs_pruned)...}
         if isa(argtypes, Method)
@@ -396,9 +417,23 @@ function evaluate_call!(interp::Interpreter, frame::Frame, fargs::Vector{Any}, e
             # run it natively.
             return invoke(fargs[2:end]...)
         else
+            # `argtypes` is a plain Type here. Native `invoke` requires it to be a
+            # *tuple* type (`Type{T} where T<:Tuple`); a non-tuple type such as
+            # `Char` makes `signature_type` raise a bare
+            # `ErrorException("expected tuple type")` where native `invoke` raises a
+            # clean `TypeError`. Defer so the error matches, as the checks above do.
+            Base.unwrap_unionall(argtypes) <: Tuple || return invoke(fargs[2:end]...)
             # Select the method in the frame's world; plain `which` would use the task's
             # (possibly newer) world.
-            f_invoked = whichtt(Base.signature_type(fargs[2], argtypes); world=frame.world)
+            invoke_sig = Base.signature_type(fargs[2], argtypes)
+            # Native `invoke` requires the actual arguments to conform to the declared
+            # `argtypes`; a non-conforming call is a TypeError. Without this check the
+            # interpreter would silently run the selected method on out-of-type
+            # arguments — returning a wrong value or throwing an unrelated error deep
+            # inside the callee — where compiled code raises a clean TypeError. Defer
+            # to native `invoke` to raise the same error.
+            sig <: invoke_sig || return invoke(fargs[2:end]...)
+            f_invoked = whichtt(invoke_sig; world=frame.world)
             f_invoked === nothing && throw(MethodError(fargs[2], argtypes, frame.world))
         end
         ret = prepare_framecode(f_invoked, sig; enter_generated, world=frame.world)
@@ -471,7 +506,36 @@ function evaluate_methoddef(interp::Interpreter, frame::Frame, node::Expr)
         mod = f isa Symbol ? moduleof(frame) : f.mod
         name = f isa Symbol ? f : f.name
         if isbindingresolved_deprecated
-            f = Core.eval(mod, Expr(:function, name))
+            # Extend an already-defined binding (an owned function/type, or a
+            # `using`-imported non-owned one) instead of unconditionally creating a
+            # fresh function. `Core.eval(mod, Expr(:function, name))` on an imported
+            # name creates a NEW function that SHADOWS the import, where native
+            # `Core.eval` of the method definition extends the imported binding —
+            # so a later use of `name` as a type (e.g. `DateTime(dt::TimeType)=…`
+            # under `using Dates`, then `x::DateTime + …`) saw a function and threw
+            # `invalid type for argument` / `invalid subtyping in definition`. This
+            # mirrors the non-deprecated `else` branch below (minus the removed
+            # `Base.isbindingresolved` guard). Found by differential fuzzing.
+            local existing
+            if @invokelatest(isdefinedglobal(mod, name)) &&
+               (existing = @invokelatest getfield(mod, name)) isa Type
+                # The name resolves to a TYPE (possibly a `using`-imported one, e.g.
+                # `DateTime` under `using Dates`): a method definition adds a
+                # constructor, EXTENDING that type — exactly as native `Core.eval`
+                # does. The previous code ran `Core.eval(mod, Expr(:function, name))`
+                # here, which created a fresh function that SHADOWED the type, so a
+                # later use of the name as a type saw a function and threw
+                # `invalid type for argument` / `invalid subtyping in definition`.
+                f = existing
+            else
+                # Undefined name, a `using`-imported FUNCTION (native creates a fresh
+                # local generic function that shadows it — e.g. defining `sin(::Int)`
+                # in a module does NOT extend `Base.sin`), or a non-callable value
+                # (native errors). `Core.eval(Expr(:function, name))` reproduces all
+                # three, matching native — this is the original, unchanged behavior
+                # for every non-Type name.
+                f = Core.eval(mod, Expr(:function, name))
+            end
         else
             # TODO: This logic isn't fully correct, but it's been used for a long
             # time, so let's leave it for now.

@@ -1,0 +1,6 @@
+findings/
+journal/
+Manifest.toml
+test/SuppositionDB/
+longrun/
+journal-*/

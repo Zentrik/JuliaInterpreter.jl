@@ -789,3 +789,30 @@ end
     @test isempty(bp.instances)
     remove()
 end
+
+# Target functions for the is_leaf regression below — defined at top level (like
+# `radius2` above) so `breakpoint` attaches to the generic function's framecode.
+kwbp_val(x) = x + 100
+kwbp_pos(x) = x + 1
+kwbp_fn(a; k = 0) = a + k
+kwbp_outer() = kwbp_fn(kwbp_pos(2); k = kwbp_val(5))
+
+@testset "breakpoint in kwarg value survives stepping (is_leaf invariant)" begin
+    # A breakpoint that fires while a command steps through keyword-arg setup (the
+    # kwarg value is a call to the breakpointed function) must pause at the leaf
+    # with a BreakpointRef, not return a non-leaf frame. Returning a non-leaf frame
+    # violated the `is_leaf(frame)` assertion in `step_expr!`, so a following command
+    # crashed with AssertionError. Found by differential fuzzing (step axis).
+    for cmd in (:nc, :s)
+        remove()
+        breakpoint(kwbp_val)
+        frame = JuliaInterpreter.enter_call(kwbp_outer)
+        fr, pc = JuliaInterpreter.debug_command(frame, cmd, true)
+        @test JuliaInterpreter.is_leaf(fr)                       # not a non-leaf frame
+        @test isa(pc, JuliaInterpreter.BreakpointRef)            # paused inside kwbp_val
+        @test JuliaInterpreter.scopeof(fr).name === :kwbp_val
+        # the returned frame is a valid leaf: a following command must not assert
+        @test JuliaInterpreter.debug_command(fr, :c, true) === nothing
+    end
+    remove()
+end

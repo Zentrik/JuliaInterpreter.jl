@@ -159,7 +159,13 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Some{Any}(Core.apply_type(getargs(interp, args, frame)...))
     elseif f === Core.compilerbarrier
         if nargs == 2
-            return Some{Any}(Core.compilerbarrier(lookup(interp, frame, args[2]), lookup(interp, frame, args[3])))
+            # Delegate to a genuinely dynamic (non-elidable) call so Julia itself
+            # validates the barrier setting. A plain `Core.compilerbarrier(s, x)`
+            # here sits in compiled code where the optimizer ELIDES the barrier
+            # (lowers it to `x`), so an invalid setting was silently accepted and the
+            # value returned, where native eval throws. Found by differential fuzzing
+            # (`Core.compilerbarrier(:b, v)` returned `v` interpreted, threw natively).
+            return Some{Any}(invoke_in_world(frame.world, Core.compilerbarrier, lookup(interp, frame, args[2]), lookup(interp, frame, args[3])))
         else
             return Some{Any}(Core.compilerbarrier(getargs(interp, args, frame)...))
         end
@@ -327,10 +333,16 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Expr(:call, invoke, args[2:end]...)
     elseif @static isdefinedglobal(Core, :invokelatest) && f === Core.invokelatest
         args = getargs(interp, args, frame)
-        if !expand
+        # A malformed `invokelatest()` (no function argument) must raise the
+        # native ArgumentError, not a BoundsError from indexing `args[1]` in the
+        # expand path below. Defer to the native call, as the `invoke` rewrite does.
+        if !expand || isempty(args)
             return Some{Any}(Core.invokelatest(args...))
         end
-        new_expr = Expr(:call, args[1])
+        # QuoteNode the callee too (see _call_latest): a bare Symbol value in
+        # function position would be looked up as a name (UndefVarError) instead
+        # of called as a value (MethodError).
+        new_expr = Expr(:call, QuoteNode(args[1]))
         popfirst!(args)
         for x in args
             push!(new_expr.args, QuoteNode(x))
@@ -576,10 +588,14 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         return Some{Any}(Core._call_in_world(getargs(interp, args, frame)...))
     elseif @static (isdefinedglobal(Core, :_call_latest) && Core._call_latest isa Core.Builtin) && f === Core._call_latest
         args = getargs(interp, args, frame)
-        if !expand
+        if !expand || isempty(args)
             return Some{Any}(Core._call_latest(args...))
         end
-        new_expr = Expr(:call, args[1])
+        # QuoteNode the callee, like the arguments below: args[1] is an evaluated
+        # *value*, and a bare value in function position is re-interpreted as a
+        # name when it looks like one (a Symbol became an UndefVarError instead of
+        # the MethodError native `_call_latest` raises for a non-callable value).
+        new_expr = Expr(:call, QuoteNode(args[1]))
         popfirst!(args)
         for x in args
             push!(new_expr.args, QuoteNode(x))

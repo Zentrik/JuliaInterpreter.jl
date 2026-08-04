@@ -1,0 +1,232 @@
+# Grammar-shape metrics: what does the generator actually *produce*?
+#
+#   julia --project=fuzz fuzz/metrics.jl [--n SEEDS] [--big] [--maxblockdepth D] ...
+#
+# Generation is cheap (no execution), so this answers "did that grammar change
+# do what I meant?" in seconds instead of waiting on a campaign. Report:
+#
+#   - program size (statements, rendered lines) — the budget guard: a change
+#     that raises feature rates by inflating programs costs throughput and
+#     abort rate, and this makes that visible.
+#   - control-flow nesting depth histogram — how deep programs actually go, vs
+#     the configured cap.
+#   - P(program contains X) for the constructs the interpreter is most likely
+#     to get wrong. A feature whose probability is ~0 is a grammar gap: either
+#     unreachable by construction or diluted below the sampling rate of a
+#     campaign, and either way it is not being tested.
+#
+# Interpreting the interaction rows: `try_in_loop_in_fn` and `exit_through_try`
+# are the :enter/:leave and exception-frame-unwinding surface — historically
+# the most bug-dense part of an interpreter, and the reason the nesting cap
+# matters. `ctrl_in_fn` gates all of them: control flow must be able to appear
+# inside an interpreted *function* frame, not just at toplevel.
+
+include(joinpath(@__DIR__, "src", "FuzzJI.jl"))
+using .FuzzJI
+using .FuzzJI: Xoshiro, St, Program, sections, nstatements
+
+function parseargs(args)
+    o = Dict{String,Any}("n" => 500, "big" => false, "noswarm" => false, "nopolicy" => false,
+                         "policy" => nothing)
+    for k in ("maxdepth", "maxblockdepth", "maxblockstmts", "maxloop")
+        o[k] = nothing
+    end
+    i = 1
+    while i <= length(args)
+        a = args[i]
+        if a == "--n"
+            o["n"] = parse(Int, args[i += 1])
+        elseif a == "--big"
+            o["big"] = true
+        elseif a == "--noswarm"
+            o["noswarm"] = true
+        elseif a == "--nopolicy"
+            o["nopolicy"] = true
+        elseif a == "--policy"     # force one policy for every program (validates the boosts)
+            o["policy"] = Symbol(args[i += 1])
+        elseif a in ("--maxdepth", "--maxblockdepth", "--maxblockstmts", "--maxloop")
+            o[a[3:end]] = parse(Int, args[i += 1])
+        else
+            error("unknown argument $a")
+        end
+        i += 1
+    end
+    return o
+end
+
+o = parseargs(ARGS)
+base = o["big"] ? Cfg(maxdepth=5, nglobals=1:5, nstructs=0:3, nfundefs=1:5, nmidstmts=0:5,
+                      nbodystmts=10:26, maxblockstmts=4, maxblockdepth=4, maxloop=6,
+                      maxstring=10) : Cfg()
+ov(f, k) = o[k] === nothing ? getfield(base, f) : o[k]
+cfg = Cfg(; maxdepth=ov(:maxdepth, "maxdepth"), nglobals=base.nglobals, nstructs=base.nstructs,
+            nfundefs=base.nfundefs, nmidstmts=base.nmidstmts, nbodystmts=base.nbodystmts,
+            maxblockstmts=ov(:maxblockstmts, "maxblockstmts"), minblockstmts=base.minblockstmts,
+            maxblockdepth=ov(:maxblockdepth, "maxblockdepth"), blockdecay=base.blockdecay,
+            maxloop=ov(:maxloop, "maxloop"), maxstring=base.maxstring,
+            swarm=!o["noswarm"], policy=!o["nopolicy"])
+
+const CTRL = (:if, :for, :while, :let, :try)
+
+# Deepest control-flow nesting anywhere in a statement list.
+function ctrldepth(sts, d=0)
+    m = d
+    for st in sts
+        nd = st.kind in CTRL ? d + 1 : d
+        m = max(m, nd)
+        for b in st.blocks
+            m = max(m, ctrldepth(b, nd))
+        end
+    end
+    return m
+end
+
+# Some constructs are expression kinds, not statement kinds (a comprehension is
+# an :assign whose rhs is an :compr; a builtin probe is a :guard around a :src),
+# so counting statement kinds alone would report them as absent.
+function scanex!(counts, e)
+    haskey(counts, e.kind) && (counts[e.kind] += 1)
+    # A probe is either a reflection-driven call (:probe) or one of the fixed
+    # templates (:src); both are "one builtin probe" for density purposes.
+    (e.kind === :src || e.kind === :probe) && (counts[:builtin] += 1)
+    for k in e.kids
+        scanex!(counts, k)
+    end
+end
+
+# Per-construct occurrence counts, plus the feature *interactions* that matter.
+function scan!(counts, sts; infunc=false, inloop=false, intry=false)
+    for st in sts
+        k = st.kind
+        haskey(counts, k) && (counts[k] += 1)
+        for e in st.exs
+            scanex!(counts, e)
+        end
+        infunc && k in CTRL && (counts[:ctrl_in_fn] += 1)
+        inloop && k === :try && (counts[:try_in_loop] += 1)
+        infunc && inloop && k === :try && (counts[:try_in_loop_in_fn] += 1)
+        # break/continue/return crossing a try boundary: the unwinding surface
+        intry && (k === :brk || k === :cont || k === :ret) && (counts[:exit_through_try] += 1)
+        nf = infunc || k === :fundef || k === :recdef
+        nl = inloop || k === :for || k === :while
+        nt = intry || k === :try
+        for b in st.blocks
+            scan!(counts, b; infunc=nf, inloop=nl, intry=nt)
+        end
+    end
+end
+
+const TRACKED = (:try, :for, :while, :if, :let, :fundef, :recdef, :structdef, :amodify,
+                 :setprop, :alias, :loopundef, :maybeundef, :typedlocal, :brk, :cont, :ret,
+                 :compr, :push, :setindex,
+                 # determinism unlocks (determinism.md §3/§4)
+                 :rng, :vtime, :dictlit, :setlit, :dictset, :dictdel, :setpush, :dictobs,
+                 # expression-level constructs (counted via scanex!)
+                 :builtin, :guard, :callfn, :callvar, :kwcall, :closure, :closuremut, :call,
+                 :ctrl_in_fn, :try_in_loop, :try_in_loop_in_fn, :exit_through_try)
+
+N = o["n"]
+counts = Dict{Symbol,Int}(k => 0 for k in TRACKED)
+withprog = Dict{Symbol,Int}(k => 0 for k in TRACKED)
+depths = Int[]; sizes = Int[]; lines = Int[]
+# --policy forces every program onto one policy, which is how the boost tables
+# get validated: run it against --policy uniform and the targeted rules should
+# move sharply while program size stays put.
+forced = o["policy"]
+forced === nothing || forced in FuzzJI.POLICIES ||
+    error("unknown policy $forced (expected one of $(FuzzJI.POLICIES))")
+genone(seed) = forced === nothing ? genprogram(Xoshiro(seed), cfg) :
+                                    FuzzJI.genprogram_policy(Xoshiro(seed), cfg, forced)
+for seed in 1:N
+    p = genone(seed)
+    push!(depths, maximum(ctrldepth(sec) for sec in sections(p)))
+    push!(sizes, nstatements(p))
+    push!(lines, count(==('\n'), render(p)))
+    before = copy(counts)
+    for sec in sections(p)
+        scan!(counts, sec)
+    end
+    for k in TRACKED
+        counts[k] > before[k] && (withprog[k] += 1)
+    end
+end
+
+mean(xs) = round(sum(xs) / length(xs); digits=2)
+pct(x) = string(round(100x / N; digits=1), "%")
+
+println("seeds=$N  maxblockdepth=$(cfg.maxblockdepth) maxblockstmts=$(cfg.maxblockstmts) ",
+        "maxdepth=$(cfg.maxdepth) bodystmts=$(cfg.nbodystmts) ",
+        "swarm=$(cfg.swarm) policy=$(cfg.policy)")
+println("statements/program: mean $(mean(sizes))  max $(maximum(sizes))")
+println("rendered lines/program: mean $(mean(lines))  max $(maximum(lines))")
+println("control-flow depth: mean $(mean(depths))  max $(maximum(depths))  ",
+        "histogram(depth 0..) ", [count(==(d), depths) for d in 0:maximum(depths)])
+println()
+println(rpad("construct", 22), rpad("P(in program)", 15), "occurrences")
+for k in TRACKED
+    k === :ctrl_in_fn && println("  -- feature interactions --")
+    println("  ", rpad(k, 20), rpad(pct(withprog[k]), 15), counts[k])
+end
+
+# ---------------------------------------------------------------------------
+# The builtins prober (fuzz/src/probes.jl).
+#
+# Two numbers describe the *target set* — how much of the runtime's builtin and
+# intrinsic surface the enumeration reaches, and how much of it the safety
+# denylist has to withhold — and the rest describe what generation does with
+# it. Probe density is measured under the `builtins` policy specifically: that
+# policy exists to concentrate probes, so a collapse there is invisible in the
+# blended average.
+
+println()
+println("builtin/intrinsic prober")
+println("  enumerated:         ", FuzzJI.nprobe_enumerated(), " spellings")
+println("  allowed:            ", length(FuzzJI.PROBE_TARGETS),
+        " (builtins ", length(FuzzJI.PROBE_BUILTIN_TARGETS),
+        ", intrinsics ", length(FuzzJI.PROBE_INTRINSIC_TARGETS),
+        "); recipe-only: ", FuzzJI.nprobe_reciponly())
+println("  denylisted:         ", FuzzJI.nprobe_denied(),
+        " spellings over ", length(unique(n for (_, n, _) in FuzzJI.PROBE_DENIED)), " names")
+println("  recipes:            ", length(FuzzJI.PROBE_RECIPES), " builtins, ",
+        sum(length, values(FuzzJI.PROBE_RECIPES)), " argument shapes; ",
+        length(FuzzJI.FIXED_PROBES), " fixed templates")
+
+const PROBE_N = min(N, 500)
+probecounts = Int[]
+targets = Dict{String,Int}()
+for seed in 1:PROBE_N
+    p = FuzzJI.genprogram_policy(Xoshiro(seed), cfg, :builtins)
+    n = 0
+    function walkex(e)
+        if e.kind === :probe
+            n += 1
+            s = e.meta::String
+            targets[s] = get(targets, s, 0) + 1
+        elseif e.kind === :src
+            n += 1
+        end
+        for k in e.kids
+            walkex(k)
+        end
+    end
+    function walk(sts)
+        for st in sts
+            for e in st.exs
+                walkex(e)
+            end
+            for b in st.blocks
+                walk(b)
+            end
+        end
+    end
+    for sec in sections(p)
+        walk(sec)
+    end
+    push!(probecounts, n)
+end
+covered = length(targets)
+println("  policy=builtins, ", PROBE_N, " programs: probes/program mean ",
+        mean(probecounts), "  max ", maximum(probecounts),
+        "  P(>=1 probe) ", string(round(100count(>(0), probecounts) / PROBE_N; digits=1), "%"))
+println("  distinct callables reached: ", covered, "/", length(FuzzJI.PROBE_TARGETS),
+        " (", string(round(100covered / max(1, length(FuzzJI.PROBE_TARGETS)); digits=1), "%)"))

@@ -323,6 +323,23 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         end
 """)
             continue
+        elseif f === Core.compilerbarrier
+            print(io,
+"""
+    elseif f === Core.compilerbarrier
+        if nargs == 2
+            # Delegate to a genuinely dynamic (non-elidable) call so Julia itself
+            # validates the barrier setting. A plain `Core.compilerbarrier(s, x)`
+            # here sits in compiled code where the optimizer ELIDES the barrier
+            # (lowers it to `x`), so an invalid setting was silently accepted and the
+            # value returned, where native eval throws. Found by differential fuzzing
+            # (`Core.compilerbarrier(:b, v)` returned `v` interpreted, threw natively).
+            return Some{Any}(invoke_in_world(frame.world, Core.compilerbarrier, lookup(interp, frame, args[2]), lookup(interp, frame, args[3])))
+        else
+            return Some{Any}(Core.compilerbarrier(getargs(interp, args, frame)...))
+        end
+""")
+            continue
         end
 
         id = findfirst(isequal(f), Core.Compiler.T_FFUNC_KEY)

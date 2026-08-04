@@ -1,0 +1,41 @@
+[29382] signal 11 (128): Segmentation fault
+in expression starting at none:1
+gc_try_claim_and_push at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:1683 [inlined]
+gc_mark_objarray at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:1837
+gc_mark_outrefs at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2412 [inlined]
+gc_mark_loop_serial_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2519
+gc_mark_loop_serial at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2542
+gc_mark_loop at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:2730 [inlined]
+_jl_gc_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:3074
+ijl_gc_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:3475
+maybe_collect at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:351 [inlined]
+jl_gc_small_alloc_inner at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:727 [inlined]
+jl_gc_small_alloc_noinline at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:785 [inlined]
+jl_gc_alloc_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/gc-stock.c:799
+_new_array at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/array.c:64 [inlined]
+new_array at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/array.c:86 [inlined]
+ijl_alloc_array_1d at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/array.c:149
+jl_exprn at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/builtins.c:1660
+scm_to_julia_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:642
+scm_to_julia_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:646
+scm_to_julia_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:646
+scm_to_julia_ at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:646
+scm_to_julia at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:472
+ijl_expand_with_loc_warn at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/ast.c:1320
+jl_toplevel_eval_flex at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:808
+ijl_toplevel_eval at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:1047
+ijl_toplevel_eval_in at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/toplevel.c:1092
+eval at ./boot.jl:489
+eval_code at /home/user/JuliaInterpreter.jl/src/utils.jl:815
+eval_code at /home/user/JuliaInterpreter.jl/src/utils.jl:787
+check_evalcode at /home/user/JuliaInterpreter.jl/fuzz/src/evalcodefuzz.jl:100
+#evalcode_probe#571 at /home/user/JuliaInterpreter.jl/fuzz/src/evalcodefuzz.jl:176
+evalcode_probe at /home/user/JuliaInterpreter.jl/fuzz/src/evalcodefuzz.jl:160 [inlined]
+#evalcode_campaign#576 at /home/user/JuliaInterpreter.jl/fuzz/src/evalcodefuzz.jl:251
+evalcode_campaign at /home/user/JuliaInterpreter.jl/fuzz/src/evalcodefuzz.jl:225
+unknown function (ip: 0x7f320553e2ff) at (unknown file)
+jl_apply at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/julia.h:2391 [inlined]
+do_call at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:123
+eval_value at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:243
+eval_stmt_value at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:194 [inlined]
+eval_body at /cache/build/builder-amdci5-4/julialang/julia-release-1-dot-12/src/interpreter.c:707
