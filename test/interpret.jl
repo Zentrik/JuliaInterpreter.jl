@@ -1634,6 +1634,21 @@ end
 end
 end
 
+@testset "_apply_iterate quotes the callee like _call_latest" begin
+    # The _apply_iterate expand path put the evaluated callee bare in function
+    # position, where evaluate_call! re-resolves a Symbol as a *name*: a
+    # non-callable Symbol callee raised UndefVarError instead of the native
+    # MethodError, and `(:sin)((1.0,)...)` silently called `sin` where native
+    # raises. Found by differential fuzzing (value_divergence-c6f2ab08).
+    sym_splat() = (:d)((1, 2)...)
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_splat))
+    sym_shadow() = (:sin)((1.0,)...)
+    @test_throws MethodError finish_and_return!(JuliaInterpreter.enter_call(sym_shadow))
+    # well-formed splatted calls are unaffected
+    ok_splat() = +((1, 2, 3)...)
+    @test finish_and_return!(JuliaInterpreter.enter_call(ok_splat)) == 6
+end
+
 @testset "invoke selects its method in the frame world" begin
     @eval module InvokeWorld
     function target end

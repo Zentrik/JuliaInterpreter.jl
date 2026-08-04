@@ -109,7 +109,10 @@ function maybe_evaluate_builtin(interp::Interpreter, frame::Frame, call_expr::Ex
         aw1 = argswrapped[1]::Function
         aw1 === Core.iterate || aw1 === Core.Compiler.iterate || aw1 === Base.iterate ||
             @invokelatest error("cannot handle `_apply_iterate` with non iterate as first argument, got ", aw1, ", ", typeof(aw1))
-        new_expr = Expr(:call, argswrapped[2])
+        # QuoteNode the callee too (see _call_latest): a bare Symbol value in
+        # function position is re-resolved as a *name* by evaluate_call!, so
+        # `(:sin)((1.0,)...)` silently called sin where native raises MethodError.
+        new_expr = Expr(:call, QuoteNode(argswrapped[2]))
         popfirst!(argswrapped) # pop the iterate
         popfirst!(argswrapped) # pop the function
         argsflat = invoke_in_world(frame.world, append_any, argswrapped...)::Vector{Any}
