@@ -14,7 +14,93 @@ landed**: the confirm-on-divergence gate and `fuzz/triage.jl`. Item 2
 
 ---
 
-## Session handoff — 2026-08-04 (read this first)
+## Session handoff — 2026-08-04, second session (read this first)
+
+This session worked the previous handoff's follow-up list: false-positive
+sources on the call and corpus axes, the nightly-CI overrun, and repro
+fidelity. Everything is committed on
+`claude/false-positive-fussing-improvements-igts2c` (which contains the whole
+harness — it merges `claude/fuzzing-effectiveness-review-92ph29`); the nightly
+workflow's checkout pin now points there too, so a `workflow_dispatch` from
+that branch exercises the improved harness.
+
+### False-positive fixes
+
+1. **Call axis: per-run global reset** (previous item 1, the 0-for-6 axis).
+   `call_program` now snapshots the module's whole mutable surface after the
+   definition pass (`snapshotglobals`) and restores it before *every* run of a
+   call — native #1, native #2 and the interpreted run (`restoreglobals!`):
+   non-const globals are rebound to a deepcopy, const-bound mutables (Ref,
+   Vector, Dict, Set, mutable struct — atomic fields included) are restored
+   in place, preserving the identity closures hold. This closes the whole
+   unreset-global class (`1dc96bf0` and friends) instead of downweighting the
+   axis; certification stays as the backstop for what the reset cannot reach
+   (const-bound closures over captured state). Selftest covers the three
+   mutation shapes with calls whose native outcomes coincide by construction.
+   Gotcha worth remembering: `names(m; all=true)` and `Base.isconst` consult
+   the *caller's* world, so inside `call_program` they silently missed the
+   just-`Core.eval`'d bindings — every world-sensitive lookup in the snapshot
+   goes through `invokelatest` now.
+2. **Corpus axis: frame-introspection filter** (previous item 2).
+   `corpus_ok` rejects fragments that call `stacktrace`/`backtrace`/
+   `catch_backtrace`/`catch_stack`/`current_exceptions` (same call-position
+   AST walk as `UNSAFE_NAMES`), so backtrace-asserting fragments like
+   `390a4eeb` can no longer self-certify and then diverge on frame details.
+   Corpus certification rate is unchanged (~57% in the smoke run).
+
+### Fuzzing-rate / CI fixes
+
+3. **Nightly lane overrun diagnosed and closed** (previous item 3). Run #8's
+   nightly lane ran its campaign step 5h48 against a 3 h DURATION until the
+   job's 6 h limit cancelled it: a wedged nightly julia ignored the per-batch
+   `timeout` TERM, which never escalated, so the deadline check never ran
+   again. Three-layer fix: `timeout -k 30` per batch (longrun.sh), a
+   `timeout -k 60 $((DURATION+2700))` backstop around the whole campaign step
+   (workflow), and `if: always()` on the report step so findings are printed
+   to the log even if a lane is cancelled. The `--n` shortening the previous
+   handoff suggested was not needed — DURATION already bounds the campaign
+   when TERM is deliverable.
+4. **longrun.sh batches right-sized; timeout kills no longer pollute the
+   crash journal.** The corpus batch (`--n 800` at ~3 s/case) could never
+   finish inside the 1800 s batch timeout, so *every* corpus batch was killed
+   mid-flight and its in-flight candidate preserved as spurious "crash"
+   evidence. Batches are sized to finish (corpus 450, native 3500), and an
+   exit-124 batch now deletes `current.jl` instead of promoting it —
+   exit 137 (TERM ignored, KILLed: a real hang) and signal deaths still
+   preserve theirs.
+
+### Repro fidelity (previous item 4 — done)
+
+`reprostep(SRC, walkseed)`, `reproevalcode(SRC, walkseed)` and
+`reprocorpusstep(SRC, walkseed)` in reprolib.jl replay the recorded walk the
+way `reprocall` already did (loading FuzzJI rather than duplicating walk
+logic), and `writefinding` routes the step/evalcode/corpus modes to them.
+Previously these modes fell back to `reprorun`, which never steps — their
+repros under-reproduced by construction.
+
+### State / what's left
+
+- Selftest 449/449 on 1.12.6. Smoke campaigns after the changes: call 150/150
+  agreed (0 findings, 0 nondet, ~1.7 cases/s steady state — reset cost is
+  noise), corpus 60 cases / 29 ran / 34 certified / 0 findings.
+- **Run #8's nightly findings artifact is now partially triaged** (previous
+  item 5): of its ~30 new entries, 3 corpusvalue findings are the
+  backtrace-introspection class (now filtered at admission) and the 6 new
+  call divergences are almost certainly the unreset-global class (now
+  closed) — re-run the nightly lane to confirm they stop re-deriving. What
+  remains genuinely unanalyzed: ~20 corpusvalue `interp_only_throw` findings
+  on 1.14-DEV (mostly `TestSetException`/`FallbackTestSetException` — real
+  early-warning material for the interpreter on nightly), one
+  `corpus-corpus_internal_error-6eea3f32`, and `step-step_divergence-7e03896b`.
+  The artifact is `fuzz-findings-julia-nightly` on run 30854168537.
+- `370cc475` (candidate upstream Julia UB) deliberately not touched — being
+  handled separately.
+- The previous session's ranked list below is otherwise unchanged; its items
+  1–4 are done as described above.
+
+---
+
+## Session handoff — 2026-08-04, first session
 
 This session ran a long `-O1` campaign plus CI runs and turned the "few
 similar issues" concern into concrete fixes. Everything below is committed on
