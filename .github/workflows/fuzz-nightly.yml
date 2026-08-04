@@ -37,8 +37,9 @@ jobs:
     # Only the supported release lane (1.12) is required; the forward-looking
     # lanes are advisory early warning, so their failures never fail the workflow.
     continue-on-error: ${{ matrix.version != '1.12' }}
-    # duration (default 3 h) + up to ~30 min of longrun batch overshoot
-    # + setup/selftest/upload, comfortably under GitHub's 6 h job limit.
+    # The campaign step's own backstop caps it at duration (default 3 h)
+    # + 45 min; setup/selftest/upload fit in the remainder with hours to
+    # spare, so hitting this job limit again would mean the backstop broke.
     timeout-minutes: 350
     strategy:
       fail-fast: false
@@ -53,7 +54,7 @@ jobs:
         with:
           # The fuzzing harness lives on this branch; master has no fuzz/ yet.
           # Drop this pin (checkout default) once the branch merges.
-          ref: claude/fuzzing-effectiveness-review-92ph29
+          ref: claude/false-positive-fussing-improvements-igts2c
       - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
@@ -66,6 +67,7 @@ jobs:
         # keeps the workflow green while the lane itself is marked failed.
         run: julia --project=fuzz fuzz/run.jl --selftest
       - name: Snapshot findings
+        id: snapshot
         run: |
           mkdir -p fuzz/findings
           ls -1 fuzz/findings | sort > "$RUNNER_TEMP/findings-before.txt"
@@ -84,7 +86,21 @@ jobs:
           # purpose: the Julia versions test identical programs, so the only
           # variable is the Julia version.
           export SEED_BASE=$(( 1000000 + RUN_NUMBER ))
-          ./fuzz/longrun.sh "$DURATION"
+          # Hard wall-clock backstop: DURATION plus 45 min of slack for the
+          # last batches to drain. longrun.sh bounds itself (deadline between
+          # batches, timeout -k per batch), but the one time it did not — run
+          # #8's nightly lane, where a wedged julia ignored the un-escalated
+          # per-batch TERM — the campaign ran 5h48 into the job's 6 h limit and
+          # the whole job was cancelled with the findings uploaded but never
+          # reported. The backstop converts that worst case into a truncated
+          # campaign whose findings still flow through the report + fail gate.
+          rc=0
+          timeout -k 60 $(( DURATION + 2700 )) ./fuzz/longrun.sh "$DURATION" || rc=$?
+          if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "::warning::campaign hit the wall-clock backstop (exit $rc); reporting what it found"
+          elif [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@v4
@@ -114,6 +130,12 @@ jobs:
         # reachable. The repro.jl is dumped too for a copy-paste reproducer.
         # This runs before the fail gate so it always executes; the gate below
         # is what turns the lane red.
+        #
+        # always(): run #8's nightly lane was cancelled at the job limit and
+        # this step was skipped — findings uploaded but unreadable from the
+        # log. As long as the snapshot exists there is something to diff, no
+        # matter how the campaign step ended.
+        if: ${{ always() && steps.snapshot.outcome == 'success' }}
         run: |
           ls -1 fuzz/findings | sort > "$RUNNER_TEMP/findings-after.txt"
           comm -13 "$RUNNER_TEMP/findings-before.txt" "$RUNNER_TEMP/findings-after.txt" \
