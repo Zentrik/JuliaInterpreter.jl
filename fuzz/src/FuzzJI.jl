@@ -29,7 +29,8 @@ include("supposition.jl")
 
 export campaign, supposition_campaign, step_campaign, call_campaign, evalcode_campaign,
        corpus_campaign,
-       split_campaign, genprogram, gensplit, render, run_both, classify, shrink, shrink_ir,
+       split_campaign, genprogram, gensplit, gensplit_toplevel, render, run_both, classify,
+       shrink, shrink_ir,
        ddmin_source, ShrinkBudget, Cfg, SplitCfg, ProgramGen
 
 end

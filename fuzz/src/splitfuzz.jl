@@ -45,7 +45,7 @@
 # Budget exhaustion (statements or fragments) is a tracked discard, never a
 # finding: the same rule the other axes use.
 
-using JuliaInterpreter: ExprSplitter, Frame
+using JuliaInterpreter: ExprSplitter, Frame, is_doc_expr
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -85,8 +85,13 @@ mutable struct SplitGen
     rng::AbstractRNG
     cfg::SplitCfg
     counter::Int
+    # `false` for `Base.__toplevel__`-parent programs (`gensplit_toplevel`): there
+    # the program's root modules are *root* modules (their parent is themselves),
+    # so `import ..__obs__` cannot reach a harness prelude — there is no harness
+    # module above them. The oracle for those cases is the module tree alone.
+    withobs::Bool
 end
-SplitGen(rng::AbstractRNG, cfg::SplitCfg=SplitCfg()) = SplitGen(rng, cfg, 0)
+SplitGen(rng::AbstractRNG, cfg::SplitCfg=SplitCfg()) = SplitGen(rng, cfg, 0, true)
 
 # Unique across the whole program: two same-named modules in the same parent are
 # a *documented* divergence (`ExprSplitter` reuses an existing module where
@@ -449,8 +454,9 @@ function emit_module!(lines, g::SplitGen, sc::SScope, ind::String)
     end
     # `import ..__obs__` — one dot per level up, plus one for the name itself.
     # It reaches the root module directly, so it works even when the enclosing
-    # module never imported it.
-    if chance(g, 0.7)
+    # module never imported it. (Not in `__toplevel__`-parent programs: their
+    # depth-0 "root" is a self-parented root module with no prelude above it.)
+    if g.withobs && chance(g, 0.7)
         emit!(lines, inner, string("import ", "."^(childdepth + 1), "__obs__"))
         child.hasobs = true
     end
@@ -607,6 +613,115 @@ function gensplit(rng::AbstractRNG, cfg::SplitCfg=SplitCfg())
         emit_form!(lines, g, sc, "")
     end
     isempty(lines) && push!(lines, "__obs__(0)")
+    return join(lines, "\n") * "\n"
+end
+
+# ---------------------------------------------------------------------------
+# `Base.__toplevel__`-parent generation
+# ---------------------------------------------------------------------------
+#
+# `find_or_create_module`'s package-resolution arm (`find_toplevel_module_id`,
+# the `Base.loaded_modules` scan) is reachable *only* when the parent module is
+# `Base.__toplevel__` — the module Julia evaluates package files into, and the
+# parent Revise passes when re-interpreting one. No axis reached it before this.
+#
+# ISOLATION. `Base.__toplevel__` is process-global shared state, and a `module`
+# evaluated into it does three things a fresh-module parent does not (verified
+# empirically on 1.12):
+#
+#   • the new module becomes a *root* module (its parent is itself), and it is
+#     registered in `Base.loaded_modules` under `PkgId(nothing, name)` — the
+#     same table real loaded packages live in;
+#   • re-evaluating the same name natively *replaces* the registered module
+#     (with a "Replacing module" warning), while the interpreted path's
+#     package-resolution arm *finds and reuses* whatever `loaded_modules` holds
+#     under that name — the fresh-module axis's documented divergence #1, now
+#     at process scope;
+#   • nothing is ever garbage-collected: every registered module stays alive.
+#
+# So three rules, each load-bearing:
+#
+#   1. UNIQUE NAMES PER RUN, NOT PER SEED. The generator emits the wrapper
+#      names as the placeholder `FJTLW<k>`; every *execution* (reference run,
+#      each interpreted run, every shrinker re-run) substitutes a fresh
+#      process-unique name via `tl_instantiate`. Seed-derived names would not
+#      survive re-execution: the second run of the same seed would find the
+#      first run's module in `loaded_modules` and silently reuse it — stale
+#      bindings reported as divergence. The name never appears in anything the
+#      oracle compares (`modstate` keys are rooted at the stable `TL<k>` prefix
+#      and skip the module's self-binding; `normstate` scrubs identity), so the
+#      *case* — template, semantics, verdict — remains a pure function of the
+#      seed; only the harness-plumbing name is per-invocation.
+#   2. DISTINCT NAMES PER SIDE ('R'/'I' plus a fresh nonce). Both sides use the
+#      same parent, `Base.__toplevel__` — that is the point — but they share
+#      one global namespace, so running the interpreted side under the
+#      reference's name would resolve the reference's *already-populated*
+#      module through the very arm under test and evaluate into it: reuse-vs-
+#      replace reported as a bug, real divergence masked by leftover state.
+#   3. NO REAL-PACKAGE COLLISIONS, AND CLEANUP. The `FJTL` prefix + nonce can
+#      never equal a loaded package's name, so `Base.identify_package` returns
+#      `nothing`, the `loaded_modules` scan matches nothing pre-existing, and
+#      no real module is ever found, shadowed, or mutated — the arm always
+#      takes its create path, exercising the full resolution failure chain.
+#      After each run `tl_cleanup` unregisters the case's modules
+#      (`Base.unreference_module`), so `loaded_modules` does not accumulate a
+#      campaign's worth of dead entries (which every later case's resolution
+#      scan would have to walk) and a leaked name can never be resolved again.
+#
+# RESTRICTED FORMS. Only `module`/`baremodule` blocks (optionally documented)
+# are generated at true top level here: any other statement would evaluate into
+# `Base.__toplevel__` *itself* — shared mutable state, unisolatable. That is
+# also the realistic shape: a `__toplevel__` parent only ever occurs for package
+# files, which are exactly one docstring-optional `module` block. Everything
+# inside the wrappers reuses the ordinary form generator (depth 1, `withobs`
+# off — see `SplitGen.withobs`), so the wrappers' bodies keep the full
+# adversarial surface. The oracle is unchanged: failure mode + observation
+# stream (empty on both sides by construction) + module tree.
+const TL_PLACEHOLDER = "FJTLW"
+
+"""
+    gensplit_toplevel(rng, cfg=SplitCfg()) -> String
+
+Generate one adversarial program for the `Base.__toplevel__` parent: 1–2
+top-level `module`/`baremodule` blocks named `FJTLW1`, `FJTLW2`, … (placeholders
+substituted per execution by `tl_instantiate`), with ordinary generated bodies.
+Deterministic in `rng`.
+"""
+function gensplit_toplevel(rng::AbstractRNG, cfg::SplitCfg=SplitCfg())
+    g = SplitGen(rng, cfg)
+    g.withobs = false
+    lines = String[]
+    for k in 1:rand(rng, 1:2)
+        bare = chance(g, 0.2)
+        usingbase = bare && chance(g, 0.5)
+        hasbase = !bare || usingbase
+        # A docstring on the top-level module — the package-file shape, and the
+        # `is_doc_expr` rewrite combined with a `__toplevel__` parent (both
+        # `find_or_create_module` call sites). Interpolating a binding the body
+        # defines, half the time, exactly like `emit_module!`. Needs the
+        # docsystem, hence gated on Base.
+        interpname = ""
+        if hasbase && chance(g, 0.25)
+            if chance(g, 0.5)
+                interpname = nextname!(g, "K")
+                emit!(lines, "", string('"', "tl module doc: \$(", interpname, ")\""))
+            else
+                emit!(lines, "", string('"', "tl module doc ", g.counter, '"'))
+            end
+        end
+        emit!(lines, "", string(bare ? "baremodule " : "module ", TL_PLACEHOLDER, k))
+        usingbase && emit!(lines, "    ", "using Base")
+        sc = SScope(1, hasbase, false)
+        if !isempty(interpname)
+            emit!(lines, "    ", "const $interpname = $(litexpr(g, hasbase))")
+            push!(sc.refs, SRef(interpname, :val))
+            push!(sc.ownrefs, SRef(interpname, :val))
+        end
+        for _ in 1:rand(rng, cfg.nrootforms)
+            emit_form!(lines, g, sc, "    ")
+        end
+        emit!(lines, "", "end")
+    end
     return join(lines, "\n") * "\n"
 end
 
@@ -851,6 +966,164 @@ function split_interp(ex::Expr; nstmts::Int, maxfrags::Int,
 end
 
 # ---------------------------------------------------------------------------
+# `Base.__toplevel__`-parent execution
+# ---------------------------------------------------------------------------
+# See the isolation contract at `TL_PLACEHOLDER`. Everything here works on the
+# *template* source; each run instantiates its own process-unique names.
+
+# Process-unique nonce for wrapper-name instantiation. Per *run*, not per seed
+# or per case: the shrinker re-executes one case's variants dozens of times in
+# one process, and `Base.loaded_modules` remembers every name ever registered
+# (isolation rule 1).
+const TL_NONCE = Ref(0)
+
+"""
+    tl_instantiate(src, side) -> String
+
+Substitute the template's `FJTLW<k>` wrapper names with process-unique,
+side-tagged names (`FJTL<nonce><side>W<k>`). `side` is `"R"` (reference) or
+`"I"` (interpreted): the two sides share `Base.__toplevel__`'s global namespace,
+so they must not share names (isolation rule 2).
+"""
+function tl_instantiate(src::String, side::String)
+    nonce = (TL_NONCE[] += 1)
+    return replace(src, TL_PLACEHOLDER => string("FJTL", nonce, side, "W"))
+end
+
+# The top-level module names of an instantiated program, in source order —
+# either bare `module` statements or `@doc`-wrapped ones (a docstring line
+# before a `module` parses to a `Core.@doc` macrocall with the module as its
+# fourth argument).
+function tl_wrappernames(ex::Expr)
+    out = Symbol[]
+    for st in ex.args
+        st isa Expr || continue
+        m = st.head === :module ? st :
+            (is_doc_expr(st) && st.args[4] isa Expr && (st.args[4]::Expr).head === :module) ?
+                st.args[4]::Expr : nothing
+        m === nothing && continue
+        push!(out, m.args[end-1]::Symbol)   # name precedes the body block
+    end
+    return out
+end
+
+# A module evaluated into `Base.__toplevel__` leaves no binding behind — it is
+# registered in `Base.loaded_modules` under `PkgId(nothing, name)` instead
+# (`Base.register_root_module`, called from `jl_eval_module_expr`). That table
+# is therefore both how the harness retrieves each wrapper after a run and the
+# very table the arm under test resolves against.
+tl_lookup(name::Symbol) =
+    @lock Base.require_lock get(Base.loaded_modules, Base.PkgId(String(name)), nothing)
+
+# The module-tree map for a `__toplevel__` run, rooted at the stable per-wrapper
+# prefix `TL<k>` so the two sides' state maps are keyed identically even though
+# their wrapper *names* differ by construction. A wrapper the run never created
+# (e.g. the interpreted path silently skipped the `module` statement — the
+# historical failure mode, now at the package-resolution seam) shows up as
+# `:__absent_module__` against `:__submodule__`, a value divergence at `TL<k>`.
+function tl_modstate(wnames::Vector{Symbol})
+    out = Dict{String,Any}()
+    for (k, n) in enumerate(wnames)
+        prefix = string("TL", k)
+        m = tl_lookup(n)
+        if m === nothing
+            out[prefix] = :__absent_module__
+        else
+            out[prefix] = :__submodule__
+            modstate!(out, m, prefix, Set{Module}(), 1)
+        end
+    end
+    return out
+end
+
+# Unregister this run's wrapper modules (isolation rule 3). Best-effort: the
+# names are process-unique either way, so a failure here only leaks a dead
+# entry, never corrupts a later case.
+function tl_cleanup(wnames::Vector{Symbol})
+    isdefined(Base, :unreference_module) || return nothing
+    for n in wnames
+        try
+            Base.unreference_module(Base.PkgId(String(n)))
+        catch
+        end
+    end
+    return nothing
+end
+
+# The reference for `__toplevel__` cases: native `Core.eval` into
+# `Base.__toplevel__` per top-level statement — exactly what `include` does when
+# Julia loads a package file. State is collected before cleanup; the observation
+# stream is empty by construction (no `__obs__` above a root module).
+function split_ref_tl(src::String)::SplitOutcome
+    isrc = tl_instantiate(src, "R")
+    ex = Meta.parseall(isrc)::Expr
+    wnames = tl_wrappernames(ex)
+    try
+        for st in ex.args
+            st isa LineNumberNode && continue
+            Core.eval(Base.__toplevel__, st)
+        end
+        return SplitOutcome(:done, :none, Any[], tl_modstate(wnames), "", :none, 0)
+    catch err
+        return SplitOutcome(:threw, scrubexc(err), Any[], tl_modstate(wnames),
+                            shortstr(err), :none, 0)
+    finally
+        tl_cleanup(wnames)
+    end
+end
+
+"""
+    split_interp_tl(src; nstmts, maxfrags, interp) -> SplitOutcome
+
+Drive a `__toplevel__`-parent template through the production path:
+`ExprSplitter(Base.__toplevel__, ex)` — the only construction that reaches
+`find_or_create_module`'s package-resolution arm — then `Frame` per fragment
+under the budgeted executor. Same shape as `split_interp`, but the module tree
+is retrieved through `Base.loaded_modules` (`tl_modstate`) rather than from a
+harness-owned root module.
+"""
+function split_interp_tl(src::String; nstmts::Int, maxfrags::Int,
+                         interp::Interpreter=RecursiveInterpreter())::SplitOutcome
+    isrc = tl_instantiate(src, "I")
+    ex = Meta.parseall(isrc)::Expr
+    wnames = tl_wrappernames(ex)
+    budget = nstmts
+    nfrags = 0
+    try
+        # invokelatest for the same reason as `split_interp`: macro expansion at
+        # construction time, in a world newer than this function's.
+        for (mod, frag) in Base.invokelatest(ExprSplitter, Base.__toplevel__, ex)
+            nfrags += 1
+            nfrags > maxfrags &&
+                return SplitOutcome(:aborted, :none, Any[], Dict{String,Any}(),
+                                    "fragment budget", :none, nfrags)
+            frame = Base.invokelatest(Frame, mod, frag)
+            while true
+                ret, budget = evaluate_limited!(interp, frame, budget, true)
+                ret isa Aborted &&
+                    return SplitOutcome(:aborted, :none, Any[], Dict{String,Any}(),
+                                        "statement budget", :none, nfrags)
+                ret isa Some && break
+                @assert ret === nothing   # paused after a method definition; resume
+            end
+        end
+        return SplitOutcome(:done, :none, Any[], tl_modstate(wnames), "", :none, nfrags)
+    catch err
+        err isa AbortException &&
+            return SplitOutcome(:aborted, :none, Any[], Dict{String,Any}(),
+                                "statement budget", :none, nfrags)
+        site = internalframe(stacktrace(catch_backtrace()))
+        sitename = site === nothing ? :none : Symbol(site[1])
+        loc = site === nothing ? "" : string(" in ", site[1], " (", site[2], ")")
+        return SplitOutcome(:threw, scrubexc(err), Any[], tl_modstate(wnames),
+                            string(nameof(typeof(err)), loc, ": ", shortstr(err)),
+                            sitename, nfrags)
+    finally
+        tl_cleanup(wnames)
+    end
+end
+
+# ---------------------------------------------------------------------------
 # Oracle
 # ---------------------------------------------------------------------------
 
@@ -961,25 +1234,99 @@ function ref_syntax_error(o::SplitOutcome)
     return occursin("syntax:", o.detail) || occursin("not at top level", o.detail)
 end
 
-"""
-    split_case(src; nstmts, maxfrags, interp) -> (Verdict, SplitOutcome, SplitOutcome)
-
-Run one program both ways and classify. Returns `nothing` if the program was
-discarded before comparison (unparseable, or invalid Julia).
-"""
-function split_case(src::String; nstmts::Int=300_000, maxfrags::Int=4000,
-                    interp::Interpreter=RecursiveInterpreter())
+# Parse gate shared by the single- and multi-mode entry points. For
+# `__toplevel__` cases this validates the *template*: the placeholder is an
+# ordinary identifier, so template validity and instantiated validity coincide.
+function split_parsegate(src::String)
     ex = try
         Meta.parseall(src)
     catch
         return nothing
     end
     (ex isa Expr && ex.head === :toplevel) || return nothing
-    ref = split_ref(ex)
+    return ex
+end
+
+# Are all top-level forms `module` blocks (bare or docstring-wrapped)? The
+# `__toplevel__` entry points refuse anything else: a non-module statement at
+# true top level would evaluate into `Base.__toplevel__` *itself* — shared
+# process state both sides would write to. The generator never emits one, but
+# the shrinker's line-level delta debugging can (dropping a `module` line strips
+# the wrapper off its body), so this is enforced at the execution gate: such a
+# variant is a discard, which the shrinker's keep-predicate reads as "edit
+# rejected".
+function tl_moduleonly(ex::Expr)
+    for st in ex.args
+        st isa LineNumberNode && continue
+        st isa Expr || return false
+        st.head === :module && continue
+        (is_doc_expr(st) && st.args[4] isa Expr && (st.args[4]::Expr).head === :module) &&
+            continue
+        return false
+    end
+    return true
+end
+
+"""
+    split_case(src; nstmts, maxfrags, interp, toplevel) -> (Verdict, SplitOutcome, SplitOutcome)
+
+Run one program both ways under a single interpreter configuration and classify.
+`toplevel=true` treats `src` as a `gensplit_toplevel` template and evaluates
+both sides with `Base.__toplevel__` as the parent module (same parent on both
+sides; distinct instantiated wrapper names — see `TL_PLACEHOLDER`). Returns
+`nothing` if the program was discarded before comparison (unparseable, or
+invalid Julia).
+"""
+function split_case(src::String; nstmts::Int=300_000, maxfrags::Int=4000,
+                    interp::Interpreter=RecursiveInterpreter(), toplevel::Bool=false)
+    ex = split_parsegate(src)
+    ex === nothing && return nothing
+    toplevel && !tl_moduleonly(ex) && return nothing
+    ref = toplevel ? split_ref_tl(src) : split_ref(ex)
     ref_syntax_error(ref) && return nothing
-    spl = split_interp(ex; nstmts, maxfrags, interp)
+    spl = toplevel ? split_interp_tl(src; nstmts, maxfrags, interp) :
+                     split_interp(ex; nstmts, maxfrags, interp)
     return (classify_split(ref, spl), ref, spl)
 end
+
+"""
+    split_case_all(src; nstmts, maxfrags, modes, toplevel) -> nothing | (ref, [(mode, SplitOutcome), ...])
+
+Campaign form: one reference run, one interpreted run per mode (`:rec` |
+`:cmp`), the same sharing the differential axis's `run_all` does. Verdicts are
+produced by classifying each `(ref, spl)` pair with `classify_split`.
+"""
+function split_case_all(src::String; nstmts::Int=300_000, maxfrags::Int=4000,
+                        modes::Tuple=(:rec, :cmp), toplevel::Bool=false)
+    ex = split_parsegate(src)
+    ex === nothing && return nothing
+    toplevel && !tl_moduleonly(ex) && return nothing
+    ref = toplevel ? split_ref_tl(src) : split_ref(ex)
+    ref_syntax_error(ref) && return nothing
+    runs = [(m, toplevel ?
+                split_interp_tl(src; nstmts, maxfrags, interp=modeinterp(m)) :
+                split_interp(ex; nstmts, maxfrags, interp=modeinterp(m)))
+            for m in modes]
+    return (ref, runs)
+end
+
+# Fraction of cases constructed with `Base.__toplevel__` as the parent module.
+# Drawn *first* from the case RNG, so it is part of the seed's choice sequence
+# and every case remains a pure function of its seed. A quarter: the
+# `__toplevel__` generator is deliberately narrower (module-shaped top forms
+# only — see `TL_PLACEHOLDER`), so most of the budget stays on the wide-open
+# fresh-module surface; a quarter is still hundreds of package-resolution-arm
+# cases per thousand-case batch, against zero anywhere else in the harness.
+const SPLIT_TL_FRACTION = 0.25
+
+# Fingerprint/report tag per (parent, interpreter-mode) configuration. `:split`
+# is the historical rec/fresh-module tag, so existing findings dirs keep their
+# names; the other three get their own dedup namespaces (a bug that appears in
+# both modes, or under both parents, is the same fingerprint salted apart —
+# exactly how driver.jl separates `:rec` from `:cmp`).
+splitmodetag(toplevel::Bool, mode::Symbol) =
+    toplevel ? (mode === :rec ? :splittl : :splittlcmp) :
+               (mode === :rec ? :split   : :splitcmp)
 
 """
     split_campaign(; n, baseseed, ...) -> Stats
@@ -987,12 +1334,28 @@ end
 Generate adversarial toplevel programs, run each through `Core.eval` and through
 `ExprSplitter` + `Frame`, and report any divergence in failure mode, observation
 stream, or resulting module tree.
+
+Each case runs the interpreted side in *both* interpreter configurations —
+`:rec` (RecursiveInterpreter) and `:cmp` (Compiled mode,
+NonRecursiveInterpreter) — against one shared reference run, mirroring the
+differential axis's `run_all`. Run-both was chosen over a per-case mode draw
+because the marginal cost is small while a draw would halve each mode's
+effective case rate: generation, parsing and the reference run (plus its module
+walk) are shared, and on this axis's definition-heavy programs the two modes'
+interpreted runs differ only where a fragment actually *calls* something —
+toplevel stepping, module creation and method definition take the same path —
+so the second mode costs well under one extra full case. A gated fraction of
+cases (`SPLIT_TL_FRACTION`) is additionally constructed with `Base.__toplevel__`
+as the parent module, the only construction that reaches
+`find_or_create_module`'s package-resolution arm; see `TL_PLACEHOLDER` for the
+isolation contract.
 """
 function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
                         outdir::String=joinpath(@__DIR__, "..", "findings"),
                         journaldir::String=joinpath(@__DIR__, "..", "journal"),
                         cfg::SplitCfg=SplitCfg(), progress::Int=100,
                         seeddisk::Bool=true, journalsync::Bool=true,
+                        modes::Tuple=(:rec, :cmp), tlfraction::Float64=SPLIT_TL_FRACTION,
                         doshrink::Bool=true, shrinkruns::Int=80, shrinksecs::Real=240.0)
     j = Journal(journaldir; sync=journalsync)
     stats = Stats()
@@ -1004,45 +1367,61 @@ function split_campaign(; n::Int=500, baseseed::Int=1, nstmts::Int=300_000,
     try
         for i in 1:n
             seed = baseseed + i - 1
-            src = gensplit(Xoshiro(seed), cfg)
+            rng = Xoshiro(seed)
+            # Parent-module draw first: part of the choice sequence, so the
+            # whole case (parent + program) reproduces from the seed alone.
+            toplevel = rand(rng) < tlfraction
+            src = toplevel ? gensplit_toplevel(rng, cfg) : gensplit(rng, cfg)
             journal_case!(j, seed, src)
             stats.cases += 1
-            r = split_case(src; nstmts, maxfrags=cfg.maxfrags)
+            r = split_case_all(src; nstmts, maxfrags=cfg.maxfrags, modes, toplevel)
             if r === nothing
                 stats.discarded += 1
                 continue
             end
-            v, _ref, spl = r
-            if v.class === :agree
-                stats.agreed += 1
-            elseif v.class === :aborted
-                stats.aborted += 1
-            elseif split_suppressed(v)
-                stats.suppressed += 1
-            else
-                fp = tagfp(:split, fingerprint(v))
-                if fp in seen
-                    stats.duplicates += 1
+            ref, runs = r
+            anyaborted = anyfinding = false
+            for (mode, spl) in runs
+                v = classify_split(ref, spl)
+                if v.class === :agree
+                    continue
+                elseif v.class === :aborted
+                    anyaborted = true
+                elseif split_suppressed(v)
+                    anyfinding = true
+                    stats.suppressed += 1
                 else
-                    push!(seen, fp)
-                    stats.findings += 1
-                    @info "SPLIT FINDING $(v.class)" seed fp nfrags = spl.nfrags detail = first(v.detail, 400)
-                    # This axis generates source text, not Program IR, so
-                    # minimization is the statement-level delta debugger with
-                    # "same fingerprint" as the property.
-                    shrunksrc = if doshrink
-                        keep = s -> begin
-                            r2 = split_case(s; nstmts, maxfrags=cfg.maxfrags)
-                            r2 !== nothing && tagfp(:split, fingerprint(r2[1])) == fp
-                        end
-                        ddmin_source(src, keep;
-                                     budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs))
+                    tag = splitmodetag(toplevel, mode)
+                    fp = tagfp(tag, fingerprint(v))
+                    if fp in seen
+                        anyfinding = true
+                        stats.duplicates += 1
                     else
-                        src
+                        push!(seen, fp)
+                        anyfinding = true
+                        stats.findings += 1
+                        @info "SPLIT FINDING $(v.class)" seed mode toplevel fp nfrags = spl.nfrags detail = first(v.detail, 400)
+                        # This axis generates source text, not Program IR, so
+                        # minimization is the statement-level delta debugger with
+                        # "same fingerprint" as the property — re-run in exactly
+                        # the configuration that found it.
+                        shrunksrc = if doshrink
+                            keep = s -> begin
+                                r2 = split_case(s; nstmts, maxfrags=cfg.maxfrags,
+                                                interp=modeinterp(mode), toplevel)
+                                r2 !== nothing && tagfp(tag, fingerprint(r2[1])) == fp
+                            end
+                            ddmin_source(src, keep;
+                                         budget=ShrinkBudget(; maxruns=shrinkruns, seconds=shrinksecs))
+                        else
+                            src
+                        end
+                        writefinding(outdir, fp, v, seed, src, shrunksrc; mode=tag)
                     end
-                    writefinding(outdir, fp, v, seed, src, shrunksrc; mode=:split)
                 end
             end
+            # Per-case rollup, worst class wins — same as driver.jl's campaign.
+            anyfinding ? nothing : anyaborted ? (stats.aborted += 1) : (stats.agreed += 1)
             if progress > 0 && i % progress == 0
                 @info "split progress" i rate_per_s = round(stats.cases / (time() - t0); digits=2) stats.agreed stats.aborted stats.discarded stats.findings stats.duplicates
             end
