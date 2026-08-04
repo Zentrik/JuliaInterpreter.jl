@@ -24,7 +24,14 @@ function Base.nameof(frame::Frame)
     isa(s, Method) ? s.name : nameof(s)
 end
 
-_Typeof(x) = isa(x, Type) ? Type{x} : typeof(x)
+# `Core.Typeof`, not `isa(x, Type) ? Type{x} : typeof(x)`: the two agree
+# through Julia 1.13, but on 1.14 (TypeEgal, JuliaLang/julia#61915) type-valued
+# arguments dispatch through `Core.TypeEgal` and a hand-built `Type{x}`
+# signature resolves calls like `getproperty(::Type, :name)` to the wrong
+# method (observed: `FieldError: Core.TypeEgal has no field name`, plus
+# mis-dispatch-induced stack overflows). `Core.Typeof` is the dispatch-accurate
+# spelling on every version.
+_Typeof(x) = Core.Typeof(x)
 
 function to_function(@nospecialize(x), world::UInt)
     isa(x, GlobalRef) ? invoke_in_world(world, getglobal, x.mod, x.name) : x

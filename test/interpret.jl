@@ -1838,3 +1838,35 @@ end
     @test (@interpret cbcall(:type, (9, -100))) == (9, -100)
     @test (@interpret cbcall(:conditional, 1)) == 1
 end
+
+@testset "type-valued argument dispatch uses Core.Typeof" begin
+    # `_Typeof` must be `Core.Typeof`, not a hand-built `Type{x}`: through Julia
+    # 1.13 the two agree, but under 1.14's TypeEgal (JuliaLang/julia#61915) a
+    # hand-built `Type{x}` signature resolves calls like
+    # `getproperty(::Type, :name)` to the wrong method — observed as
+    # `FieldError: Core.TypeEgal has no field name` and mis-dispatch-induced
+    # stack overflows on the deprecated `SubString{T}(s, i, j, Val(:noshift))`
+    # path. Found by differential fuzzing on the nightly lane.
+    native = try
+        SubString{String}("abcd", 1, 2, Val(:noshift))
+    catch err
+        err
+    end
+    interp = try
+        @interpret SubString{String}("abcd", 1, 2, Val(:noshift))
+    catch err
+        err
+    end
+    if native isa Exception
+        @test interp isa Exception && typeof(interp) === typeof(native)
+    else
+        @test interp == native
+    end
+    # Dispatch *on* a type value must select the same method as native Julia.
+    dispatch_on_type(::Type{Int}) = 1
+    dispatch_on_type(::Type{<:AbstractString}) = 2
+    dispatch_on_type(@nospecialize(x)) = 3
+    for arg in (Int, String, SubString{String}, 1.0, Union{})
+        @test (@interpret dispatch_on_type(arg)) === dispatch_on_type(arg)
+    end
+end
