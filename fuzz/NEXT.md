@@ -99,7 +99,142 @@ per compiler change — a candidate small fix for a future session.
 
 ---
 
-## Session handoff — 2026-08-04, second session (read this first)
+## Session handoff — 2026-08-04, third session (read this first)
+
+Multi-agent session: five parallel workstreams (triage, probes, grammar,
+split axis, measurements) plus interpreter fixes driven by the triage
+results. Everything is on `claude/false-positive-fussing-improvements-igts2c`
+(selftest **559/559**, `Pkg.test` **1241 pass / 0 fail** on 1.12.6).
+
+### Interpreter bugs fixed (src/, each with a regression test)
+
+1. **`_apply_iterate` Symbol-callee re-resolution** — `src/builtins.jl` +
+   generator template. The expand path QuoteNode-wrapped the splatted
+   arguments but left the evaluated callee bare, so `evaluate_call!`
+   re-resolved a Symbol callee as a *name*: `(:sin)((1.0,)...)` silently
+   returned `sin(1.0)` where native raises MethodError — a silent wrong value
+   on the supported release. Same defect and fix as `_call_latest`
+   (`142a17f7`); the follow-up commit unwraps the QuoteNode in both
+   expanded-builtin recursion helpers so nested *builtin* callees still
+   recurse. From `value_divergence-c6f2ab08` (run #9, pre lane; reproduced on
+   1.12.6 + 1.13-rc1).
+2. **`_Typeof` → `Core.Typeof`** — `src/utils.jl`. On 1.14 (TypeEgal,
+   JuliaLang/julia#61915) the hand-built `Type{x}` signature mis-dispatches
+   `getproperty(::Type, :name)`; 17 nightly-lane findings collapse to this
+   one root cause. Unconditional (suite-verified on 1.12; trigger agrees on
+   1.14-DEV).
+3. **`get_source` generator world-age** — `src/construct.jl`. The
+   `@generated` stub was invoked in the caller's dynamic world instead of the
+   frame's; stepping into a generated function defined after the driver was
+   compiled raised a spurious MethodError. Found by the new `@generated`
+   grammar + `:sg` step walk.
+4. **`test/interpret.jl` was silently truncated** — a missing `end` left the
+   `@static if isdefinedglobal(Core, :invokelatest)` block swallowing every
+   subsequent testset; `Meta.parseall` *embeds* the resulting error as a
+   trailing `:incomplete` node, so the suite ran 285 tests and died on the
+   node, looking like a phantom ParseError. See the new lesson below.
+
+### Harness false-positive classes closed
+
+- **Call axis per-run global reset** (`snapshotglobals`/`restoreglobals!`,
+  callfuzz.jl): the 0-for-6 unreset-global class. World-age gotcha recorded
+  in the code: `names`/`isconst` consult the caller's world and silently miss
+  just-eval'd bindings — every snapshot lookup goes through `invokelatest`.
+- **Corpus frame-introspection filter** (`corpus_ok` rejects
+  stacktrace/backtrace/catch_backtrace/catch_stack/current_exceptions).
+- **`__fjnorm__` String branch** strips the sandbox module prefix AND
+  normalizes `@0x…` heap addresses (both presentations of
+  `step_divergence-7e03896b`), in all three synced copies.
+
+### Surfaces opened
+
+- **Grammar** (`:destr`/`:kwfn`/`:gen` features): destructuring (assignment
+  + argument forms), keyword sorters, pure `@generated` functions —
+  `maybe_step_through_arg_destructuring!` fully hit, `is_indexed_iterate_call`
+  hit, `get_source` 3/4 lines, kwprep warm. Densities 56%/37%/20%; parse-gate
+  discards still 0.
+- **Prober**: all 12 probeable cold arms from coverage-report.md verified hit
+  on 1.12.6 (`_equiv_typedef` recipe-only unban, `atomic_pointermodify`
+  GC-rooted fixed probes); `llvmcall` (measured permanent divergence,
+  documented), `_apply_pure` (not a Builtin on 1.12) and the `kwinvoke` tail
+  (unreachable on 1.12) are closed as non-gaps.
+- **Split axis**: runs both interpreter modes per case, and a gated fraction
+  of cases parent at `Base.__toplevel__` — `find_or_create_module`'s
+  package-resolution arm (previously untested by ANY axis) now exercised
+  under a strict isolation contract. 6000 calibration cases, 0 findings.
+
+### CI / throughput
+
+- Nightly workflow hardened: `timeout -k` per batch, wall-clock backstop on
+  the campaign step, `if: always()` reporting; longrun batches right-sized
+  and timeout-kills no longer pollute the crash journal. **Run #9's nightly
+  lane demonstrated the cost of not having this**: its campaign step failed
+  and every upload was skipped — findings unrecoverable. The scheduled
+  workflow still runs master's copy with the OLD branch pin; merging this
+  branch (or repointing master's pin) is what makes the hardened pipeline
+  and fixed harness live.
+- Dict abort leak re-measured: **gone** (was stale doc); default budget
+  600k confirmed free (0.7% rec aborts, 0.0% throughput). `fuzz/dict-abort-ev-2026-08-04.md`.
+- Step axis parsed every candidate twice; fixed (+8.5%, byte-identical
+  stats). Full stage-cost tables in `fuzz/throughput-report-2026-08-04.md`;
+  the next candidate is a non-specializing `snapshotglobals` copier
+  (~9-10% of the call axis, deepcopy specialization churn) — needs its own
+  correctness testset (aliasing/undef-slot semantics).
+- Mutantbench re-run post-grammar: both step mutants detected@300 in
+  80s/81s (baseline 143s/131s — faster, no yield regression);
+  native-rec baseline unchanged (not-detected@500).
+
+### Triage: every uploaded artifact analyzed (runs #6, #8, #9)
+
+Full reports: `fuzz/triage-report-2026-08-04-nightly.md` (run #8 nightly) and
+`fuzz/triage-report-2026-08-04-lanes.md` (runs #6/#9 1.12+pre). Net: the
+TypeEgal group and `c6f2ab08` became fixes 1-2 above; four historical fixes
+were confirmed still-fixed (the run #6 artifacts predate them — decode the
+seed to get the campaign's SEED_BASE, `1000000 + run_number`, before assuming
+which checkout produced a finding); the rest are the two now-filtered FP
+classes plus the **pure-Julia compiled-vs-runtime class** below.
+`370cc475` deliberately untouched (handled separately).
+
+### Upstream Julia shortlist (pure-Julia; interpreter matches the runtime side)
+
+1. **Bool i1-vs-i8 intrinsic family — silent wrong values in compiled code**:
+   `ctlz_int(::Bool)` (opposite Bool), `sext_int(UInt64, ::Bool)`
+   (`0xffff…` vs `0x1`), `sitofp(Float32, ::Bool)` (`-1.0f0` vs `1.0f0`).
+2. **`_svec_ref` compiled specialization**: wrong exception types, and with
+   Any-typed args UB-flavored garbage payloads (nonsense UndefVarError
+   scopes, `BoundsError` with heap-garbage indices) — memory-safety-suspect.
+3. `checked_udiv_int` / `atomic_fence(:unordered)` exception-type splits.
+4. The 1.12.6 cumulative-heap GC segfault (previous sessions) still wants an
+   rr capture.
+
+### Follow-ups, ranked
+
+1. **Call-axis three-way adjudication** (or probe-exclusion of the known
+   compiled-vs-runtime shapes): the class above re-derives every night until
+   the axis can attribute a divergence to Julia rather than the interpreter —
+   the native axis's `ji.jl` adjudicator is the template.
+2. **Report the upstream shortlist** to JuliaLang/julia.
+3. **Non-specializing snapshot copier** (throughput item above).
+4. **Merge to master / repoint the workflow pin** so nightly CI runs the
+   hardened workflow and the fixed harness (run #9's nightly lane is the
+   standing argument).
+5. Long-horizon items unchanged (coverage stage two, EMI, determinism taint).
+
+### New lesson for the list below
+
+**A "parses OK" check is vacuous unless it inspects the result.**
+`Meta.parseall` does not throw on a parse error — it embeds an
+`Expr(:error, …)`/`Expr(:incomplete, …)` node that throws only when
+*evaluated*, and incremental `Meta.parse` returns `:incomplete` without
+raising. A file with a missing `end` therefore "parses fine" under every
+naive check while `include` runs most of it and dies at the end — which
+mimicked nondeterministic state corruption convincingly enough to burn a
+multi-hour diagnostic chase through GC theories and parser-state theories.
+Check `ast.args` for error/incomplete heads, always.
+
+---
+
+## Session handoff — 2026-08-04, second session
 
 This session worked the previous handoff's follow-up list: false-positive
 sources on the call and corpus axes, the nightly-CI overrun, and repro

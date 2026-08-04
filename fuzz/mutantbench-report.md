@@ -119,14 +119,14 @@ per-mutant env setup (~2 min each).
 
 <!-- mutantbench:matrix -->
 
-_Matrix regenerated 2026-08-03T10:26:50Z from `fuzz/mutantbench-results.tsv`._
+_Matrix regenerated 2026-08-04T10:00:27Z from `fuzz/mutantbench-results.tsv`._
 
 | mutant (revert of) | description | native-rec | step |
 |---|---|---|---|
 | 7194542 | improve stepping behavior (#760) | revert-conflict, skipped | revert-conflict, skipped |
-| beeb4b0 | Fix rec-mode _call_latest/invokelatest on a non-callable first argument | not detected@500 (236s) | — |
-| a3eabb3 | Fix a debugger crash and remove two Compiled-mode class-X probe sources | — | detected@300 (1: step-step_only_throw-88d4b5b2, 143s) |
-| 73d94c4 | Make next_line! stop on assignment-only lines | — | detected@300 (1: step-step_only_throw-bd46d40d, 131s) |
+| beeb4b0 | Fix rec-mode _call_latest/invokelatest on a non-callable first argument | not detected@500 (118s) | — |
+| a3eabb3 | Fix a debugger crash and remove two Compiled-mode class-X probe sources | — | detected@300 (1: step-step_only_throw-88d4b5b2, 80s) |
+| 73d94c4 | Make next_line! stop on assignment-only lines | — | detected@300 (1: step-step_only_throw-bd46d40d, 81s) |
 
 Cells: `detected@N (k: class-fingerprint, secs)` = the axis produced k
 finding(s) within N candidates; `not detected@N` = clean run at that n;
