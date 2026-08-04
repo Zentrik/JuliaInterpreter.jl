@@ -141,6 +141,43 @@ function render(st::St, io::IO, ind::Int)
         else
             println(io, pad, needsglobal ? "global " : "", String(name), " = ", render(st.exs[1]))
         end
+    elseif k === :destructure
+        # `a, b = rhs` — iterated assignment (Base.indexed_iterate lowering).
+        # Reassigning module globals from local scope needs `global`, which
+        # applies to every name on the left (all targets share globality by
+        # construction, see the :destructure rule).
+        names = st.meta[1]::Vector{Symbol}
+        needsglobal = st.meta[4]::Bool
+        println(io, pad, needsglobal ? "global " : "", join(String.(names), ", "),
+                " = ", render(st.exs[1]))
+    elseif k === :gendef
+        # A pure @generated function: the generator branches on the argument
+        # types only and interpolates static values into a trivial body. Two
+        # spelling constraints keep the whole surface steppable:
+        #  - the types are taken through *static parameters* (`where {T, U}`),
+        #    never by inspecting the argument slots: `get_source` invokes the
+        #    generator stub with the arg *names* (placeholder Symbols) and only
+        #    the `env` carries real types, so `a <: Number` would throw
+        #    TypeError the moment a debugger `:sg`s in — `T <: Number` is the
+        #    steppable spelling (test/debug.jl's `generatedparams` pattern);
+        #  - the generated body guards with `a isa Type`: the frame `:sg`
+        #    enters is the generated body with *type-valued* argument slots
+        #    (the stub runs the generator inside get_source and wraps its
+        #    return in a lambda), so `a + b` there would be `+(Int64, Int64)`.
+        #    The guard makes that frame return the baked literal instead —
+        #    total in both worlds. Real calls never pass a Type, so program
+        #    semantics are unchanged. See gengendef (rules.jl).
+        gname, gk, gsym = st.meta
+        n = String(gname)
+        println(io, pad, "@generated function ", n, "(a::T, b::U) where {T, U}")
+        println(io, pad, "    if T <: Number && U <: Number")
+        println(io, pad, "        return :(a isa Type ? ", gk, " : a + b + \$(Int(sizeof(T))) + ", gk, ")")
+        println(io, pad, "    elseif T <: AbstractString")
+        println(io, pad, "        return :(a isa Type ? ", gk, " : length(a) + ", gk, ")")
+        println(io, pad, "    else")
+        println(io, pad, "        return :(:", String(gsym), ")")
+        println(io, pad, "    end")
+        println(io, pad, "end")
     elseif k === :structdef
         s = st.meta::StructT
         println(io, pad, s.ismutable ? "mutable struct " : "struct ", String(s.name))
@@ -285,17 +322,30 @@ function render(st::St, io::IO, ind::Int)
         ndefaults = length(st.meta) >= 7 ? st.meta[7]::Int : 0
         pparts = String[]
         for (i, (pn, ps, typed)) in enumerate(params)
-            base = String(pn) * (typed ? "::" * typename(ps) : "")
-            # trailing `ndefaults` positional params get an Int default
-            if ndefaults > 0 && i > length(params) - ndefaults
+            base = if pn isa Symbol
+                String(pn) * (typed ? "::" * typename(ps) : "")
+            else
+                # destructured tuple parameter: `(a, b)` / `(a, b)::Tuple{...}`
+                # (juliatypestr for the full parameterization, so the annotated
+                # form dispatches on the element types)
+                "(" * join(String.(pn::Vector{Symbol}), ", ") * ")" *
+                    (typed ? "::" * juliatypestr(ps) : "")
+            end
+            # trailing `ndefaults` positional params get an Int default (never
+            # emitted for a destructured param — genfundef guarantees it, and a
+            # scalar default could not be iterated)
+            if ndefaults > 0 && i > length(params) - ndefaults && pn isa Symbol
                 base *= " = 0"
             end
             push!(pparts, base)
         end
         vararg && push!(pparts, String(varargname) * "...")
         plist = join(pparts, ", ")
+        # a kw default is a literal value, or a String of source text (a default
+        # referencing an earlier parameter — the keyword-sorter shape)
         kwlist = isempty(kwparams) ? "" :
-                 "; " * join([String(kn) * " = " * repr(kv) for (kn, kv) in kwparams], ", ")
+                 "; " * join([String(kn) * " = " * (kv isa String ? kv : repr(kv))
+                              for (kn, kv) in kwparams], ", ")
         println(io, pad, "function ", String(name), "(", plist, kwlist, ")")
         renderblock(st.blocks[1], io, ind + 4)
         println(io, pad, "    return ", render(st.exs[1]))

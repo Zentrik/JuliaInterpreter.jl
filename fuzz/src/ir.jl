@@ -45,8 +45,14 @@
 #             toplevel the body is a soft scope, where a bare decrement would
 #             declare a new local and throw UndefVarError instead of counting down
 #   :fundef   meta = (name, params, retsum[, kwparams, vararg::Bool])  exs = [retex]  blocks = [body]
-#             params::Vector{Tuple{Symbol,TySum,Bool}} (name, sum, typed);
-#             kwparams::Vector{Tuple{Symbol,Any}} (name, literal default value)
+#             params::Vector{Tuple{Any,TySum,Bool}} (name, sum, typed); the name is a
+#             Symbol for an ordinary parameter, or a Vector{Symbol} for a
+#             *destructured tuple parameter* `f((a, b), ...)` (sum is then a TupT
+#             with one element per name — the lowering shape that drives
+#             `maybe_step_through_arg_destructuring!`/`is_indexed_iterate_call`)
+#             kwparams::Vector{Tuple{Symbol,Any}} (name, default): the default is a
+#             literal value, or a String of source text (a default referencing an
+#             earlier parameter — the keyword-sorter shape)
 #   :structdef meta = StructT                               (fields with `typed` = fieldsums[i] isa ConcT)
 #   :setprop  meta = (varname, fieldname[, atomic::Bool])   exs = [val]   # mutable struct field write
 #   :amodify  meta = (varname, fieldname, op::Symbol)       exs = [rhs]   # @atomic v.f op= rhs (modifyfield! path)
@@ -74,6 +80,18 @@
 #             proj :whole|:keys|:values|:len — observes a content-comparable
 #             projection of a Dict/Set, so associative iteration/keys/values are
 #             oracle data (values sorted; whole-container normalized by __fjnorm__)
+#   :destructure meta = (names::Vector{Symbol}, sums::Vector{TySum},
+#                        isnew::Bool, needsglobal::Bool)    exs = [rhs]
+#             `a, b = rhs` (tuple-destructuring assignment; `global a, b = rhs`
+#             when reassigning module globals from local scope). rhs is a TupT
+#             expression with one element summary per name. The iterated-assignment
+#             lowering (`indexed_iterate`) is the surface this exists for.
+#   :gendef   meta = (name::Symbol, k::Int, sym::Symbol)
+#             a simple pure `@generated function name(a, b)` whose generator
+#             builds the body from the argument *types* only (interpolating the
+#             literal `k` and a type-derived static value); `sym` is the inert
+#             Symbol the fallback branch returns. Total for any argument types,
+#             calls no user code — termination-by-construction is preserved.
 
 struct Ex
     kind::Symbol
@@ -157,6 +175,11 @@ function refs!(out::Set{Symbol}, st::St)
         push!(out, st.meta[2]::Symbol)
     elseif st.kind === :setprop || st.kind === :amodify || st.kind === :dictobs
         push!(out, st.meta[1]::Symbol)
+    elseif st.kind === :destructure && !(st.meta[3]::Bool)
+        # a reassigning destructure *references* its targets (they must stay bound)
+        for n in st.meta[1]::Vector{Symbol}
+            push!(out, n)
+        end
     end
     for e in st.exs
         refs!(out, e)
@@ -170,8 +193,9 @@ end
 # Names a statement *binds* for following statements in the same block.
 function binds(st::St)
     st.kind === :assign && (st.meta[3]::Bool) && return Symbol[st.meta[1]]
+    st.kind === :destructure && (st.meta[3]::Bool) && return copy(st.meta[1]::Vector{Symbol})
     st.kind === :alias && return Symbol[st.meta[1]]
-    (st.kind === :fundef || st.kind === :recdef) && return Symbol[st.meta[1]]
+    (st.kind === :fundef || st.kind === :recdef || st.kind === :gendef) && return Symbol[st.meta[1]]
     st.kind === :structdef && return Symbol[(st.meta::StructT).name]
     st.kind === :typedlocal && return Symbol[st.meta[1]]
     st.kind === :maybeundef && return Symbol[st.meta::Symbol]

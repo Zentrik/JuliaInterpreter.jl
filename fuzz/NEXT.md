@@ -14,6 +14,91 @@ landed**: the confirm-on-divergence gate and `fuzz/triage.jl`. Item 2
 
 ---
 
+## Session handoff — 2026-08-04, third session (grammar gaps; read this first)
+
+This session closed the three cold-evidence grammar gaps from
+`coverage-report.md`'s last table (NEXT.md item 2's findings): destructuring,
+keyword sorters, and `@generated` functions. Each is gated behind a new swarm
+feature (`:destr`, `:kwfn`, `:gen`) with default densities high enough that a
+default-policy program has a real chance of containing each.
+
+1. **Destructuring** (`:destr`). (a) A `:destructure` statement rule —
+   `a, b = <tuple expr>` — in local and toplevel scope, both fresh-binding and
+   reassignment forms; reassignment picks only same-globality non-growable
+   scalar targets (`global a, b = rhs` cannot express mixed globality, and the
+   growable-feedback safety property is kept trivially). (b) Destructured
+   tuple parameters in `genfundef` — `f((a, b), x)`, optionally
+   `::Tuple{...}`-annotated — the shape whose `indexed_iterate` preamble
+   drives `maybe_step_through_arg_destructuring!`/`is_indexed_iterate_call`.
+   Call sites need nothing new: the signature records a TupT, so every caller
+   already passes an appropriately-shaped tuple.
+2. **Keyword sorters** (`:kwfn`). Kw methods are more frequent/numerous under
+   the feature, and a kw default may reference an *earlier parameter* (an Int
+   positional param or an earlier kw — never a destructured element name:
+   those are bound in the body, not the sorter; verified, it throws
+   UndefVarError). `:kwcall` now draws all-kw / no-kw / subset call shapes
+   explicitly — the no-kw path through a kw method is its own lowering shape
+   (`maybe_step_through_kwprep!`'s `pairs(NamedTuple())` branch).
+3. **`@generated`** (`:gen`). A pure template (`gengendef`): the generator
+   branches on argument types and interpolates literals + `sizeof(T)`.
+   Guaranteed observed call sites are appended to `mid`. Two spelling
+   constraints worth remembering (both bit this session): the generator must
+   read types via **static parameters** (`where {T, U}`) because `get_source`
+   invokes the stub with the arg *names* (Symbols) and only `env` carries
+   types; and the generated body must guard with `a isa Type` because the
+   frame `:sg` enters is the *generated body on type-valued slots*. The step
+   walk now draws `:sg` as a low-probability variant of `:s`; a walk that
+   entered a generator frame sets `StepOutcome.ingen` and stands the value
+   oracle down (the generator's return legitimately replaces the call value).
+   Also note the shrink-direction gotcha: the gendef gate is spelled
+   `rand(rng) > 0.70` because Supposition shrinks draws toward 0 — spelled
+   `< 0.30` the shrinker pinned a gendef into every minimal program and
+   regressed the selftest's shrink-floor canary from 10 to 12.
+
+**Real interpreter bug found and fixed** (by the new grammar + `:sg` walks):
+`get_source(::GeneratedFunctionStub, ...)` invoked the stub in the caller's
+*dynamic* world, ignoring the `world` argument it was handed. Any debugger
+session whose driving code was compiled before the `@generated` function was
+defined (`Core.eval`'d mid-session) got a spurious
+`MethodError: no method matching (generator)` on `:sg`. Fixed with
+`invoke_in_world(world, g, ...)` (src/construct.jl), the same pattern the rest
+of the package uses; regression test in test/debug.jl's "generated" testset
+(`stale_world_sg`).
+
+Numbers (julia 1.12.6): selftest **501/501** (three new testsets: generation
+floors, hand-built agreement incl. stepping walks, generator-entry). Blended
+default-policy rates at 400 seeds: destructure 56%, destrparam 22%,
+kwfundef 37%, kw-ref-default 17%, gendef 20%. Program size moved
+34.4 → 36.6 statements (mean). Parse/lowering gate: **0 discards in 400
+seeds** (and 0/200 on every policy) before and after. Smokes: native 300/300
+agreed (both modes), step 200/200 agreed, `:sg` included — 0 findings.
+
+Coverage before/after (before = the committed `coverage-report.md`, 1.11.9,
+4000 runs, 5 engines; after = 800 candidate-runs, native+step rec, 1.12.6):
+
+- `maybe_step_through_arg_destructuring!` (323–372): 10 hit / 26 cold (the
+  whole destructuring loop) → **fully hit**.
+- `is_indexed_iterate_call`: never-hit → **hit**.
+- `get_source(::GeneratedFunctionStub)`: never-hit → **3 of 4 lines hit**
+  (only the `eval(b)` fallback stays cold; generators return CodeInfo here).
+- `maybe_step_through_kwprep!` (main def): partially hit both sides; the
+  1.12-only tuple-detection branch now runs, and the NamedTuple/apply_type
+  branch is warm. The deep advance/no-kw sub-branches were cold in this
+  modest sample but are confirmed reachable (a single `:s` into a method
+  making a kw call parks directly on the `Core.kwcall` statement).
+- Bonus: `prepare_framecode`'s generated arms (`get_staged`) down to 2 cold
+  lines; `maybe_step_through_wrapper!` down to 3.
+
+Follow-up worth knowing: on 1.12 a **toplevel** kw call lowers its names
+tuple as `Core.tuple(:kw1)` (a call) rather than the literal
+`(:kw1,)` tuple `maybe_step_through_kwprep!` pattern-matches, so at toplevel
+the prep-skip does not engage and `:s` can pause inside the NamedTuple
+constructor. Method-scope kw calls match fine. Cosmetic stepping-UX gap in
+the interpreter, in the function whose own comment says it must be re-tweaked
+per compiler change — a candidate small fix for a future session.
+
+---
+
 ## Session handoff — 2026-08-04, second session (read this first)
 
 This session worked the previous handoff's follow-up list: false-positive
@@ -724,19 +809,21 @@ side.)
 
 ### Still-open grammar gaps
 
-From earlier waves, never closed: destructuring, `do` blocks, `@generated`
-functions, parametric structs, inner constructors, defaults referencing
-earlier parameters.
+From earlier waves: destructuring, `do` blocks, `@generated` functions,
+parametric structs, inner constructors, defaults referencing earlier
+parameters.
 
-Item 2 now answers which of them matter, and the answer is in
-`coverage-report.md`'s last table rather than in this list: **destructuring**,
-**`@generated`** and **keyword sorters** each leave a specific interpreter
-function with zero executed lines, **`do` blocks** have no distinct
-interpreter surface to leave cold, and **parametric structs / inner
-constructors** are mostly already reached by other constructs (all the
-`Core._structtype`/`_typevar`/`apply_type` arms are hit) — so that one buys
-new inputs rather than new paths. Re-run `fuzz/coverage.jl` after closing any
-of them: the report is the regression check.
+Item 2 answered which of them matter (`coverage-report.md`'s last table), and
+the third 2026-08-04 session **closed the three that had cold evidence**:
+destructuring (assignment + method arguments), keyword sorters (defaults
+referencing earlier parameters, explicit no-kw call shapes) and `@generated`
+functions (plus `:sg` in the step walk) — see that session's handoff above.
+Still open, deliberately: **`do` blocks** have no distinct interpreter surface
+to leave cold, and **parametric structs / inner constructors** are mostly
+already reached by other constructs (all the
+`Core._structtype`/`_typevar`/`apply_type` arms are hit) — both buy new
+inputs rather than new paths. Re-run `fuzz/coverage.jl` after closing any
+gap: the report is the regression check.
 
 ---
 

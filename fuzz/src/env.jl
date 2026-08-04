@@ -70,7 +70,14 @@ const SWARMABLE = (:if, :for, :while, :let, :try, :push, :setindex, :alias, :set
                    # determinism unlocks (determinism.md §3/§4): explicit-RNG draws,
                    # content-keyed Dict/Set, and the virtual clock, each maskable so
                    # a program that targets them isn't diluted by everything else.
-                   :rng, :dict, :vtime)
+                   :rng, :dict, :vtime,
+                   # grammar-gap closers (coverage-report.md's cold-evidence gaps):
+                   # tuple destructuring (assignment + method arguments,
+                   # `is_indexed_iterate_call`/`maybe_step_through_arg_destructuring!`),
+                   # richer keyword sorters (defaults referencing earlier params,
+                   # `maybe_step_through_kwprep!`), and simple pure `@generated`
+                   # functions (`get_source` on a GeneratedFunctionStub).
+                   :destr, :kwfn, :gen)
 
 const POLICIES = (
     :uniform,    # no skew — keeps the historical distribution in the mix
@@ -89,10 +96,10 @@ const POLICY_BOOST = Dict{Symbol,Dict{Symbol,Float64}}(
                         :for => 2.0, :while => 2.0, :guardix => 2.0, :guarddiv => 2.0,
                         :badcall => 2.0),
     :dispatch   => Dict(:callfn => 4.0, :kwcall => 4.0, :badcall => 4.0, :callvar => 3.0,
-                        :closure => 3.0),
+                        :closure => 3.0, :destructure => 2.0),
     :builtins   => Dict(:builtin => 8.0, :amodify => 4.0, :setprop => 2.0),
     :toplevel   => Dict(:maybeundef => 4.0, :loopundef => 4.0, :typedlocal => 3.0,
-                        :reassign => 2.0),
+                        :reassign => 2.0, :destructure => 3.0),
     :mutation   => Dict(:push => 3.0, :setindex => 3.0, :alias => 4.0, :setprop => 3.0,
                         :amodify => 3.0, :compr => 2.0),
     # RNG draws (int/float/bool), the vtime clock, and every Dict/Set rule

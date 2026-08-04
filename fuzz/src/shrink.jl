@@ -59,7 +59,13 @@ function allbound!(out::Set{Symbol}, st::St)
     end
     if st.kind === :fundef
         for (pn, _, _) in st.meta[2]
-            push!(out, pn)
+            if pn isa Symbol
+                push!(out, pn)
+            else                       # destructured tuple parameter
+                for n in pn::Vector{Symbol}
+                    push!(out, n)
+                end
+            end
         end
         if length(st.meta) >= 5 && st.meta[5]::Bool     # vararg name
             push!(out, st.meta[6]::Symbol)
@@ -83,6 +89,10 @@ function allbound!(out::Set{Symbol}, st::St)
         push!(out, st.meta[1])
     elseif st.kind === :assign   # any assignment can (re)create a local
         push!(out, st.meta[1])
+    elseif st.kind === :destructure   # ditto, for every name on the left
+        for n in st.meta[1]::Vector{Symbol}
+            push!(out, n)
+        end
     elseif st.kind === :structdef
         push!(out, (st.meta::StructT).name)
     elseif st.kind === :typedlocal

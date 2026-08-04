@@ -259,8 +259,15 @@ function genex_inner(ctx::Ctx, want::TySum)::Ex
         f = pick(rng, cands)
         sig = f.sigs[1]
         args = Ex[genex(ctx, p isa AnyT ? anyargsum(ctx) : p) for p in sig]
-        # pass a random subset of declared kwargs (all default to Int)
-        chosen = [kw for kw in f.kwnames if rand(rng, Bool)]
+        # Pass all / none / a random subset of the declared kwargs. All three
+        # call shapes lower differently — the kw-omitting call through a kw
+        # method runs the defaults in the sorter (the `pairs(NamedTuple())`
+        # prep maybe_step_through_kwprep! pattern-matches), so it is kept as an
+        # explicit branch rather than left to the subset draw's 2^-n tail.
+        r = rand(rng)
+        chosen = r < 0.30 ? Symbol[] :
+                 r < 0.60 ? copy(f.kwnames) :
+                 [kw for kw in f.kwnames if rand(rng, Bool)]
         for kw in chosen
             push!(args, genex(ctx, IntT))
         end
@@ -538,6 +545,12 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         anyset && push!(opts, (0.6, :setpush))
         allowobs && (anydict || anyset) && push!(opts, (0.7, :dictobs))
     end
+    # tuple-destructuring assignment (grammar-gap closer, coverage-report.md):
+    # `a, b = <tuple expr>` in whatever scope this statement lands in. Drives
+    # Julia's iterated-assignment lowering (Base.indexed_iterate) — the surface
+    # behind is_indexed_iterate_call, and the value-side twin of the
+    # destructured-argument shape genfundef emits.
+    swarmon(ctx, :destr) && push!(opts, (0.9, :destructure))
     # control-flow exits; break/continue through try/finally is the :enter/:leave
     # and exception-frame-unwinding surface
     ctx.loopdepth > 0 && push!(opts, (1.0, :brk), (0.8, :cont))
@@ -725,7 +738,53 @@ function genstmt(ctx::Ctx; allowobs::Bool=true, blockdepth::Int=0)::St
         rhs = genex(ctx, s)
         name = freshname(ctx, "t")
         st = St(:typedlocal, (name, s); exs=[rhs])
-        declare!(ctx, VInfo(name, s))
+        # NOT declare!: the rendered statement says `local`, so the binding is a
+        # local wherever it sits — including inside a toplevel `if`, where
+        # declare!'s no-runtime-scope inference would record it as a global.
+        # That lie made a later global-qualified write (`global t = ...` from
+        # :reassign, or `global t, x = ...` from :destructure) render in the
+        # same block and fail lowering with "declared both local and global".
+        push!(ctx.scopes[end], VInfo(name, s))
+        return st
+    elseif kind === :destructure
+        # Reassignment-destructure over existing bindings ~1/3 of the time when
+        # enough same-globality scalar targets exist (mixed globality would need
+        # per-name `global`, which `global a, b = rhs` cannot express); fresh
+        # bindings otherwise — locals in runtime-local scope, module globals at
+        # toplevel, exactly the isglobal logic :assignnew relies on (declare!).
+        # Targets are restricted to non-growable ConcT so a reassignment running
+        # in a loop or oft-called function cannot feed a growable binding back
+        # into itself (the :reassign rule's safety property, kept trivially).
+        cands = [v for v in reassign_targets(ctx) if v.sum isa ConcT && !growablevar(v)]
+        glob = [v for v in cands if v.isglobal]
+        loc = [v for v in cands if !v.isglobal]
+        grp = length(glob) >= 2 && length(loc) >= 2 ? (rand(rng, Bool) ? glob : loc) :
+              length(glob) >= 2 ? glob : loc
+        if length(grp) >= 2 && rand(rng) < 0.35
+            k = min(rand(rng, 2:3), length(grp))
+            idxs = collect(eachindex(grp))
+            targets = VInfo[]
+            for _ in 1:k
+                j = rand(rng, 1:length(idxs))
+                push!(targets, grp[idxs[j]])
+                deleteat!(idxs, j)
+            end
+            sums = TySum[t.sum for t in targets]
+            rhs = genex(ctx, TupT(sums))
+            # Writing module globals from local scope needs the `global` keyword,
+            # same as :reassign; all targets share isglobal by construction.
+            needsglobal = targets[1].isglobal && inlocal(ctx)
+            return St(:destructure, (Symbol[t.name for t in targets], sums, false, needsglobal);
+                      exs=[rhs])
+        end
+        k = rand(rng, 2:3)
+        sums = TySum[pick(rng, CONCRETE_MENU) for _ in 1:k]
+        rhs = genex(ctx, TupT(sums))
+        names = Symbol[freshname(ctx, "d") for _ in 1:k]
+        st = St(:destructure, (names, sums, true, false); exs=[rhs])
+        for (n, s) in zip(names, sums)
+            declare!(ctx, VInfo(n, s))
+        end
         return st
     elseif kind === :dictset
         cands = [v for v in visiblevars(ctx) if v.sum isa DictT]
@@ -802,22 +861,53 @@ function genfundef(ctx::Ctx)::St
     end
     name = freshname(ctx, "f")
     nparams = rand(rng, 0:3)
-    params = Tuple{Symbol,TySum,Bool}[]
+    params = Tuple{Any,TySum,Bool}[]
     for i in 1:nparams
+        # Destructured tuple parameter `f((a, b), ...)` — the method-entry
+        # destructuring shape whose indexed_iterate preamble drives
+        # maybe_step_through_arg_destructuring! when a debugger steps in.
+        # Gated by the :destr swarm feature. Call sites need no special
+        # handling: the signature records a TupT, so :callfn/:kwcall/:badcall
+        # all pass an appropriately-shaped tuple already.
+        if swarmon(ctx, :destr) && rand(rng) < 0.22
+            k = rand(rng, 2:3)
+            elems = TySum[pick(rng, CONCRETE_MENU) for _ in 1:k]
+            push!(params, (Symbol[freshname(ctx, "da") for _ in 1:k], TupT(elems),
+                           rand(rng, Bool)))
+            continue
+        end
         s = boundarysum(ctx)
         typed = annotatable(s) && rand(rng, Bool)
         push!(params, (freshname(ctx, "a"), s, typed))
     end
-    # optional positional default on the last param (Int-valued)
-    ndefaults = (nparams > 0 && rand(rng) < 0.25) ? 1 : 0
+    # optional positional default on the last param (Int-valued) — never on a
+    # destructured parameter (a scalar default cannot be iterated)
+    ndefaults = (nparams > 0 && params[end][1] isa Symbol && rand(rng) < 0.25) ? 1 : 0
     # optional trailing vararg
     vararg = rand(rng) < 0.2
     varargname = vararg ? freshname(ctx, "va") : :_
-    # optional keyword params (all Int, with defaults)
+    # optional keyword params (Int-summarized, with defaults). Under the :kwfn
+    # swarm feature kwargs are more frequent, more numerous, and a default may
+    # reference an *earlier parameter* — the keyword-sorter lowering shape
+    # (defaults evaluated in the sorter, maybe_step_through_kwprep!'s surface).
+    # Only ordinary Int positional params and earlier kw names are referenceable:
+    # destructured element names are bound in the body, not the sorter (verified —
+    # referencing one throws UndefVarError), and a default must never call user
+    # code (the sorter would run it on every kw-omitting call — termination).
     kwparams = Tuple{Symbol,Any}[]
-    if rand(rng) < 0.3
-        for _ in 1:rand(rng, 1:2)
-            push!(kwparams, (freshname(ctx, "kw"), rand(rng, -5:5)))
+    kwrate = swarmon(ctx, :kwfn) ? 0.5 : 0.3
+    if rand(rng) < kwrate
+        intrefs = Symbol[pn for (pn, ps, _) in params if pn isa Symbol && ps == IntT]
+        for _ in 1:rand(rng, 1:(swarmon(ctx, :kwfn) ? 3 : 2))
+            kn = freshname(ctx, "kw")
+            default = if swarmon(ctx, :kwfn) && !isempty(intrefs) && rand(rng) < 0.45
+                r = pick(rng, intrefs)
+                rand(rng, Bool) ? String(r) : string(r, " + ", rand(rng, 1:3))
+            else
+                rand(rng, -5:5)
+            end
+            push!(kwparams, (kn, default))
+            push!(intrefs, kn)   # later kw defaults may reference earlier kws
         end
     end
     retsum = boundarysum(ctx)
@@ -829,7 +919,14 @@ function genfundef(ctx::Ctx)::St
     wasinfunc, wasret, wasloop = ctx.infunc, ctx.retsum, ctx.loopdepth
     ctx.infunc = true
     for (pn, ps, _) in params
-        declare!(ctx, VInfo(pn, ps))
+        if pn isa Symbol
+            declare!(ctx, VInfo(pn, ps))
+        else
+            # destructured tuple parameter: the element names are the bindings
+            for (n, es) in zip(pn::Vector{Symbol}, (ps::TupT).elts)
+                declare!(ctx, VInfo(n, es))
+            end
+        end
     end
     vararg && declare!(ctx, VInfo(varargname, TupT(TySum[])))  # a Tuple; only used opaquely
     for (kn, _) in kwparams
@@ -852,6 +949,26 @@ function genfundef(ctx::Ctx)::St
     push!(ctx.fns, fi)
     return St(:fundef, (name, params, retex.sum, kwparams, vararg, varargname, ndefaults);
               exs=[retex], blocks=[body])
+end
+
+# A simple, PURE `@generated` function (grammar-gap closer: `get_source` on a
+# GeneratedFunctionStub, the generated arms of `prepare_framecode`/`get_staged`,
+# and `debug_command(:sg)`). The generator body inspects only the argument
+# *types* and builds a trivial expression from them, interpolating a literal
+# baked at generation time plus a type-derived static value (`sizeof(a)` — the
+# arguments the program can pass in the Number branch are Int64/Float64/Bool,
+# all with definite sizes). Every branch is total for any argument type the
+# generator can produce, calls no user code, and the generator itself is a pure
+# deterministic function of the types — bit-identical on both engines, and
+# termination-by-construction is untouched. Registered like any other FnInfo so
+# :callfn/:badcall reach it; genprogram additionally emits guaranteed observed
+# call sites (see there).
+function gengendef(ctx::Ctx)::St
+    name = freshname(ctx, "gg")
+    k = rand(ctx.rng, 1:9)
+    sym = pick(ctx.rng, [:ga, :gb, :gc])
+    push!(ctx.fns, FnInfo(name, [TySum[AnyT(), AnyT()]], AnyT()))
+    return St(:gendef, (name, k, sym))
 end
 
 # A struct or mutable struct definition. Fields are concrete-summarized so
@@ -989,6 +1106,55 @@ function genprogram(ctx::Ctx)::Program
             st === nothing || push!(fundefs, st)
         end
     end
+    # A pure @generated function (grammar gap: the generated-function entry
+    # paths — get_source, get_staged, the genframedict cache). Guaranteed
+    # observed call sites are appended to `mid` below: relying on :callfn draws
+    # alone would leave many gendef programs never *expanding* the generator,
+    # and the expansion is the whole point. Args are leaves of anyargsum shapes,
+    # so distinct type combinations trigger distinct specializations.
+    # (`> 0.70`, not `< 0.30`: choice-sequence shrinking drives draws toward 0,
+    # and the shrunk direction must REMOVE the construct — spelled `< 0.30` the
+    # supposition shrinker would pin a gendef into every minimal program, which
+    # regressed the selftest's shrink-floor canary from 10 to 12.)
+    gencalls = St[]
+    if swarmon(ctx, :gen) && rand(rng) > 0.70
+        gd = gengendef(ctx)
+        push!(fundefs, gd)
+        gname = (gd.meta[1])::Symbol
+        for _ in 1:rand(rng, 1:2)
+            args = Ex[genleaf(ctx, anyargsum(ctx)) for _ in 1:2]
+            push!(gencalls, St(:observe; exs=[Ex(:call, AnyT(), gname, args)]))
+        end
+    end
+    # Guaranteed observed call sites for the other two grammar-gap method
+    # shapes, same rationale as the gendef calls above: a destructured-param or
+    # kw-carrying method that is never *called where a walk steps* leaves
+    # maybe_step_through_arg_destructuring!/is_indexed_iterate_call and the
+    # kwsorter paths cold (measured: 121 step walks entered 109 methods at
+    # pc==1, none of them a destructured one). Guarded, so a throwing body
+    # becomes oracle data instead of truncating the program. Kw methods get
+    # both call shapes — all-kw and no-kw — because they lower differently.
+    for fd in fundefs
+        fd.kind === :fundef || continue
+        length(gencalls) >= 6 && break        # bound program growth
+        name, params = fd.meta[1], fd.meta[2]
+        kwnames = Symbol[kn for (kn, _) in fd.meta[4]]
+        hasdestr = any(p -> !(p[1] isa Symbol), params)
+        (hasdestr || !isempty(kwnames)) || continue
+        mkargs() = Ex[genleaf(ctx, p[2] isa AnyT ? anyargsum(ctx) : p[2]) for p in params]
+        if hasdestr
+            push!(gencalls, St(:observe;
+                exs=[Ex(:guard, AnyT(), nothing, [Ex(:call, AnyT(), name, mkargs())])]))
+        end
+        if !isempty(kwnames)
+            kwargs = vcat(mkargs(), Ex[genleaf(ctx, IntT) for _ in kwnames])
+            push!(gencalls, St(:observe;
+                exs=[Ex(:guard, AnyT(), nothing,
+                        [Ex(:kwcall, AnyT(), (name, copy(kwnames)), kwargs)])]))
+            push!(gencalls, St(:observe;
+                exs=[Ex(:guard, AnyT(), nothing, [Ex(:call, AnyT(), name, mkargs())])]))
+        end
+    end
     # mid: bare toplevel statements (exercise the toplevel-frame path directly,
     # not the `let`-wrapped one). Assignments here create module globals.
     # blockdepth 1 (was a flat 2): a toplevel `for`/`if`/`try` is one
@@ -1004,6 +1170,7 @@ function genprogram(ctx::Ctx)::Program
         end
         push!(mid, st)
     end
+    append!(mid, gencalls)   # the guaranteed @generated call sites (see above)
     # body: the `let` block. That `let` is a real runtime scope, so bindings
     # made here are locals, not globals — without counting it, a `while` in the
     # body would emit `global fuel -= 1` for a variable that is local to the

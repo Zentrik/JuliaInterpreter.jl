@@ -102,6 +102,16 @@ function scan!(counts, sts; infunc=false, inloop=false, intry=false)
         for e in st.exs
             scanex!(counts, e)
         end
+        # grammar-gap closers: destructured method parameters, kw-carrying
+        # methods and param-referencing kw defaults live inside :fundef meta,
+        # so statement-kind counting alone would report them as absent.
+        if k === :fundef
+            any(p -> !(p[1] isa Symbol), st.meta[2]) && (counts[:destrparam] += 1)
+            if length(st.meta) >= 4 && !isempty(st.meta[4])
+                counts[:kwfundef] += 1
+                any(kv -> kv[2] isa String, st.meta[4]) && (counts[:kwrefdefault] += 1)
+            end
+        end
         infunc && k in CTRL && (counts[:ctrl_in_fn] += 1)
         inloop && k === :try && (counts[:try_in_loop] += 1)
         infunc && inloop && k === :try && (counts[:try_in_loop_in_fn] += 1)
@@ -121,6 +131,8 @@ const TRACKED = (:try, :for, :while, :if, :let, :fundef, :recdef, :structdef, :a
                  :compr, :push, :setindex,
                  # determinism unlocks (determinism.md §3/§4)
                  :rng, :vtime, :dictlit, :setlit, :dictset, :dictdel, :setpush, :dictobs,
+                 # grammar-gap closers: destructuring, kw sorters, @generated
+                 :destructure, :destrparam, :kwfundef, :kwrefdefault, :gendef,
                  # expression-level constructs (counted via scanex!)
                  :builtin, :guard, :callfn, :callvar, :kwcall, :closure, :closuremut, :call,
                  :ctrl_in_fn, :try_in_loop, :try_in_loop_in_fn, :exit_through_try)
