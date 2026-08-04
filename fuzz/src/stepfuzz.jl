@@ -64,10 +64,17 @@ struct StepOutcome
     site::Symbol        # innermost JuliaInterpreter function in the backtrace (:none if absent)
     excname::Symbol     # exception type (:none unless status === :threw)
     nbp::Int            # breakpoint actions performed during the walk
+    ingen::Bool         # a `:sg` landed in a @generated function's *generator*
+                        # frame: by design the generator's returned expression
+                        # then becomes the call's value, so the stepped program
+                        # legitimately computes something different from plain
+                        # interpretation — obs/exception comparison is unsound
+                        # for this walk (termination/stuck invariants still hold)
 end
-StepOutcome(status, obs, detail, n, cmds) = StepOutcome(status, obs, detail, n, cmds, :none, :none, 0)
-StepOutcome(status, obs, detail, n, cmds, site) = StepOutcome(status, obs, detail, n, cmds, site, :none, 0)
-StepOutcome(status, obs, detail, n, cmds, site, excname) = StepOutcome(status, obs, detail, n, cmds, site, excname, 0)
+StepOutcome(status, obs, detail, n, cmds) = StepOutcome(status, obs, detail, n, cmds, :none, :none, 0, false)
+StepOutcome(status, obs, detail, n, cmds, site) = StepOutcome(status, obs, detail, n, cmds, site, :none, 0, false)
+StepOutcome(status, obs, detail, n, cmds, site, excname) = StepOutcome(status, obs, detail, n, cmds, site, excname, 0, false)
+StepOutcome(status, obs, detail, n, cmds, site, excname, nbp) = StepOutcome(status, obs, detail, n, cmds, site, excname, nbp, false)
 
 # Did this exception come from JuliaInterpreter itself, rather than from the
 # interpreted program? Program-thrown exceptions are expected (the grammar
@@ -266,8 +273,9 @@ function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds
     noops = 0
     lastcmd = :none
     drained = false
+    ingen = false
     while true
-        n >= maxcmds && return (:budget, n, :none)
+        n >= maxcmds && return (:budget, n, :none, ingen)
         if bpd !== nothing && !drained
             if n > 0.8 * maxcmds
                 # Entering the drain phase: silence every pause source so the
@@ -296,19 +304,28 @@ function walkframe!(rng::AbstractRNG, interp::Interpreter, frame::Frame, maxcmds
         # program with deep call nesting would otherwise spend the whole budget
         # there.
         cmd = n > 0.8 * maxcmds ? pick(rng, DRAIN_COMMANDS) : pick(rng, STEP_COMMANDS)
+        # `:sg` steps into the *generator* of a @generated callee — the
+        # enter_generated=true path (get_source on a GeneratedFunctionStub,
+        # prepare_framecode's generator arm). On a non-generated callee it is
+        # exactly `:s` (`enter_generated &= is_generated`), so drawing it as a
+        # low-probability variant of `:s` leaves plain programs unaffected.
+        cmd === :s && rand(rng) < 0.15 && (cmd = :sg)
         # `:until` takes a line number; nothing means "the line after this one".
         ret = cmd === :until && rand(rng) < 0.5 ?
               debug_command(interp, fr, cmd, true; line=rand(rng, 1:40)) :
               debug_command(interp, fr, cmd, true)
         n += 1
-        ret === nothing && return (:done, n, :none)
+        ret === nothing && return (:done, n, :none, ingen)
         # Continue from wherever the command left execution: a callee frame
         # after stepping in, the caller after finishing, or a breakpoint pause.
         fr, pc = ret
+        # Landing in a generator frame poisons the value comparison for the
+        # whole walk (see StepOutcome.ingen); record it for the classifier.
+        fr.framecode.generator && (ingen = true)
         state = (objectid(fr.framecode), fr.pc)
         if state == laststate && !isa(pc, BreakpointRef)
             noops += 1
-            noops >= STUCK_LIMIT && return (:stuck, n, lastcmd)
+            noops >= STUCK_LIMIT && return (:stuck, n, lastcmd, ingen)
         else
             noops = 0
         end
@@ -336,6 +353,7 @@ function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveI
     m = freshmodule()
     cmds = Symbol[]
     total = 0
+    anyingen = false
     bpd = usebreakpoints ? BpDriver(m, 0.04, 0, 0) : nothing
     try
         if usebreakpoints
@@ -351,23 +369,26 @@ function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveI
             # it is the natural moment for a user to set a breakpoint on one.
             bpd !== nothing && rand(rng) < 0.3 && bpaction!(rng, bpd)
             frame = Frame(mod, frag)
-            status, n, stuckcmd = walkframe!(rng, interp, frame, maxcmds - total, bpd)
+            status, n, stuckcmd, ingen = walkframe!(rng, interp, frame, maxcmds - total, bpd)
             total += n
+            anyingen |= ingen
             if status === :stuck
                 return StepOutcome(:stuck, getobs(m),
                                    "`:$stuckcmd` left execution at the same (framecode, pc) " *
                                    "$STUCK_LIMIT times in a row after $total commands",
-                                   total, cmds, stuckcmd, :none, bpd === nothing ? 0 : bpd.nset)
+                                   total, cmds, stuckcmd, :none, bpd === nothing ? 0 : bpd.nset,
+                                   anyingen)
             end
             # Budget exhaustion is not evidence of a bug — break-on-error stops
             # at every throw, and these programs throw on purpose — so it ends
             # the walk without a verdict rather than reporting one.
             status === :budget && return StepOutcome(:budget, getobs(m),
                                                      "command budget exhausted", total, cmds,
-                                                     :none, :none, bpd === nothing ? 0 : bpd.nset)
+                                                     :none, :none, bpd === nothing ? 0 : bpd.nset,
+                                                     anyingen)
         end
         return StepOutcome(:done, getobs(m), "", total, cmds, :none, :none,
-                           bpd === nothing ? 0 : bpd.nset)
+                           bpd === nothing ? 0 : bpd.nset, anyingen)
     catch err
         bt = catch_backtrace()
         # Record where it surfaced, but do NOT use that to decide whether it is a
@@ -383,7 +404,7 @@ function step_program(src::String; walkseed::Int, interp::Interpreter=RecursiveI
                            string(nameof(typeof(err)), loc, ": ", shortstr(err), "\n",
                                   first(sprint(Base.show_backtrace, bt; context=:limit => true), 2500)),
                            total, cmds, sitename, scrubexc(err),
-                           bpd === nothing ? 0 : bpd.nset)
+                           bpd === nothing ? 0 : bpd.nset, anyingen)
     finally
         usebreakpoints && (break_off(:error, :throw); remove())
     end
@@ -403,6 +424,13 @@ function classify_step(plain::Outcome, st::StepOutcome)::Verdict
     # Budget-aborted plain runs have a truncated stream, so there is nothing
     # sound to compare against.
     plain.status === :aborted && return agree()
+    # A `:sg` walk that entered a generator frame: the generator's return value
+    # (an expression) replaced the call's value by design, so from that point on
+    # the stepped program computes something legitimately different — neither
+    # its observations nor its exceptions are comparable to plain interpretation.
+    # Invariants 1 (termination, the :stuck check above) still hold; the value
+    # oracle stands down for this walk rather than manufacturing divergences.
+    st.ingen && return agree()
     if st.status === :threw
         # The generated programs throw on purpose, and a program-thrown
         # exception unwinds through interpreter frames — so the question is not

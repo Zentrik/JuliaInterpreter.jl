@@ -75,6 +75,8 @@ function diagnose(m, ex, rng, interp, maxcmds)
         while total < maxcmds
             is_toplevel_frame(fr) && (fr.world = Base.get_world_counter())
             cmd = total > 0.8 * maxcmds ? pick(rng, DRAIN_COMMANDS) : pick(rng, STEP_COMMANDS)
+            # Mirror walkframe!'s `:sg` variant draw so the stream stays aligned.
+            cmd === :s && rand(rng) < 0.15 && (cmd = :sg)
             ret = try
                 cmd === :until && rand(rng) < 0.5 ?
                     debug_command(interp, fr, cmd, true; line=rand(rng, 1:40)) :

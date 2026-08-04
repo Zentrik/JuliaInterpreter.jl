@@ -1128,6 +1128,214 @@ end
         @test count(hasvtime, bsrcs) / bn >= 0.08
     end
 
+    @testset "grammar-gap constructs: generation floors" begin
+        # The three cold-evidence gaps from coverage-report.md: destructuring
+        # (assignment + method arguments), keyword sorters (defaults referencing
+        # earlier params, no-kw call sites), and pure @generated functions.
+        # Each must appear at a measurable rate in the blended default corpus,
+        # or the campaign silently stops testing the interpreter paths they
+        # exist for (is_indexed_iterate_call, maybe_step_through_arg_destructuring!,
+        # maybe_step_through_kwprep!, get_source). Measured at 400 seeds:
+        # destructure 0.57, destrparam 0.21, kwfundef 0.37, kwref 0.17, gendef 0.20.
+        function gapscan(p)
+            sawdestr = sawdp = sawkw = sawkwref = sawgen = false
+            function scanst(st)
+                st.kind === :destructure && (sawdestr = true)
+                st.kind === :gendef && (sawgen = true)
+                if st.kind === :fundef
+                    any(pp -> !(pp[1] isa Symbol), st.meta[2]) && (sawdp = true)
+                    if length(st.meta) >= 4 && !isempty(st.meta[4])
+                        sawkw = true
+                        any(kv -> kv[2] isa String, st.meta[4]) && (sawkwref = true)
+                    end
+                end
+                for b in st.blocks, s in b
+                    scanst(s)
+                end
+            end
+            for sec in sections(p), st in sec
+                scanst(st)
+            end
+            return (sawdestr, sawdp, sawkw, sawkwref, sawgen)
+        end
+        N = 300
+        tallies = zeros(Int, 5)
+        for seed in 1:N
+            saw = gapscan(genprogram(Xoshiro(seed)))
+            for i in 1:5
+                saw[i] && (tallies[i] += 1)
+            end
+        end
+        @test tallies[1] / N >= 0.30   # destructuring assignment
+        @test tallies[2] / N >= 0.10   # destructured method parameter
+        @test tallies[3] / N >= 0.20   # kw-carrying method
+        @test tallies[4] / N >= 0.07   # kw default referencing an earlier param
+        @test tallies[5] / N >= 0.10   # @generated function
+    end
+
+    @testset "grammar-gap constructs: hand-built programs agree" begin
+        # One hand-built program per construct, through the full differential
+        # oracle. A divergence here is a real interpreter finding — triage it.
+        gap = [
+        # (1) tuple-destructuring assignment: toplevel (globals), soft-scope
+        # reassignment (`global a, b = ...` inside a toplevel while body), local
+        # scope, and destructuring a generated function's returned tuple.
+        "destructuring assignment" => """
+        ga = 1
+        gb = 2.0
+        d1, d2 = (5, "s")
+        __obs__((d1, d2))
+        mktup() = (7, 3.5)
+        fuel = 2
+        while fuel > 0
+            global fuel -= 1
+            global ga, gb = (ga + 1, gb + 0.5)
+        end
+        __obs__((ga, gb))
+        let
+            a, b = mktup()
+            x, y, z = (1, 2, 3)
+            __obs__((a, b, x + y + z))
+        end
+        """,
+        # (2) argument destructuring: untyped and Tuple-annotated destructured
+        # params, mixed with ordinary params — the indexed_iterate method
+        # preamble maybe_step_through_arg_destructuring! pattern-matches.
+        "argument destructuring" => """
+        fd((a, b), x) = a * x + b
+        function fd2((p, q)::Tuple{Int64, Float64}, (r, s))
+            return p + q + r * s
+        end
+        __obs__(fd((2, 3), 4))
+        __obs__(fd2((1, 2.5), (3, 4)))
+        __obs__(try fd((1, 2.5), 1) catch __e; (:__thrown, nameof(typeof(__e))) end)
+        """,
+        # (3) keyword sorters: defaults (literal + referencing an earlier
+        # positional param + referencing an earlier kw), a kw-passing call, a
+        # partial-kw call, and the no-kw call whose sorter runs every default.
+        "keyword sorters" => """
+        function fk(x, y = x + 1; kw1 = x * 2, kw2 = kw1 + 1, kw3 = -1)
+            return (x, y, kw1, kw2, kw3)
+        end
+        __obs__(fk(1))
+        __obs__(fk(1, 5))
+        __obs__(fk(2; kw2 = 0))
+        __obs__(fk(2; kw1 = 3, kw2 = 4, kw3 = 5))
+        """,
+        # (4) a pure @generated function (the gengendef template): the generator
+        # branches on argument types only; distinct call-site type combinations
+        # force distinct expansions on both engines.
+        "@generated function" => raw"""
+        @generated function ggt(a::T, b::U) where {T, U}
+            if T <: Number && U <: Number
+                return :(a isa Type ? 2 : a + b + $(Int(sizeof(T))) + 2)
+            elseif T <: AbstractString
+                return :(a isa Type ? 2 : length(a) + 2)
+            else
+                return :(:gsym)
+            end
+        end
+        __obs__(ggt(1, 2))
+        __obs__(ggt(1.0, true))
+        __obs__(ggt("abcd", :x))
+        __obs__(ggt(:s, ()))
+        """,
+        ]
+        for (label, src) in gap
+            r = run_both(src; nstmts=2_000_000)
+            @test r !== nothing
+            r === nothing && continue
+            ref, int = r
+            v = classify(ref, int)
+            v.class === :agree ||
+                @warn "grammar-gap divergence — triage me" label v.class v.detail
+            @test v.class === :agree
+            @test !isempty(ref.obs)
+            @test isequal(ref.obs, int.obs)
+        end
+        # The same programs, driven by stepping walks: this is what actually
+        # executes maybe_step_through_arg_destructuring!/is_indexed_iterate_call
+        # and maybe_step_through_kwprep! in-process. Several walkseeds, so the
+        # walks hit the method entries from different command mixes.
+        nbad = 0
+        for (label, src) in gap, walkseed in (1, 7, 23)
+            ex = FuzzJI.parsegate(src)
+            @test ex !== nothing
+            ex === nothing && continue
+            plain = FuzzJI.run_interp(ex; nstmts=500_000)
+            st = FuzzJI.step_program(src; walkseed, maxcmds=4000)
+            st === nothing && continue
+            v = FuzzJI.classify_step(plain, st)
+            if !(v.class === :agree || v.class === :aborted)
+                nbad += 1
+                @warn "grammar-gap stepping divergence (a real finding — triage it!)" label walkseed v.class v.detail
+            end
+        end
+        @test nbad == 0
+    end
+
+    @testset "grammar-gap constructs: generator entry (get_source) runs" begin
+        # `:sg` / enter_generated=true is the only route to
+        # get_source(::GeneratedFunctionStub). Enter the generator of a
+        # program-defined @generated function directly and finish it. Note what
+        # that frame *is* on current Julia: the stub runs the generator eagerly
+        # inside get_source and wraps its returned expression in a lambda, so
+        # the entered frame executes the generated body with type-valued
+        # argument slots — which is why the template guards with `a isa Type`
+        # (finishing yields the baked literal, 5 here).
+        m = FuzzJI.freshmodule()
+        Core.eval(m, Meta.parseall(raw"""
+        @generated function ggen(a::T, b::U) where {T, U}
+            if T <: Number && U <: Number
+                return :(a isa Type ? 5 : a + b + $(Int(sizeof(T))))
+            else
+                return :(:gsym)
+            end
+        end
+        """))
+        gfn = Base.invokelatest(getfield, m, :ggen)
+        genframe = Base.invokelatest(JuliaInterpreter.enter_call_expr,
+                                     :($(gfn)(1, 2)); enter_generated=true)
+        @test genframe !== nothing
+        @test genframe.framecode.generator
+        ret = Base.invokelatest(JuliaInterpreter.finish_and_return!, genframe, false)
+        @test ret == 5
+        # And the interpreted *call* (enter_generated=false, the get_staged arm)
+        # still computes the real value.
+        callframe = Base.invokelatest(JuliaInterpreter.enter_call, gfn, 3, 4)
+        @test Base.invokelatest(JuliaInterpreter.finish_and_return!, callframe, false) == 3 + 4 + 8
+        # A step walk over a generated-function program must classify cleanly
+        # whether or not its draws include `:sg` (the ingen relaxation).
+        gsrc = raw"""
+        @generated function gw(a::T, b::U) where {T, U}
+            if T <: Number && U <: Number
+                return :(a isa Type ? 5 : a + b + $(Int(sizeof(T))))
+            else
+                return :(:gsym)
+            end
+        end
+        __obs__(gw(1, 2))
+        __obs__(gw(2.5, 1))
+        __obs__(gw(:x, "y"))
+        """
+        ex = FuzzJI.parsegate(gsrc)
+        @test ex !== nothing
+        plain = FuzzJI.run_interp(ex; nstmts=500_000)
+        ningen = 0
+        for walkseed in 1:12
+            st = FuzzJI.step_program(gsrc; walkseed, maxcmds=3000)
+            st === nothing && continue
+            ningen += st.ingen
+            v = FuzzJI.classify_step(plain, st)
+            v.class === :agree || v.class === :aborted ||
+                @warn "generated-fn stepping divergence — triage me" walkseed v.class v.detail
+            @test v.class === :agree || v.class === :aborted
+        end
+        # The walks must actually enter a generator sometimes, or the
+        # get_source path is not being fuzzed at all.
+        @test ningen > 0
+    end
+
     @testset "eval_code axis: probe selection and verdicts" begin
         Variable = FuzzJI.Variable
         # Plumbing names and non-scalar values are not round-trip candidates.
