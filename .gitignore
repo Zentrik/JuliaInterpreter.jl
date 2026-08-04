@@ -7,3 +7,6 @@ test/results.md
 Manifest.toml
 Manifest-*.toml
 !/test/code_coverage/coverage_example.jl.cov
+
+# Transient per-agent git worktrees created by Claude Code subagents
+.claude/worktrees/
