@@ -209,6 +209,27 @@ end
             @test debug_command(fr, :finish) === nothing
             @test JuliaInterpreter.get_return(fr) == (Int, 2)
         end
+
+        # The generator stub must be invoked in the requested world, not the
+        # caller's dynamic world: when the @generated function is defined
+        # *after* the code driving the debugger was already running (a stale
+        # dynamic world), entering the generator used to raise a spurious
+        # `MethodError: no method matching (generator)` from `get_source` even
+        # though the caller passed a new-enough `world` explicitly.
+        function stale_world_sg()
+            m = Module(:StaleSGWorld)
+            Core.eval(m, :(@generated function gsw(a::T) where {T}
+                return T <: Number ? :(a isa Type ? 1 : a + 1) : :(0)
+            end))
+            f = Base.invokelatest(getfield, m, :gsw)
+            # From here on the *dynamic* world of this function predates gsw.
+            frame = enter_call_expr(:($f(41)); enter_generated=true,
+                                    world=Base.get_world_counter())
+            return JuliaInterpreter.finish_and_return!(frame)
+        end
+        # The entered frame is the generated body running on the type-valued
+        # argument (issue #161), so the `a isa Type` arm yields 1.
+        @test stale_world_sg() == 1
     end
 
     @testset "Function-like objects are not wrappers (issue #299)" begin

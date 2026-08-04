@@ -216,10 +216,19 @@ end
 get_source(meth::Method) = Base.uncompressed_ast(meth)
 
 function get_source(g::GeneratedFunctionStub, source::Method, env, world::UInt)
+    # Invoke the stub in `world`, not in the caller's dynamic world: the stub
+    # dispatches to the lowered generator function (`g.gen`), which was defined
+    # together with the `@generated` function itself — when that definition is
+    # newer than the world the *caller of get_source* is running in (e.g. a
+    # debugger session stepping code that was `Core.eval`'d after the session's
+    # own code was compiled), plain invocation raises a spurious
+    # `MethodError: no method matching (generator)` even though `world` (the
+    # frame's world, in which the method genuinely exists) was passed in
+    # explicitly for exactly this purpose.
     b = @static if VERSION < v"1.12.0-DEV.1968"   # julia #57230
-        g(world, LineNumberNode(Int(source.line), source.file), env..., g.argnames...)
+        invoke_in_world(world, g, world, LineNumberNode(Int(source.line), source.file), env..., g.argnames...)
     else
-        g(world, source, env..., g.argnames...)
+        invoke_in_world(world, g, world, source, env..., g.argnames...)
     end
     b isa CodeInfo && return b
     return eval(b)
