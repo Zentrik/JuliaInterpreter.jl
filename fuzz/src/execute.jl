@@ -144,7 +144,12 @@ function fjnorm(@nospecialize(x), prefix::String)
         # which legitimately differs per run: normalize it to `@0x0`
         # (both from finding step_divergence-7e03896b).
         return replace(x, prefix => "", r"@0x[0-9a-fA-F]+" => "@0x0")
-    elseif x isa Union{Number, Symbol, Char, Nothing}
+    elseif x isa Symbol
+        # Symbol(structvalue, ...) stringifies its arguments, so runtime-built
+        # symbols embed the same module-qualified reprs and heap addresses the
+        # String branch strips (step_divergence-5a44d1a5, third presentation)
+        return Symbol(replace(String(x), prefix => "", r"@0x[0-9a-fA-F]+" => "@0x0"))
+    elseif x isa Union{Number, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(el -> fjnorm(el, prefix), x)

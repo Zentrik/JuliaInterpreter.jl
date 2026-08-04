@@ -22,7 +22,10 @@ function __fjnorm__(x)
         # `string(structvalue)` — strip, same trick as the Type branch below —
         # and Ptr/MemoryRef repr embeds per-run heap addresses: normalize
         return replace(x, string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0")
-    elseif x isa Union{Number, Symbol, Char, Nothing}
+    elseif x isa Symbol
+        # runtime-built symbols (Symbol(structvalue, ...)) embed qualified reprs too
+        return Symbol(replace(String(x), string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0"))
+    elseif x isa Union{Number, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(__fjnorm__, x)

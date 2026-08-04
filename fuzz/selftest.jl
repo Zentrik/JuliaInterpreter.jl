@@ -615,6 +615,10 @@ end
             # ... and per-run heap addresses in Ptr/MemoryRef reprs
             # (step_divergence-7e03896b, second presentation)
             @test Base.invokelatest(norm, "Ptr{Int64} @0x00007f2ab8c01230") == "Ptr{Int64} @0x0"
+            # ... and runtime-built Symbols (Symbol(structvalue, ...)) embed the
+            # same qualified reprs (step_divergence-5a44d1a5, third presentation)
+            s3 = Base.invokelatest(Core.eval, m, :(Symbol(string(ZQ(7)), :x)))
+            @test Base.invokelatest(norm, s3) === Symbol("ZQ(7)x")
         end
         # end to end: two engines in differently named modules agree on it
         r = run_both("struct ZQS; x::Int64; end\n__obs__(string(ZQS(3)))\n"; nstmts=100_000)

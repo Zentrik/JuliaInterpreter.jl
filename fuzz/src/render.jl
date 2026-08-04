@@ -450,7 +450,10 @@ function __fjnorm__(x)
         # between the two engines' runs — normalize the address to `@0x0`
         # (both from finding step_divergence-7e03896b).
         return replace(x, string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0")
-    elseif x isa Union{Number, Symbol, Char, Nothing}
+    elseif x isa Symbol
+        # runtime-built symbols (Symbol(structvalue, ...)) embed qualified reprs too
+        return Symbol(replace(String(x), string(@__MODULE__, ".") => "", r"@0x[0-9a-fA-F]+" => "@0x0"))
+    elseif x isa Union{Number, Char, Nothing}
         return x
     elseif x isa Tuple
         return map(__fjnorm__, x)
