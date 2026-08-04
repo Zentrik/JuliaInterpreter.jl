@@ -187,6 +187,8 @@ println("  allowed:            ", length(FuzzJI.PROBE_TARGETS),
         "); recipe-only: ", FuzzJI.nprobe_reciponly())
 println("  denylisted:         ", FuzzJI.nprobe_denied(),
         " spellings over ", length(unique(n for (_, n, _) in FuzzJI.PROBE_DENIED)), " names")
+println("  fixed-only:         ", FuzzJI.nprobe_fixedonly(),
+        " spellings (reachable only via vetted FIXED_PROBES templates)")
 println("  recipes:            ", length(FuzzJI.PROBE_RECIPES), " builtins, ",
         sum(length, values(FuzzJI.PROBE_RECIPES)), " argument shapes; ",
         length(FuzzJI.FIXED_PROBES), " fixed templates")
