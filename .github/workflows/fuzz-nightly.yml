@@ -17,8 +17,15 @@
 # the job then fails iff the findings directory gained entries.
 name: Fuzz nightly
 on:
-  schedule:
-    - cron: '17 3 * * *'   # 03:17 UTC, off-peak
+  # Nightly cron disabled: at the current harness maturity the campaigns
+  # re-derive only known upstream-Julia divergences (the Bool i1-vs-i8
+  # intrinsic family, _svec_ref specialization, compilerbarrier
+  # invalid-setting UB — see fuzz/NEXT.md's upstream shortlist), so the
+  # standing schedule was spending CI on noise. Re-enable by uncommenting the
+  # schedule block once the call axis gains three-way adjudication (NEXT.md
+  # follow-up #1) so it stops reporting non-interpreter divergences.
+  # schedule:
+  #   - cron: '17 3 * * *'   # 03:17 UTC, off-peak
   workflow_dispatch:
     inputs:
       duration_seconds:
